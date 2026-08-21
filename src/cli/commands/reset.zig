@@ -109,7 +109,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     _ = current_sha;
 }
 
-/// Reset index to match the given commit's tree
+/// Reset index to match the given commit's tree (recursive)
 fn resetIndex(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: *const loose.LooseStore, commit_sha: [20]u8) !void {
     const commit_obj = store.read(allocator, io, commit_sha) catch return;
     const commit = switch (commit_obj) {
@@ -117,26 +117,37 @@ fn resetIndex(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, sto
         else => return,
     };
 
-    const tree_obj = store.read(allocator, io, commit.tree) catch return;
+    var idx = index_mod.Index.init(allocator);
+    defer idx.deinit(allocator);
+
+    try flattenTreeToIndex(&idx, store, allocator, io, commit.tree, "");
+    try idx.writeToFile(git_dir, allocator, io);
+}
+
+fn flattenTreeToIndex(idx: *index_mod.Index, store: *const loose.LooseStore, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) !void {
+    const tree_obj = store.read(allocator, io, tree_sha) catch return;
     const tree = switch (tree_obj) {
         .tree => |t| t,
         else => return,
     };
 
-    // Build new index from tree entries
-    var idx = index_mod.Index.init(allocator);
-    defer idx.deinit(allocator);
-
     for (tree.entries) |entry| {
-        const owned_name = try allocator.dupe(u8, entry.name);
-        try idx.entries.append(allocator, .{
-            .sha = entry.sha,
-            .mode = entry.mode,
-            .name = owned_name,
-        });
-    }
+        const full_path = if (prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
+        else
+            try allocator.dupe(u8, entry.name);
 
-    try idx.writeToFile(git_dir, allocator, io);
+        if (entry.mode == 0o040000) {
+            try flattenTreeToIndex(idx, store, allocator, io, entry.sha, full_path);
+            allocator.free(full_path);
+        } else {
+            try idx.entries.append(allocator, .{
+                .sha = entry.sha,
+                .mode = entry.mode,
+                .name = full_path,
+            });
+        }
+    }
 }
 
 /// Reset working tree to match the given commit's tree

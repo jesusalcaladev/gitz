@@ -90,16 +90,15 @@ pub const Config = struct {
     pub fn serialize(self: Config, allocator: Allocator) ![]u8 {
         var result = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
         errdefer result.deinit(allocator);
-        const writer = result.writer(allocator);
 
         var section_iter = self.sections.iterator();
         while (section_iter.next()) |section| {
-            try writer.print("[{s}]\n", .{section.key_ptr.*});
+            try result.print(allocator, "[{s}]\n", .{section.key_ptr.*});
             var val_iter = section.value_ptr.iterator();
             while (val_iter.next()) |entry| {
-                try writer.print("\t{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+                try result.print(allocator, "\t{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             }
-            try writer.writeByte('\n');
+            try result.append(allocator, '\n');
         }
 
         return try result.toOwnedSlice(allocator);

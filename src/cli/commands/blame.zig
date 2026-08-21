@@ -65,11 +65,14 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         else => return,
     };
 
-    for (blame_result) |*blame| {
+    for (blame_result, 0..) |*blame, idx| {
         blame.sha = head_sha;
         blame.author = try allocator.dupe(u8, latest_commit.author.name);
         blame.timestamp = latest_commit.author.timestamp;
-        blame.content = ""; // will be filled later
+        blame.content = if (idx < current_lines.items.len)
+            try allocator.dupe(u8, current_lines.items[idx])
+        else
+            "";
         blame.owned = true;
     }
 

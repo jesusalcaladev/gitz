@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const Config = @import("../../core/config.zig").Config;
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var verbose = false;
@@ -46,113 +47,170 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 }
 
+fn loadConfig(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !Config {
+    var config = Config.init(allocator);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config", .{git_dir});
+    defer allocator.free(config_path);
+    const content = std.Io.Dir.cwd().readFileAlloc(io.io, config_path, allocator, .unlimited) catch return config;
+    defer allocator.free(content);
+    try config.parse(content);
+    return config;
+}
+
+fn saveConfig(allocator: std.mem.Allocator, git_dir: []const u8, config: Config, io: Io) !void {
+    const serialized = try config.serialize(allocator);
+    defer allocator.free(serialized);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config", .{git_dir});
+    defer allocator.free(config_path);
+    try io.writeFile(config_path, serialized);
+}
+
 fn remoteAdd(allocator: std.mem.Allocator, git_dir: []const u8, name: []const u8, url: []const u8, io: Io) !void {
     if (name.len == 0 or url.len == 0) {
         try io.eprint("usage: gitz remote add <name> <url>\n", .{});
         return;
     }
-    // Check if exists
-    const existing = getRemoteUrl(allocator, git_dir, name, io);
-    defer if (existing) |e| allocator.free(e);
-    if (existing != null) {
+
+    var config = try loadConfig(allocator, git_dir, io);
+    defer config.deinit();
+
+    // Check if remote already exists
+    const section = try std.fmt.allocPrint(allocator, "remote \"{s}\"", .{name});
+    defer allocator.free(section);
+    if (config.get(section, "url")) |_| {
         try io.eprint("error: remote '{s}' already exists\n", .{name});
         return;
     }
-    try writeRemote(allocator, git_dir, name, url, io);
+
+    try config.set(section, "url", url);
+    try saveConfig(allocator, git_dir, config, io);
     try io.print("remote {s} added\n", .{name});
 }
 
 fn remoteRemove(allocator: std.mem.Allocator, git_dir: []const u8, name: []const u8, io: Io) !void {
-    const existing = getRemoteUrl(allocator, git_dir, name, io);
-    defer if (existing) |e| allocator.free(e);
-    if (existing == null) {
+    var config = try loadConfig(allocator, git_dir, io);
+    defer config.deinit();
+
+    const section = try std.fmt.allocPrint(allocator, "remote \"{s}\"", .{name});
+    defer allocator.free(section);
+    if (config.get(section, "url") == null) {
         try io.eprint("error: remote '{s}' not found\n", .{name});
         return;
     }
-    const file_path = try std.fmt.allocPrint(allocator, "{s}/remotes/{s}", .{ git_dir, name });
-    defer allocator.free(file_path);
-    io.removeFile(file_path) catch {};
+
+    // Remove the section by re-serializing without it
+    var new_config = Config.init(allocator);
+    defer new_config.deinit();
+
+    var section_iter = config.sections.iterator();
+    while (section_iter.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, section)) {
+            var val_iter = entry.value_ptr.iterator();
+            while (val_iter.next()) |val| {
+                const new_section = try allocator.dupe(u8, entry.key_ptr.*);
+                if (!new_config.sections.contains(new_section)) {
+                    _ = new_config.sections.remove(new_section);
+                }
+                try new_config.set(new_section, val.key_ptr.*, val.value_ptr.*);
+            }
+        }
+    }
+
+    try saveConfig(allocator, git_dir, new_config, io);
     try io.print("remote {s} removed\n", .{name});
 }
 
 fn remoteSetUrl(allocator: std.mem.Allocator, git_dir: []const u8, name: []const u8, url: []const u8, io: Io) !void {
-    const existing = getRemoteUrl(allocator, git_dir, name, io);
-    defer if (existing) |e| allocator.free(e);
-    if (existing == null) {
+    var config = try loadConfig(allocator, git_dir, io);
+    defer config.deinit();
+
+    const section = try std.fmt.allocPrint(allocator, "remote \"{s}\"", .{name});
+    defer allocator.free(section);
+    if (config.get(section, "url") == null) {
         try io.eprint("error: remote '{s}' not found\n", .{name});
         return;
     }
-    try writeRemote(allocator, git_dir, name, url, io);
+
+    try config.set(section, "url", url);
+    try saveConfig(allocator, git_dir, config, io);
 }
 
 fn remoteRename(allocator: std.mem.Allocator, git_dir: []const u8, old: []const u8, new: []const u8, io: Io) !void {
-    const url_val = getRemoteUrl(allocator, git_dir, old, io);
-    defer if (url_val) |u| allocator.free(u);
+    var config = try loadConfig(allocator, git_dir, io);
+    defer config.deinit();
+
+    const old_section = try std.fmt.allocPrint(allocator, "remote \"{s}\"", .{old});
+    defer allocator.free(old_section);
+    const url_val = config.get(old_section, "url");
     if (url_val == null) {
         try io.eprint("error: remote '{s}' not found\n", .{old});
         return;
     }
-    // Delete old, create new
-    const old_path = try std.fmt.allocPrint(allocator, "{s}/remotes/{s}", .{ git_dir, old });
-    defer allocator.free(old_path);
-    io.removeFile(old_path) catch {};
-    try writeRemote(allocator, git_dir, new, url_val.?, io);
+
+    const new_section = try std.fmt.allocPrint(allocator, "remote \"{s}\"", .{new});
+    defer allocator.free(new_section);
+    try config.set(new_section, "url", url_val.?);
+
+    // Remove old section
+    var new_config = Config.init(allocator);
+    defer new_config.deinit();
+    var section_iter = config.sections.iterator();
+    while (section_iter.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, old_section)) {
+            var val_iter = entry.value_ptr.iterator();
+            while (val_iter.next()) |val| {
+                try new_config.set(entry.key_ptr.*, val.key_ptr.*, val.value_ptr.*);
+            }
+        }
+    }
+
+    try saveConfig(allocator, git_dir, new_config, io);
+    try io.print("remote {s} renamed to {s}\n", .{ old, new });
 }
 
 fn remoteList(allocator: std.mem.Allocator, git_dir: []const u8, verbose: bool, io: Io) !void {
-    const remotes_dir = try std.fmt.allocPrint(allocator, "{s}/remotes", .{git_dir});
-    defer allocator.free(remotes_dir);
+    var config = try loadConfig(allocator, git_dir, io);
+    defer config.deinit();
 
-    // Use raw getdents64 to list remotes directory
-    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{remotes_dir}, 0);
-    defer allocator.free(dir_z);
-
-    const fd = std.posix.openat(std.posix.AT.FDCWD, dir_z, std.posix.O{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer { _ = std.os.linux.close(@intCast(fd)); }
-
-    var buf: [4096]u8 align(@alignOf(usize)) = undefined;
-    while (true) {
-        const rc = std.os.linux.getdents64(@intCast(fd), &buf, buf.len);
-        const n: usize = if (rc > 0) @intCast(rc) else break;
-        if (n == 0) break;
-
-        var pos: usize = 0;
-        while (pos < n) {
-            const direntry: *align(1) const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
-            const rname: []const u8 = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&direntry.name)), 0);
-            if (rname.len > 0 and rname[0] != '.') {
+    // Iterate config sections to find remote sections
+    var section_iter = config.sections.iterator();
+    var found = false;
+    while (section_iter.next()) |entry| {
+        const section = entry.key_ptr.*;
+        // Check if this is a "remote \"name\"" section
+        if (std.mem.startsWith(u8, section, "remote \"")) {
+            const rest = section[8..]; // skip 'remote "'
+            if (rest.len > 0 and rest[rest.len - 1] == '"') {
+                const remote_name = rest[0 .. rest.len - 1];
+                found = true;
                 if (verbose) {
-                    const u = getRemoteUrl(allocator, git_dir, rname, io);
-                    defer if (u) |uu| allocator.free(uu);
-                    if (u) |uu| {
-                        try io.print("{s}\t{s}\n", .{ rname, uu });
+                    if (config.get(section, "url")) |url| {
+                        try io.print("{s}\t{s}\n", .{ remote_name, url });
                     } else {
-                        try io.print("{s}\n", .{rname});
+                        try io.print("{s}\n", .{remote_name});
                     }
                 } else {
-                    try io.print("{s}\n", .{rname});
+                    try io.print("{s}\n", .{remote_name});
                 }
             }
-            pos += direntry.reclen;
         }
+    }
+
+    if (!found) {
+        try io.print("No remotes configured.\n", .{});
     }
 }
 
-fn writeRemote(allocator: std.mem.Allocator, git_dir: []const u8, name: []const u8, url: []const u8, io: Io) !void {
-    const remotes_dir = try std.fmt.allocPrint(allocator, "{s}/remotes", .{git_dir});
-    defer allocator.free(remotes_dir);
-    io.makeDir(remotes_dir) catch {};
-
-    const file_path = try std.fmt.allocPrint(allocator, "{s}/remotes/{s}", .{ git_dir, name });
-    defer allocator.free(file_path);
-
-    try io.writeFile(file_path, url);
-}
-
 pub fn getRemoteUrl(allocator: std.mem.Allocator, git_dir: []const u8, name: []const u8, io: Io) ?[]const u8 {
-    const file_path = std.fmt.allocPrint(allocator, "{s}/remotes/{s}", .{ git_dir, name }) catch return null;
-    defer allocator.free(file_path);
+    // First try config file
+    var config = loadConfig(allocator, git_dir, io) catch return null;
+    defer config.deinit();
 
-    const content = io.readFileAlloc(file_path) catch return null;
-    return std.mem.trim(u8, content, &[_]u8{ '\n', '\r', ' ' });
+    const section = std.fmt.allocPrint(allocator, "remote \"{s}\"", .{name}) catch return null;
+    defer allocator.free(section);
+
+    if (config.get(section, "url")) |url| {
+        return allocator.dupe(u8, url) catch null;
+    }
+    return null;
 }
