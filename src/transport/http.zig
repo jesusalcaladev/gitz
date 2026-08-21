@@ -1,24 +1,10 @@
 const std = @import("std");
 const Sha1 = @import("../core/sha1.zig").Sha1;
+const loose = @import("../core/loose.zig");
 const object = @import("../core/object.zig");
 const refs_mod = @import("../core/refs.zig");
-const zlib_mod = @import("../core/zlib.zig");
-const packfile_mod = @import("../core/packfile.zig");
-const storage_mod = @import("../core/storage.zig");
-const pktline = @import("../core/pktline.zig");
-const delta_mod = @import("../core/delta.zig");
 
 const Allocator = std.mem.Allocator;
-
-fn typeName(t: packfile_mod.ObjectType) []const u8 {
-    return switch (t) {
-        .commit => "commit",
-        .tree => "tree",
-        .blob => "blob",
-        .tag => "tag",
-        else => "unknown",
-    };
-}
 
 /// A parsed remote reference
 pub const RemoteRef = struct {
@@ -26,122 +12,17 @@ pub const RemoteRef = struct {
     sha: [20]u8,
 };
 
-// ── HTTP Basic Auth ─────────────────────────────────────────────────────
-// Credentials come from, in order:
-//   1. URL-embedded userinfo: https://user:token@host/repo.git (like git)
-//   2. Env: GITZ_HTTP_USERNAME + GITZ_HTTP_PASSWORD
-//   3. Env: GIT_TOKEN / GITHUB_TOKEN (username defaults to x-access-token)
-
-pub const Credentials = struct {
-    username: []const u8,
-    password: []const u8,
-};
-
-pub const ResolvedAuth = struct {
-    /// Value for the Authorization header, e.g. "Basic dXNlcjpwYXNz", or null.
-    auth_header: ?[]const u8,
-    /// URL with any embedded userinfo stripped.
-    clean_url: []const u8,
-};
-
-/// Extract `user:pass` embedded before the host part of an http(s) URL.
-/// An '@' appearing only inside the path is not treated as userinfo.
-pub fn extractUrlCredentials(allocator: Allocator, url: []const u8) !struct { creds: ?Credentials, clean_url: []const u8 } {
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse
-        return .{ .creds = null, .clean_url = try allocator.dupe(u8, url) };
-    const rest = url[scheme_end + 3 ..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/');
-    const at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse
-        return .{ .creds = null, .clean_url = try allocator.dupe(u8, url) };
-    if (slash) |s| {
-        if (s < at) return .{ .creds = null, .clean_url = try allocator.dupe(u8, url) };
-    }
-    const userinfo = rest[0..at];
-    const colon = std.mem.indexOfScalar(u8, userinfo, ':');
-    const user = if (colon) |c| userinfo[0..c] else userinfo;
-    const pass = if (colon) |c| userinfo[c + 1 ..] else "";
-    return .{
-        .creds = .{
-            .username = try allocator.dupe(u8, user),
-            .password = try allocator.dupe(u8, pass),
-        },
-        .clean_url = try std.fmt.allocPrint(allocator, "{s}://{s}", .{ url[0..scheme_end], rest[at + 1 ..] }),
-    };
-}
-
-/// Build the value of an `Authorization` header: "Basic base64(user:pass)".
-pub fn buildBasicAuthValue(allocator: Allocator, creds: Credentials) ![]const u8 {
-    const raw = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ creds.username, creds.password });
-    defer allocator.free(raw);
-    const enc = std.base64.standard.Encoder;
-    const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
-    defer allocator.free(b64);
-    _ = enc.encode(b64, raw);
-    return try std.fmt.allocPrint(allocator, "Basic {s}", .{b64});
-}
-
-/// Read an environment variable without libc via /proc/self/environ.
-fn readEnvOwned(allocator: Allocator, io: std.Io, name: []const u8) ?[]const u8 {
-    var f = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return null;
-    defer f.close(io);
-    var buf: [64 * 1024]u8 = undefined;
-    const n = f.readStreaming(io, &.{&buf}) catch return null;
-    if (n == 0) return null;
-    var entries = std.mem.splitScalar(u8, buf[0..n], 0);
-    while (entries.next()) |entry| {
-        if (std.mem.startsWith(u8, entry, name) and entry.len > name.len and entry[name.len] == '=') {
-            return allocator.dupe(u8, entry[name.len + 1 ..]) catch null;
-        }
-    }
-    return null;
-}
-
-/// Resolve authentication for a remote URL: embedded userinfo first,
-/// then GITZ_HTTP_USERNAME/GITZ_HTTP_PASSWORD, then GIT_TOKEN/GITHUB_TOKEN.
-pub fn resolveAuth(allocator: Allocator, io: std.Io, url: []const u8) !ResolvedAuth {
-    var creds: ?Credentials = null;
-    const from_url = try extractUrlCredentials(allocator, url);
-    const clean_url = from_url.clean_url;
-    if (from_url.creds) |c| {
-        creds = c;
-    } else if (readEnvOwned(allocator, io, "GITZ_HTTP_USERNAME")) |user| {
-        const pass = readEnvOwned(allocator, io, "GITZ_HTTP_PASSWORD") orelse try allocator.dupe(u8, "");
-        creds = .{ .username = user, .password = pass };
-    } else if (readEnvOwned(allocator, io, "GIT_TOKEN")) |token| {
-        creds = .{
-            .username = try allocator.dupe(u8, "x-access-token"),
-            .password = token,
-        };
-    } else if (readEnvOwned(allocator, io, "GITHUB_TOKEN")) |token| {
-        creds = .{
-            .username = try allocator.dupe(u8, "x-access-token"),
-            .password = token,
-        };
-    }
-    if (creds) |c| {
-        return .{ .auth_header = try buildBasicAuthValue(allocator, c), .clean_url = clean_url };
-    }
-    return .{ .auth_header = null, .clean_url = clean_url };
-}
-
 /// HTTP transport for Smart Git protocol
 pub const HttpTransport = struct {
     allocator: Allocator,
     io: std.Io,
-    /// Remote URL with any embedded credentials stripped.
     url: []const u8,
-    /// Authorization header value (e.g. "Basic ..."), or null for anonymous.
-    auth_header: ?[]const u8,
-    /// Shallow fetch depth (--depth N), or null for a full fetch.
-    depth: ?u32 = null,
 
     pub fn init(allocator: Allocator, io: std.Io, url: []const u8) !HttpTransport {
-        const auth = try resolveAuth(allocator, io, url);
         return .{
             .allocator = allocator,
             .io = io,
-            .url = auth.clean_url,
-            .auth_header = auth.auth_header,
+            .url = url,
         };
     }
 
@@ -160,7 +41,7 @@ pub const HttpTransport = struct {
             result.deinit(self.allocator);
         }
 
-        // Use native HTTP client (no curl dependency)
+        // Use curl as a subprocess for HTTP requests (simpler than raw HTTP)
         const response = try self.httpGet(info_url);
         defer self.allocator.free(response);
 
@@ -188,12 +69,7 @@ pub const HttpTransport = struct {
 
             if (ref_line.len >= 41 and ref_line[40] == ' ') {
                 const sha_hex = ref_line[0..40];
-                // Strip capabilities after \0 (e.g. "HEAD\x00multi_ack ...")
-                var raw_name = std.mem.trimEnd(u8, ref_line[41..], &[_]u8{ '\n', '\r' });
-                if (std.mem.indexOfScalar(u8, raw_name, 0)) |nul| {
-                    raw_name = raw_name[0..nul];
-                }
-                const name = raw_name;
+                const name = std.mem.trimEnd(u8, ref_line[41..], &[_]u8{ '\n', '\r' });
 
                 const sha = Sha1.fromHex(sha_hex) catch continue;
                 const owned_name = self.allocator.dupe(u8, name) catch continue;
@@ -210,89 +86,43 @@ pub const HttpTransport = struct {
 
     /// Fetch objects from remote
     pub fn fetch(self: *HttpTransport, git_dir: []const u8, refs: []RemoteRef, have_shas: []const [20]u8) !void {
+        _ = have_shas;
 
         // Build the upload-pack request body
         var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
         defer body.deinit(self.allocator);
 
-        // Report wanted refs. First want must carry capabilities.
-        const caps = "multi_ack thin-pack side-band-64k ofs-delta agent=git/2.45.0";
-        for (refs, 0..) |ref, i| {
-            const want_pkt = try pktline.buildWantLineCaps(self.allocator, ref.sha, caps, i == 0);
-            defer self.allocator.free(want_pkt);
-            try body.appendSlice(self.allocator, want_pkt);
-        }
-        if (refs.len == 0) return error.NoWantedRefs;
-
-        // Shallow fetch: ask the server to cut history at the given depth.
-        if (self.depth) |d| {
-            const deepen_pkt = try pktline.buildDeepenLine(self.allocator, d);
-            defer self.allocator.free(deepen_pkt);
-            try body.appendSlice(self.allocator, deepen_pkt);
+        // Report wanted refs
+        for (refs) |ref| {
+            var line_buf: [128]u8 = undefined;
+            const hex = Sha1.hex(ref.sha);
+            const line = try std.fmt.bufPrint(&line_buf, "want {s}\n", .{&hex});
+            var pkt_buf: [132]u8 = undefined;
+            const pkt_len = 4 + line.len;
+            const pkt_hex = std.fmt.bytesToHex([2]u8{ @intCast(pkt_len >> 8), @intCast(pkt_len & 0xff) }, .lower);
+            const pkt = try std.fmt.bufPrint(&pkt_buf, "{s}{s}", .{&pkt_hex, line});
+            try body.appendSlice(self.allocator, pkt);
         }
 
         try body.appendSlice(self.allocator, "0000");
-
-        // Advertise what we already have so the server can thin the pack.
-        for (have_shas) |sha| {
-            const have_pkt = try pktline.buildHaveLine(self.allocator, sha);
-            defer self.allocator.free(have_pkt);
-            try body.appendSlice(self.allocator, have_pkt);
-        }
-
         try body.appendSlice(self.allocator, "0009done\n");
 
         var upload_url: [1024]u8 = undefined;
         const url = try std.fmt.bufPrint(&upload_url, "{s}/git-upload-pack", .{self.url});
 
-        // POST the request with Smart HTTP content types (required by git servers)
-        const response = try self.httpRequest("POST", url, body.items, &.{
-            .{ .name = "Content-Type", .value = "application/x-git-upload-pack-request" },
-            .{ .name = "Accept", .value = "application/x-git-upload-pack-result" },
-        });
+        // POST the request
+        const response = try self.httpPost(url, body.items);
         defer self.allocator.free(response);
 
-        // Record shallow boundaries so later commands know history is truncated.
-        if (self.depth != null) {
-            self.recordShallow(git_dir, response) catch {};
-        }
-
-        // We negotiated side-band-64k: unwrap the framing first so interleaved
-        // progress packets don't corrupt the pack stream.
-        const unframed = try pktline.stripSideband(self.allocator, response);
-        defer self.allocator.free(unframed);
-
-        // Parse the packfile from the unwrapped stream (falls back internally).
-        try self.parsePackfile(git_dir, if (unframed.len > 0) unframed else response);
+        // Parse the packfile from response
+        try self.parsePackfile(git_dir, response);
     }
 
-    /// Parse "shallow <sha>" band-1 lines from an upload-pack reply and
-    /// persist them to <git_dir>/shallow (one hex SHA per line).
-    fn recordShallow(self: *HttpTransport, git_dir: []const u8, response: []const u8) !void {
-        const shas = try pktline.extractShallowShas(self.allocator, response);
-        defer if (shas.len > 0) self.allocator.free(shas);
-        if (shas.len == 0) return;
-
-        var content: std.ArrayList(u8) = .empty;
-        defer content.deinit(self.allocator);
-        for (shas) |sha| {
-            const hex = Sha1.hex(sha);
-            try content.appendSlice(self.allocator, &hex);
-            try content.append(self.allocator, '\n');
-        }
-
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/shallow", .{git_dir});
-        defer self.allocator.free(path);
-        var f = try std.Io.Dir.cwd().createFile(self.io, path, .{});
-        defer f.close(self.io);
-        try std.Io.File.writeStreamingAll(f, self.io, content.items);
-    }
-
-    /// Parse a packfile response and write objects to loose store.
-    /// Handles full objects plus OFS_DELTA and REF_DELTA chains with
-    /// iterative resolution (deltas whose bases appear later in the pack,
-    /// or whose bases are already in the local object store).
+    /// Parse a packfile response and write objects to loose store
     fn parsePackfile(self: *HttpTransport, git_dir: []const u8, data: []const u8) !void {
+        _ = self;
+        _ = git_dir;
+
         // Find PACK header
         var pos: usize = 0;
         while (pos + 4 <= data.len) {
@@ -305,479 +135,112 @@ pub const HttpTransport = struct {
 
         if (pos + 8 > data.len) return; // No pack data
 
+        // Read version and object count
         const version = std.mem.readInt(u32, data[pos..][0..4], .big);
         const num_objects = std.mem.readInt(u32, data[pos + 4 ..][0..4], .big);
         pos += 8;
 
-        if (version != 2 and version != 3) return;
+        _ = version;
 
-        // Phase 1: parse every entry into memory.
-        // offset→sha map fills as objects are resolved.
-        var entries: std.ArrayList(PackEntry) = .empty;
-        defer {
-            for (entries.items) |*e| {
-                if (e.raw_delta) |rd| self.allocator.free(rd);
-                if (e.resolved_data) |rd| self.allocator.free(rd);
-            }
-            entries.deinit(self.allocator);
-        }
+        // Read objects
+        for (0..num_objects) |_| {
+            if (pos >= data.len) break;
 
-        var obj_index: u32 = 0;
-        while (obj_index < num_objects and pos + 1 < data.len) : (obj_index += 1) {
-            const obj_offset = pos;
-
+            // Parse type and size (variable-length encoding)
             const first_byte = data[pos];
             pos += 1;
-            const type_num: u8 = (first_byte >> 4) & 0x07;
-            var b = first_byte;
-            while (b & 0x80 != 0) {
-                if (pos >= data.len) return error.UnexpectedEof;
-                b = data[pos];
+
+            var obj_type: object.ObjectType = undefined;
+            var obj_size: u64 = first_byte & 0x0f;
+            var shift: u6 = 4;
+
+            switch ((first_byte >> 4) & 0x07) {
+                1 => obj_type = .commit,
+                2 => obj_type = .tree,
+                3 => obj_type = .blob,
+                4 => obj_type = .tag,
+                6 => {
+                    // OFS_DELTA - skip for now
+                    while (pos < data.len and data[pos] & 0x80 != 0) : (pos += 1) {}
+                    pos += 1;
+                    continue;
+                },
+                7 => {
+                    // REF_DELTA - skip for now
+                    pos += 20; // skip reference SHA
+                    while (pos < data.len and data[pos] & 0x80 != 0) : (pos += 1) {}
+                    pos += 1;
+                    continue;
+                },
+                else => continue,
+            }
+
+            while (pos < data.len and data[pos] & 0x80 != 0) {
+                obj_size |= @as(u64, data[pos] & 0x7f) << @intCast(shift);
+                shift += 7;
+                pos += 1;
+            }
+            if (pos < data.len) {
+                obj_size |= @as(u64, data[pos] & 0x7f) << @intCast(shift);
                 pos += 1;
             }
 
-            var entry = PackEntry{ .offset = obj_offset, .type_num = type_num };
-
-            switch (type_num) {
-                1, 2, 3, 4 => {
-                    const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
-                    pos += result.consumed;
-                    entry.resolved_data = result.data;
-                    entry.resolved = true;
-                },
-                6 => {
-                    // OFS_DELTA: base at (offset - negative_offset)
-                    const neg = try parseOfsDelta(data, &pos);
-                    entry.base_offset = obj_offset - neg;
-                    const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
-                    pos += result.consumed;
-                    entry.raw_delta = result.data;
-                },
-                7 => {
-                    // REF_DELTA: base identified by SHA
-                    if (pos + 20 > data.len) return error.UnexpectedEof;
-                    @memcpy(&entry.base_sha.?, data[pos..][0..20]);
-                    pos += 20;
-                    const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
-                    pos += result.consumed;
-                    entry.raw_delta = result.data;
-                },
-                else => return error.InvalidPackObjectType,
-            }
-
-            try entries.append(self.allocator, entry);
+            // For now, skip the compressed data
+            // A full implementation would use zlib to decompress and write as loose objects
+            _ = &obj_type;
+            _ = &obj_size;
         }
-
-        // Phase 2: iteratively resolve deltas until no progress is made.
-        // Each pass resolves deltas whose base became available in the previous pass.
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
-        var resolved_count: usize = 0;
-        var progress = true;
-        while (progress) {
-            progress = false;
-            resolved_count = 0;
-            for (entries.items) |*e| {
-                if (e.resolved) continue;
-                if (e.raw_delta == null) continue;
-
-                // Find the base data
-                var base_type: ?packfile_mod.ObjectType = null;
-                var base_data: ?[]const u8 = null;
-                var base_is_owned = false;
-
-                if (e.type_num == 6) {
-                    // Base by pack offset — must be another entry in this pack
-                    for (entries.items) |*cand| {
-                        if (cand.offset == e.base_offset and cand.resolved) {
-                            base_type = cand.looseType();
-                            base_data = cand.resolved_data.?;
-                            break;
-                        }
-                    }
-                } else {
-                    // REF_DELTA: look in-pack first, then local store
-                    for (entries.items) |*cand| {
-                        if (cand.resolved and cand.sha != null and std.mem.eql(u8, &cand.sha.?, &e.base_sha.?)) {
-                            base_type = cand.looseType();
-                            base_data = cand.resolved_data.?;
-                            break;
-                        }
-                    }
-                    if (base_data == null) {
-                        const base_obj = store.read(self.allocator, self.io, e.base_sha.?) catch null;
-                        if (base_obj) |bo| {
-                            base_type = switch (bo) {
-                                .commit => .commit,
-                                .tree => .tree,
-                                .blob => .blob,
-                                .tag => .tag,
-                            };
-                            const serialized = bo.serialize(self.allocator) catch continue;
-                            defer self.allocator.free(serialized);
-                            const nul = std.mem.indexOfScalar(u8, serialized, 0) orelse continue;
-                            base_data = self.allocator.dupe(u8, serialized[nul + 1 ..]) catch continue;
-                            base_is_owned = true;
-                        }
-                    }
-                }
-
-                const bt = base_type orelse continue;
-                const bd = base_data orelse continue;
-
-                const applied = delta_mod.applyDelta(self.allocator, bd, e.raw_delta.?) catch {
-                    if (base_is_owned) self.allocator.free(@constCast(bd));
-                    continue;
-                };
-
-                if (base_is_owned) self.allocator.free(@constCast(bd));
-                // A delta inherits its base's object type
-                e.type_num = @intFromEnum(bt);
-                e.resolved_data = applied;
-                e.resolved = true;
-                progress = true;
-            }
-        }
-
-        // Phase 3: write everything to the store and record SHAs.
-        for (entries.items) |*e| {
-            if (!e.resolved) continue; // unresolvable chain — skip
-            const ot: packfile_mod.ObjectType = @enumFromInt(e.type_num);
-            try self.writeObjectAsLoose(git_dir, ot, e.resolved_data.?);
-
-            // Record SHA so later REF_DELTAs can find it.
-            const header = try std.fmt.allocPrint(self.allocator, "{s} {d}\x00", .{ typeName(ot), e.resolved_data.?.len });
-            defer self.allocator.free(header);
-            var h = std.crypto.hash.Sha1.init(.{});
-            h.update(header);
-            h.update(e.resolved_data.?);
-            var sha: [20]u8 = undefined;
-            h.final(&sha);
-            e.sha = sha;
-        }
-    }
-
-    const PackEntry = struct {
-        offset: usize,
-        type_num: u8,
-        base_offset: usize = 0,
-        base_sha: ?[20]u8 = null,
-        raw_delta: ?[]u8 = null,
-        resolved: bool = false,
-        resolved_data: ?[]u8 = null,
-        sha: ?[20]u8 = null,    fn looseType(self: PackEntry) ?packfile_mod.ObjectType {
-        return switch (self.type_num) {
-            1...4 => @enumFromInt(self.type_num),
-            else => null,
-        }; 
-    }
-    };
-
-    fn writeObjectAsLoose(self: *HttpTransport, git_dir: []const u8, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
-        const type_str: []const u8 = switch (obj_type) {
-            .commit => "commit",
-            .tree => "tree",
-            .blob => "blob",
-            .tag => "tag",
-            else => return,
-        };
-
-        // Build git object: "type size\0content"
-        const header = try std.fmt.allocPrint(self.allocator, "{s} {d}\x00", .{ type_str, data.len });
-        defer self.allocator.free(header);
-
-        const full_obj = try self.allocator.alloc(u8, header.len + data.len);
-        defer self.allocator.free(full_obj);
-        @memcpy(full_obj[0..header.len], header);
-        @memcpy(full_obj[header.len..], data);
-
-        // Use the storage backend — respects the configured backend (loose or shard).
-        // This is the critical path where packfile objects are unpacked and stored
-        // individually. By routing through StorageBackend, sharded repos get
-        // objects distributed to the correct shard automatically.
-        const backend = storage_mod.StorageBackend.fromConfig(git_dir, null);
-        const obj_type_enum: object.ObjectType = switch (obj_type) {
-            .commit => .commit,
-            .tree => .tree,
-            .blob => .blob,
-            .tag => .tag,
-            else => return,
-        };
-        backend.writeRaw(self.allocator, self.io, obj_type_enum, full_obj) catch {};
-    }
-
-    const PendingDelta = struct {
-        base_offset: usize,
-        base_sha: ?[20]u8,
-        compressed_data: []u8,
-        is_ofs: bool,
-    };
-
-    fn parseOfsDelta(data: []const u8, pos_ptr: *usize) !usize {
-        var pos = pos_ptr.*;
-        if (pos >= data.len) return error.UnexpectedEof;
-        var b = data[pos];
-        pos += 1;
-        var ofs: usize = @as(usize, b & 0x7f);
-        while (b & 0x80 != 0) {
-            if (pos >= data.len) return error.UnexpectedEof;
-            b = data[pos];
-            pos += 1;
-            ofs = ((ofs + 1) << 7) | @as(usize, @intCast(b & 0x7f));
-        }
-        pos_ptr.* = pos;
-        return ofs;
     }
 
     /// Push objects to remote
     pub fn push(self: *HttpTransport, git_dir: []const u8, ref_name: []const u8, sha: [20]u8) !void {
+        _ = self;
+        _ = git_dir;
+        _ = ref_name;
+        _ = sha;
+        _ = git_dir;
+        _ = ref_name;
+        _ = sha;
+
+        // Full push would:
         // 1. Discover refs via GET /info/refs?service=git-receive-pack
-        var push_url: [1024]u8 = undefined;
-        const info_url = try std.fmt.bufPrint(&push_url, "{s}/info/refs?service=git-receive-pack", .{self.url});
-
-        const refs_response = try self.httpGet(info_url);
-        defer self.allocator.free(refs_response);
-
-        // Parse old remote SHA for this ref (for the update command)
-        var old_sha: ?[20]u8 = null;
-        var pos: usize = 0;
-        while (pos + 4 <= refs_response.len) {
-            const pkt_len = std.fmt.parseInt(usize, refs_response[pos..][0..4], 16) catch break;
-            if (pkt_len == 0) {
-                pos += 4;
-                continue;
-            }
-            if (pkt_len < 4) break;
-            if (pos + pkt_len > refs_response.len) break;
-            const line = refs_response[pos + 4 .. pos + pkt_len];
-            pos += pkt_len;
-
-            if (line.len >= 41 and line[40] == ' ') {
-                const sha_hex = line[0..40];
-                const name = std.mem.trimEnd(u8, line[41..], &[_]u8{ '\n', '\r' });
-                if (std.mem.eql(u8, name, ref_name)) {
-                    old_sha = Sha1.fromHex(sha_hex) catch null;
-                    break;
-                }
-            }
-        }
-
-        // 2. Collect all objects reachable from new SHA but not from old SHA
-        const objects_to_send = try self.collectPushObjects(git_dir, sha, old_sha);
-        defer self.allocator.free(objects_to_send);
-
-        if (objects_to_send.len == 0) return; // nothing to push
-
-        // 3. Build packfile
-        var pw = packfile_mod.PackWriter.init(self.allocator);
-        defer pw.deinit();
-        try pw.writeHeader(2, @intCast(objects_to_send.len));
-
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
-        for (objects_to_send) |obj_sha| {
-            const obj = store.read(self.allocator, self.io, obj_sha) catch continue;
-            const serialized = try obj.serialize(self.allocator);
-            defer self.allocator.free(serialized);
-
-            const null_pos = std.mem.indexOfScalar(u8, serialized, 0) orelse 0;
-            const content = serialized[null_pos + 1 ..];
-
-            const pot: packfile_mod.ObjectType = switch (obj) {
-                .blob => .blob,
-                .tree => .tree,
-                .commit => .commit,
-                .tag => .tag,
-            };
-            try pw.writeObject(pot, obj_sha, content);
-        }
-        try pw.finalize();
-
-        // 4. Build receive-pack command + pack data
-        var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-        defer body.deinit(self.allocator);
-
-        // Command pkt with report-status capability (required by servers)
-        var old_bytes: [20]u8 = if (old_sha) |s| s else @splat(0);
-        _ = &old_bytes;
-        const cmd_pkt = try pktline.buildPushCommand(self.allocator, old_bytes, sha, ref_name);
-        defer self.allocator.free(cmd_pkt);
-        try body.appendSlice(self.allocator, cmd_pkt);
-
-        // Flush
-        try body.appendSlice(self.allocator, "0000");
-
-        // Append pack data
-        try body.appendSlice(self.allocator, pw.getPackData());
-
-        // 5. POST to /git-receive-pack with proper Smart HTTP headers
-        const recv_url = try std.fmt.allocPrint(self.allocator, "{s}/git-receive-pack", .{self.url});
-        defer self.allocator.free(recv_url);
-
-        const response = try self.httpRequest("POST", recv_url, body.items, &.{
-            .{ .name = "Content-Type", .value = "application/x-git-receive-pack-request" },
-            .{ .name = "Accept", .value = "application/x-git-receive-pack-result" },
-        });
-        defer self.allocator.free(response);
-
-        // 6. Parse the report-status reply and surface failures to the caller.
-        const report = try pktline.parsePushReport(self.allocator, response);
-        if (!report.unpack_ok or !report.ref_ok) {
-            return error.PushRejected;
-        }
+        // 2. Build packfile with all objects reachable from new commits
+        // 3. POST to /git-receive-pack
     }
 
-    /// Collect all objects reachable from `new_sha` that are not reachable from `old_sha`.
-    fn collectPushObjects(self: *HttpTransport, git_dir: []const u8, new_sha: [20]u8, old_sha: ?[20]u8) ![][20]u8 {
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
-
-        var visited = std.AutoHashMap([20]u8, void).init(self.allocator);
-        defer visited.deinit();
-
-        var queue: std.ArrayList([20]u8) = .empty;
-        defer queue.deinit(self.allocator);
-
-        // Add old objects to visited set (they're already on the remote)
-        if (old_sha) |old| {
-            try self.markReachable(store, &visited, old);
-        }
-
-        // BFS from new_sha
-        try queue.append(self.allocator, new_sha);
-        while (queue.items.len > 0) {
-            const sha = queue.pop().?;
-            if (visited.contains(sha)) continue;
-            visited.put(sha, {}) catch {};
-
-            const obj = store.read(self.allocator, self.io, sha) catch continue;
-            switch (obj) {
-                .commit => |c| {
-                    try queue.append(self.allocator, c.tree);
-                    for (c.parents) |p| try queue.append(self.allocator, p);
-                },
-                .tree => |t| {
-                    for (t.entries) |e| try queue.append(self.allocator, e.sha);
-                },
-                .tag => |tg| {
-                    try queue.append(self.allocator, tg.object);
-                },
-                .blob => {},
-            }
-        }
-
-        // Build result: objects in visited that were NOT in old reachable set
-        // (if old_sha was null, all visited objects are new)
-        var result: std.ArrayList([20]u8) = .empty;
-        var iter = visited.iterator();
-        var old_set = std.AutoHashMap([20]u8, void).init(self.allocator);
-        defer old_set.deinit();
-        if (old_sha) |old| {
-            try self.markReachable(store, &old_set, old);
-        }
-
-        while (iter.next()) |entry| {
-            if (!old_set.contains(entry.key_ptr.*)) {
-                try result.append(self.allocator, entry.key_ptr.*);
-            }
-        }
-
-        return try result.toOwnedSlice(self.allocator);
-    }
-
-    fn markReachable(self: *HttpTransport, store: storage_mod.StorageBackend, visited: *std.AutoHashMap([20]u8, void), start_sha: [20]u8) !void {
-        var queue: std.ArrayList([20]u8) = .empty;
-        defer queue.deinit(self.allocator);
-        try queue.append(self.allocator, start_sha);
-
-        while (queue.items.len > 0) {
-            const sha = queue.pop().?;
-            if (visited.contains(sha)) continue;
-            try visited.put(sha, {});
-
-            const obj = store.read(self.allocator, self.io, sha) catch continue;
-            switch (obj) {
-                .commit => |c| {
-                    try queue.append(self.allocator, c.tree);
-                    for (c.parents) |p| try queue.append(self.allocator, p);
-                },
-                .tree => |t| {
-                    for (t.entries) |e| try queue.append(self.allocator, e.sha);
-                },
-                .tag => |tg| {
-                    try queue.append(self.allocator, tg.object);
-                },
-                .blob => {},
-            }
-        }
-    }
-
-    /// HTTP GET using std.http.Client (no curl dependency)
+    /// Simple HTTP GET using curl subprocess
     fn httpGet(self: *HttpTransport, url: []const u8) ![]const u8 {
-        return self.httpRequest("GET", url, &.{}, &.{
-            .{ .name = "Accept", .value = "application/x-git-upload-pack-advertisement" },
-        });
+        return self.httpRequest("GET", url, &.{});
     }
 
-    /// HTTP POST using std.http.Client (no curl dependency)
+    /// Simple HTTP POST using curl subprocess
     fn httpPost(self: *HttpTransport, url: []const u8, body: []const u8) ![]const u8 {
-        return self.httpRequest("POST", url, body, &.{});
+        return self.httpRequest("POST", url, body);
     }
 
-    pub const Header = struct {
-        name: []const u8,
-        value: []const u8,
-    };
+    /// Execute HTTP request via curl
+    fn httpRequest(self: *HttpTransport, method: []const u8, url: []const u8, body: []const u8) ![]const u8 {
+        var argv = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+        defer argv.deinit(self.allocator);
 
-    /// Execute HTTP request using Zig's built-in HTTP client.
-    /// Sends User-Agent git/2.45.0 for maximum server compatibility plus any
-    /// Smart HTTP content-type headers required by the endpoint.
-    fn httpRequest(
-        self: *HttpTransport,
-        method: []const u8,
-        url: []const u8,
-        body: []const u8,
-        extra_headers: []const Header,
-    ) ![]const u8 {
-        var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
-        defer client.deinit();
+        try argv.append(self.allocator, "curl");
+        try argv.append(self.allocator, "-s");
+        try argv.append(self.allocator, "-f");
+        try argv.append(self.allocator, method);
+        try argv.append(self.allocator, url);
 
-        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-
-        var aw = std.Io.Writer.Allocating.init(self.allocator);
-        defer aw.deinit();
-
-        var std_headers: std.http.Client.Request.Headers = .{};
-        std_headers.user_agent = .{ .override = "git/2.45.0" };
-
-        var extra: [5]std.http.Header = undefined;
-        var n_extra: usize = 0;
-        // Send credentials on every request when configured (info/refs GET,
-        // upload-pack POST and receive-pack POST all require them).
-        if (self.auth_header) |auth| {
-            extra[n_extra] = .{ .name = "Authorization", .value = auth };
-            n_extra += 1;
-        }
-        for (extra_headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) {
-                std_headers.content_type = .{ .override = h.value };
-            } else if (n_extra < extra.len) {
-                extra[n_extra] = .{ .name = h.name, .value = h.value };
-                n_extra += 1;
-            }
+        if (body.len > 0) {
+            try argv.append(self.allocator, "-d");
+            try argv.append(self.allocator, body);
         }
 
-        const method_enum: std.http.Method = if (std.mem.eql(u8, method, "POST")) .POST else .GET;
-
-        const result = client.fetch(.{
-            .location = .{ .uri = uri },
-            .method = method_enum,
-            .payload = if (body.len > 0) body else null,
-            .headers = std_headers,
-            .extra_headers = extra[0..n_extra],
-            .response_writer = &aw.writer,
+        // Use std.process.run (Zig 0.16 API)
+        const result = std.process.run(self.allocator, self.io, .{
+            .argv = argv.items,
         }) catch return error.HttpRequestFailed;
+        defer self.allocator.free(result.stderr);
 
-        if (@intFromEnum(result.status) >= 400) return error.HttpRequestFailed;
-
-        return try self.allocator.dupe(u8, aw.written());
+        return result.stdout;
     }
 };
 
@@ -891,7 +354,7 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
 
 /// Checkout files from a commit into a directory
 fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
 
     // Read commit
     const obj = store.read(allocator, io, commit_sha) catch return;
@@ -926,70 +389,4 @@ fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8, 
         defer file.close(io);
         try std.Io.File.writeStreamingAll(file, io, content);
     }
-}
-
-// ============================================================================
-// HTTP Basic Auth — TDD tests (written before implementation)
-// ============================================================================
-
-test "extractUrlCredentials: https with user:pass" {
-    const a = std.testing.allocator;
-    const r = try extractUrlCredentials(a, "https://alice:s3cret@example.com/repo.git");
-    defer a.free(r.clean_url);
-    defer if (r.creds) |c| {
-        a.free(c.username);
-        a.free(c.password);
-    };
-    try std.testing.expect(r.creds != null);
-    try std.testing.expectEqualStrings("alice", r.creds.?.username);
-    try std.testing.expectEqualStrings("s3cret", r.creds.?.password);
-    try std.testing.expectEqualStrings("https://example.com/repo.git", r.clean_url);
-}
-
-test "extractUrlCredentials: token-only userinfo (user, empty pass)" {
-    const a = std.testing.allocator;
-    const r = try extractUrlCredentials(a, "https://ghp_abc123@github.com/user/repo.git");
-    defer a.free(r.clean_url);
-    defer if (r.creds) |c| {
-        a.free(c.username);
-        a.free(c.password);
-    };
-    try std.testing.expect(r.creds != null);
-    try std.testing.expectEqualStrings("ghp_abc123", r.creds.?.username);
-    try std.testing.expectEqualStrings("", r.creds.?.password);
-    try std.testing.expectEqualStrings("https://github.com/user/repo.git", r.clean_url);
-}
-
-test "extractUrlCredentials: plain URL has no creds" {
-    const a = std.testing.allocator;
-    const r = try extractUrlCredentials(a, "https://github.com/user/repo.git");
-    defer a.free(r.clean_url);
-    try std.testing.expect(r.creds == null);
-    try std.testing.expectEqualStrings("https://github.com/user/repo.git", r.clean_url);
-}
-
-test "extractUrlCredentials: @ in path is not userinfo" {
-    const a = std.testing.allocator;
-    const r = try extractUrlCredentials(a, "https://example.com/user@2/repo.git");
-    defer a.free(r.clean_url);
-    try std.testing.expect(r.creds == null);
-    try std.testing.expectEqualStrings("https://example.com/user@2/repo.git", r.clean_url);
-}
-
-test "buildBasicAuthValue: known base64 vector" {
-    const a = std.testing.allocator;
-    // RFC 7617 example: user:pass -> Basic dXNlcjpwYXNz
-    const v = try buildBasicAuthValue(a, .{ .username = "user", .password = "pass" });
-    defer a.free(v);
-    try std.testing.expectEqualStrings("Basic dXNlcjpwYXNz", v);
-}
-
-test "buildBasicAuthValue: unicode-free token as password" {
-    const a = std.testing.allocator;
-    const v = try buildBasicAuthValue(a, .{ .username = "x-access-token", .password = "ghp_zzz" });
-    defer a.free(v);
-    // Verified independently: echo -n 'x-access-token:ghp_zzz' | base64
-    try std.testing.expect(std.mem.startsWith(u8, v, "Basic "));
-    try std.testing.expectEqual(@as(usize, 6 + 32), v.len); // 22 chars -> b64 30... sanity via exact:
-    try std.testing.expectEqualStrings("Basic eC1hY2Nlc3MtdG9rZW46Z2hwX3p6eg==", v);
 }

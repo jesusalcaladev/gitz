@@ -22,16 +22,8 @@ const fetch_cmd = @import("commands/fetch.zig");
 const push_cmd = @import("commands/push.zig");
 const pull_cmd = @import("commands/pull.zig");
 const config_cmd = @import("commands/config.zig");
-const sync_cmd = @import("commands/sync.zig");
-const pack_refs_cmd = @import("commands/pack_refs.zig");
-const search_cmd = @import("commands/search.zig");
-const review_cmd = @import("commands/review.zig");
-const show_cmd = @import("commands/show.zig");
-const clean_cmd = @import("commands/clean.zig");
-const shortlog_cmd = @import("commands/shortlog.zig");
-const worktree_cmd = @import("commands/worktree.zig");
 
-const VERSION = "0.7.0";
+const VERSION = "0.3.0";
 
 pub fn printHelp(io: Io) !void {
     try io.print(
@@ -59,12 +51,6 @@ pub fn printHelp(io: Io) !void {
         \\      blame       Show what revision and author last modified each line
         \\      gc          Clean up unreachable objects
         \\      config      Get and set repository options
-        \\      search      Search file contents and commit messages
-        \\      review      Code review between branches
-        \\      show        Show commit details and diff
-        \\      clean       Remove untracked files
-        \\      shortlog    Summarize commits by author
-        \\      worktree    Manage multiple working trees
         \\
         \\  REMOTE COMMANDS:
         \\      clone       Clone a repository from a URL
@@ -72,8 +58,6 @@ pub fn printHelp(io: Io) !void {
         \\      push        Update remote refs using associated local objects
         \\      pull        Fetch from and integrate with another repository
         \\      remote      Manage set of tracked repositories
-        \\      sync        Fetch + rebase + push the current branch in one step
-        \\      pack-refs   Compact loose refs into packed-refs
         \\
         \\  GLOBAL OPTIONS:
         \\      -h, --help      Show this help message
@@ -89,7 +73,7 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
     }
 
     if (std.mem.eql(u8, command, "-v") or std.mem.eql(u8, command, "--version")) {
-        try io.print("gitz v{s}\n", .{VERSION});
+        try io.print("gitz version {s}\n", .{VERSION});
         return;
     }
 
@@ -144,10 +128,6 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         try gc_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "remote")) {
         try remote_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "sync")) {
-        try sync_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "pack-refs")) {
-        try pack_refs_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "fetch")) {
         try fetch_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "push")) {
@@ -156,18 +136,6 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         try pull_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "config")) {
         try config_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "search")) {
-        try search_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "review")) {
-        try review_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "show")) {
-        try show_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "clean")) {
-        try clean_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "shortlog")) {
-        try shortlog_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "worktree")) {
-        try worktree_cmd.execute(allocator, git_dir, args, io);
     } else {
         try io.print("gitz: '{s}' is not a gitz command.\n\n", .{command});
         try printHelp(io);
@@ -175,67 +143,10 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
     }
 }
 
-/// Find the .gitz or .git directory by walking up the directory tree.
-/// Supports monorepos where .gitz may be in a parent directory.
-/// Also supports git worktrees via .git file pointing to the actual git dir.
 fn findGitDir(allocator: std.mem.Allocator, io: Io) ![]const u8 {
-    var dir_path = try std.fmt.allocPrint(allocator, ".", .{});
-    defer allocator.free(dir_path);
-
-    // Walk up to 256 levels (practical limit)
-    for (0..256) |_| {
-        // Check for .gitz directory
-        const gitz_path = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dir_path});
-        defer allocator.free(gitz_path);
-        
-        if (io.fileExists(gitz_path)) {
-            // Check if it's a real directory or a worktree .git file
-            const git_file_path = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dir_path});
-            defer allocator.free(git_file_path);
-            
-            // Try to read as file first (worktree case: .gitz contains "gitdir: ...")
-            if (std.Io.Dir.cwd().readFileAlloc(io.io, git_file_path, allocator, .unlimited)) |content| {
-                defer allocator.free(content);
-                
-                // If content starts with "gitdir:", it's a worktree reference
-                if (std.mem.startsWith(u8, content, "gitdir: ")) {
-                    const gitdir = std.mem.trim(u8, content[8..], &[_]u8{ '\n', '\r', ' ' });
-                    return allocator.dupe(u8, gitdir);
-                }
-            } else |_| {}
-            
-            // Normal directory case
-            return try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dir_path});
-        }
-        
-        // Also check for .git directory (git compatibility)
-        const git_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{dir_path});
-        defer allocator.free(git_path);
-        
-        if (io.fileExists(git_path)) {
-            // Check if .git is a file (worktree case)
-            const git_file_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{dir_path});
-            defer allocator.free(git_file_path);
-            
-            if (std.Io.Dir.cwd().readFileAlloc(io.io, git_file_path, allocator, .unlimited)) |content| {
-                defer allocator.free(content);
-                
-                // If content starts with "gitdir:", it's a worktree reference
-                if (std.mem.startsWith(u8, content, "gitdir: ")) {
-                    const gitdir = std.mem.trim(u8, content[8..], &[_]u8{ '\n', '\r', ' ' });
-                    return allocator.dupe(u8, gitdir);
-                }
-            } else |_| {}
-            
-            return try std.fmt.allocPrint(allocator, "{s}/.git", .{dir_path});
-        }
-        
-        // Move up one directory
-        const parent = std.fs.path.dirname(dir_path) orelse break;
-        const new_path = try std.fmt.allocPrint(allocator, "{s}", .{parent});
-        allocator.free(dir_path);
-        dir_path = new_path;
+    _ = allocator;
+    if (io.fileExists(".gitz")) {
+        return io.allocator.dupe(u8, ".gitz");
     }
-    
     return error.NotAGitRepo;
 }

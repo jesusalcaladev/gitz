@@ -228,17 +228,9 @@ fn decompressZlib(data: []const u8, offset: usize) ![]u8 {
 // Delta application
 // ============================================================================
 
-/// Apply a git delta to a base buffer.
-/// Format: [source-size varint][target-size varint][instructions]
-pub fn applyDelta(allocator: std.mem.Allocator, base: []const u8, delta: []const u8) ![]u8 {
+fn applyDelta(allocator: std.mem.Allocator, base: []const u8, delta: []const u8) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     var dpos: usize = 0;
-
-    // Header: source size and target size as little-endian base-128 varints.
-    _ = try readVarInt(delta, &dpos); // source size (should equal base.len)
-    const target_size = try readVarInt(delta, &dpos);
-
-    try result.ensureTotalCapacity(allocator, target_size);
 
     while (dpos < delta.len) {
         const instr = delta[dpos];
@@ -274,34 +266,9 @@ pub fn applyDelta(allocator: std.mem.Allocator, base: []const u8, delta: []const
     return try result.toOwnedSlice(allocator);
 }
 
-fn readVarInt(data: []const u8, pos: *usize) !usize {
-    var value: usize = 0;
-    var shift: u6 = 0;
-    while (true) {
-        if (pos.* >= data.len) return error.DeltaTruncated;
-        const b = data[pos.*];
-        pos.* += 1;
-        value |= @as(usize, @intCast(b & 0x7f)) << @intCast(shift);
-        if (b & 0x80 == 0) break;
-        shift +|= 7;
-    }
-    return value;
-}
-
-fn writeVarInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value_in: usize) !void {
-    var value = value_in;
-    while (true) {
-        var b: u8 = @intCast(value & 0x7f);
-        value >>= 7;
-        if (value != 0) b |= 0x80;
-        try out.append(allocator, b);
-        if (value == 0) break;
-    }
-}
-
 test "delta apply copy+insert" {
     const allocator = std.testing.allocator;
-    const base = "Hello World"; // 11 bytes
+    const base = "Hello World";
     // Simple delta: insert "Goodbye" then copy "World" from offset 6
     var delta_data: std.ArrayList(u8) = .empty;
     // Insert "Goodbye" (7 bytes)
@@ -314,78 +281,8 @@ test "delta apply copy+insert" {
     const delta_bytes = try delta_data.toOwnedSlice(allocator);
     defer allocator.free(delta_bytes);
 
-    // Header: source size 11, target size 12
-    var full: std.ArrayList(u8) = .empty;
-    defer full.deinit(allocator);
-    try writeVarInt(&full, allocator, 11);
-    try writeVarInt(&full, allocator, 12);
-    try full.appendSlice(allocator, delta_bytes);
-
-    const result = try applyDelta(allocator, base, full.items);
+    const result = try applyDelta(allocator, base, delta_bytes);
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings("GoodbyeWorld", result);
-}
-
-test "delta insert only" {
-    const allocator = std.testing.allocator;
-    var d: std.ArrayList(u8) = .empty;
-    defer d.deinit(allocator);
-    try writeVarInt(&d, allocator, 0); // source size
-    try writeVarInt(&d, allocator, 5); // target size
-    try d.append(allocator, 5);
-    try d.appendSlice(allocator, "hello");
-
-    const result = try applyDelta(allocator, "", d.items);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("hello", result);
-}
-
-test "delta copy entire base" {
-    const allocator = std.testing.allocator;
-    // Copy offset=0, length=0 → means 0x10000 per git spec
-    var d: std.ArrayList(u8) = .empty;
-    defer d.deinit(allocator);
-    try writeVarInt(&d, allocator, 0x10000);
-    try writeVarInt(&d, allocator, 0x10000);
-    try d.append(allocator, 0x80 | 0x10); // copy with length1 only
-    try d.append(allocator, 0); // length byte = 0 → 0x10000
-
-    const big = try allocator.alloc(u8, 0x10000);
-    defer allocator.free(big);
-    @memset(big, 'x');
-
-    const result = try applyDelta(allocator, big, d.items);
-    defer allocator.free(result);
-    try std.testing.expectEqual(big.len, result.len);
-}
-
-test "real-world notes delta from git pack" {
-    const allocator = std.testing.allocator;
-    // Actual delta observed from git-http-backend: src=77 dst=66, copy all
-    var base_buf: [77]u8 = undefined;
-    @memset(&base_buf, 'x');
-    @memcpy(base_buf[0..11], "rev 1 note\n");
-    const base: []const u8 = &base_buf;
-    const delta_bytes = [_]u8{ 0x4d, 0x42, 0x90, 0x42 };
-
-    const result = try applyDelta(allocator, base, &delta_bytes);
-    defer allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 66), result.len);
-    try std.testing.expect(std.mem.startsWith(u8, result, "rev 1 note\n"));
-}
-
-test "delta out of bounds rejected" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var d: std.ArrayList(u8) = .empty;
-    defer d.deinit(allocator);
-    try writeVarInt(&d, allocator, 3);
-    try writeVarInt(&d, allocator, 5);
-    try d.append(allocator, 0x80 | 0x01 | 0x10);
-    try d.append(allocator, 100); // offset beyond base
-    try d.append(allocator, 5);
-
-    try std.testing.expectError(error.DeltaOutOfBounds, applyDelta(allocator, "abc", d.items));
 }

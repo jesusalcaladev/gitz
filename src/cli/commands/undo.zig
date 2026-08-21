@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const storage_mod = @import("../../core/storage.zig");
+const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 
@@ -26,7 +26,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
 
     const current_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
         try io.eprint("fatal: no commits yet\n", .{});

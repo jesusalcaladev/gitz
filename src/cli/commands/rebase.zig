@@ -4,8 +4,6 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
-const storage_mod = @import("../../core/storage.zig");
-const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var abort_mode = false;
@@ -46,7 +44,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
 
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
         try io.eprint("fatal: not a gitz repository\n", .{});
@@ -102,45 +100,17 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         cur = commit.parents[0];
     }
 
-    // Fast-forward case: current branch is strictly behind upstream.
-    // Just move the ref and sync the working tree.
-    ff_check: {
-        var probe = current_sha;
-        while (true) {
-            const pobj = store.read(allocator, io.io, probe) catch break :ff_check;
-            const pc = switch (pobj) {
-                .commit => |c| c,
-                else => break :ff_check,
-            };
-            if (pc.parents.len == 0) break :ff_check;
-            probe = pc.parents[0];
-            if (std.mem.eql(u8, &probe, &onto_sha)) {
-                switch (head_info) {
-                    .branch => |b| {
-                        const rn = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
-                        defer allocator.free(rn);
-                        try refs_manager.write(allocator, io.io, rn, onto_sha);
-                    },
-                    .detached => {},
-                }
-                checkoutCommitToWorktree(allocator, io, git_dir, onto_sha) catch {};
-                try io.print("Fast-forwarded to {s}.\n", .{Sha1.hex(onto_sha)[0..7]});
-                return;
-            }
-        }
-    }
-
     if (commits_to_replay.items.len == 0) {
         try io.print("Nothing to do.\n", .{});
         return;
     }
 
     if (interactive) {
-        try interactiveRebase(allocator, git_dir, io, store, &refs_manager, &shas_to_replay, &commits_to_replay, onto_sha, &head_info);
+        try interactiveRebase(allocator, git_dir, io, &store, &refs_manager, &shas_to_replay, &commits_to_replay, onto_sha, &head_info);
         return;
     }
 
-    try replayCommits(allocator, git_dir, io, store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
+    try replayCommits(allocator, git_dir, io, &store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
     try io.print("Successfully rebased and updated refs/heads/{s}.\n", .{switch (head_info) {
         .branch => |b| b.name.items,
         .detached => "(detached)",
@@ -151,7 +121,7 @@ fn replayCommits(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
     io: Io,
-    store: storage_mod.StorageBackend,
+    store: *const loose.LooseStore,
     refs_manager: *const refs_mod.Refs,
     commits: *std.ArrayList(object.Commit),
     new_base: [20]u8,
@@ -193,67 +163,6 @@ fn replayCommits(
             try std.Io.File.writeStreamingAll(hf, io.io, wline);
         },
     }
-
-    // Sync the working tree to the rebased HEAD so files match the new history.
-    checkoutCommitToWorktree(allocator, io, git_dir, current_parent) catch {};
-}
-
-/// Write all blobs reachable from the commit's root tree into the working tree.
-fn checkoutCommitToWorktree(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8) !void {
-    const store2 = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const obj = store2.read(allocator, io.io, commit_sha) catch return;
-    const commit = switch (obj) {
-        .commit => |c| c,
-        else => return,
-    };
-    try checkoutTreeRecursive(allocator, io, git_dir, &store2, commit.tree, ".");
-}
-
-fn checkoutTreeRecursive(
-    allocator: std.mem.Allocator,
-    io: Io,
-    git_dir: []const u8,
-    store: *const storage_mod.StorageBackend,
-    tree_sha: [20]u8,
-    prefix: []const u8,
-) !void {
-    const tree_obj = store.read(allocator, io.io, tree_sha) catch return;
-    const tree = switch (tree_obj) {
-        .tree => |t| t,
-        else => return,
-    };
-
-    for (tree.entries) |entry| {
-        if (std.mem.indexOfScalar(u8, entry.name, '/') != null or std.mem.eql(u8, entry.name, "..")) continue;
-
-        const rel_path = if (std.mem.eql(u8, prefix, "."))
-            try allocator.dupe(u8, entry.name)
-        else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
-        defer allocator.free(rel_path);
-
-        const child = store.read(allocator, io.io, entry.sha) catch continue;
-        switch (child) {
-            .blob => |b| {
-                std.Io.Dir.cwd().createDirPath(io.io, dirOf(rel_path)) catch {};
-                var file = std.Io.Dir.cwd().createFile(io.io, rel_path, .{}) catch continue;
-                defer file.close(io.io);
-                try std.Io.File.writeStreamingAll(file, io.io, b.content);
-            },
-            .tree => {
-                std.Io.Dir.cwd().createDirPath(io.io, rel_path) catch {};
-                try checkoutTreeRecursive(allocator, io, git_dir, store, entry.sha, rel_path);
-            },
-            else => {},
-        }
-    }
-}
-
-fn dirOf(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
-        return path[0..idx];
-    }
-    return ".";
 }
 
 /// Interactive rebase TUI with arrow key navigation
@@ -261,7 +170,7 @@ fn interactiveRebase(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
     io: Io,
-    store: storage_mod.StorageBackend,
+    store: *const loose.LooseStore,
     refs_manager: *const refs_mod.Refs,
     shas: *std.ArrayList([20]u8),
     commits: *std.ArrayList(object.Commit),
@@ -270,27 +179,22 @@ fn interactiveRebase(
 ) !void {
     const Action = enum { pick, squash, reword, edit, drop };
 
-    const action_label = [_][]const u8{ "pick  ", "squash", "reword", "edit  ", "drop  " };
-    const action_color = [_][]const u8{ ui.c.green, ui.c.yellow, ui.c.magenta, ui.c.blue, ui.c.red };
-
     const n = commits.items.len;
     var actions = try allocator.alloc(Action, n);
     defer allocator.free(actions);
     for (actions) |*a| a.* = .pick;
 
-    // Clear screen and draw the static chrome once.
+    // Clear screen
     try io.print("\x1b[2J\x1b[H", .{});
-    try io.print(
-        "{s}{s}  Interactive Rebase  {s}{s}onto {s}{s}{s}\n\n",
-        .{ ui.c.bold, ui.c.bcyan, ui.c.reset, ui.c.dim, ui.c.reset, ui.c.yellow, Sha1.hex(onto)[0..7] },
-    );
-    try io.print("{s}  {d} commit(s){s}\n\n", .{ ui.c.dim, n, ui.c.reset });
+    try io.print("\x1b[1;36m=== Interactive Rebase ===\x1b[0m onto \x1b[1;33m{s}\x1b[0m\n\n", .{Sha1.hex(onto)[0..7]});
+    try io.print("\x1b[2m[p]ick  [s]quash  [r]eword  [e]dit  [d]rop | [j/k] nav | [Enter] confirm | [q] abort\x1b[0m\n\n", .{});
 
     var cursor: usize = 0;
 
+    // Main loop
     while (true) {
-        // Redraw the list area.
-        try io.print("\x1b[{d};1H", .{5});
+        // Move cursor to list area and redraw
+        try io.print("\x1b[5;1H", .{});
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -300,63 +204,42 @@ fn interactiveRebase(
             const hex = Sha1.hex(sha);
             var msg_lines = std.mem.splitScalar(u8, commit.message, '\n');
             const first_line = msg_lines.next() orelse "";
-            const ai = @intFromEnum(actions[display_idx]);
 
+            const action_str = switch (actions[display_idx]) {
+                .pick => "pick   ",
+                .squash => "squash ",
+                .reword => "reword ",
+                .edit => "edit   ",
+                .drop => "drop   ",
+            };
+
+            // Cursor indicator + colored action
             if (display_idx == cursor) {
-                try io.print(
-                    "{s}{s} {s}[{s}]{s} {s}{s}{s} {s}\x1b[K\n",
-                    .{ ui.c.reverse, ui.sym.cursor, action_color[ai], action_label[ai], ui.c.reset, ui.c.bold, hex[0..7], ui.c.reset, first_line },
-                );
+                try io.print("\x1b[1;7m> {s}\x1b[0m {s} {s}\x1b[0m\n", .{ action_str, hex[0..7], first_line });
             } else {
-                try io.print(
-                    "  {s}[{s}]{s} {s}{s}{s} {s}\x1b[K\n",
-                    .{ action_color[ai], action_label[ai], ui.c.reset, ui.c.dim, hex[0..7], ui.c.reset, first_line },
-                );
+                try io.print("  {s} {s} {s}\n", .{ action_str, hex[0..7], first_line });
             }
         }
 
-        // Status footer.
-        try io.print(
-            "\n{s} j/k or arrows: move   p pick  s squash  r reword  e edit  d drop   Enter: start   q: abort {s}",
-            .{ ui.c.reverse, ui.c.reset },
-        );
-
-        // Read a keypress, decoding CSI arrow sequences (ESC [ A/B/C/D).
+        // Read one byte from stdin
         var stdin = std.Io.File.stdin();
-        var input_buf: [8]u8 = undefined;
+        var input_buf: [1]u8 = undefined;
         const n_read = stdin.readStreaming(io.io, &.{&input_buf}) catch 0;
         if (n_read == 0) break;
-        const keys = input_buf[0..n_read];
 
-        if (keys[0] == 'q') {
+        const c = input_buf[0];
+        if (c == 'q' or c == 0x1b) {
             try io.print("\x1b[2J\x1b[H", .{});
             try io.print("Rebase aborted.\n", .{});
             return;
         }
-        if (keys[0] == '\n' or keys[0] == '\r') break;
-        if (keys[0] == 0x1b) {
-            if (n_read >= 3 and keys[1] == '[') {
-                switch (keys[2]) {
-                    'A' => { // up = older commit
-                        if (cursor < n - 1) cursor += 1;
-                    },
-                    'B' => { // down = newer commit
-                        if (cursor > 0) cursor -= 1;
-                    },
-                    else => {},
-                }
-            } else {
-                // Bare ESC: abort like git's default editor behaviour on ^C.
-                try io.print("\x1b[2J\x1b[H", .{});
-                try io.print("Rebase aborted.\n", .{});
-                return;
-            }
-        } else if (keys[0] == 'j') {
+        if (c == '\n' or c == '\r') break;
+        if (c == 'j' or c == 'B') { // down
             if (cursor > 0) cursor -= 1;
-        } else if (keys[0] == 'k') {
+        } else if (c == 'k' or c == 'A') { // up
             if (cursor < n - 1) cursor += 1;
         } else {
-            actions[cursor] = switch (keys[0]) {
+            actions[cursor] = switch (c) {
                 'p' => .pick,
                 's' => .squash,
                 'r' => .reword,
@@ -419,7 +302,7 @@ fn interactiveRebase(
         },
     }
 
-    try io.print("{s}{s}{s} Successfully rebased{s} ({d} rebased, {d} dropped).\n", .{ ui.c.bold, ui.c.bgreen, ui.sym.ok, ui.c.reset, rebased, dropped });
+    try io.print("Successfully rebased ({d} rebased, {d} dropped).\n", .{ rebased, dropped });
 }
 
 fn abortRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
@@ -445,7 +328,7 @@ fn resolveRef(
     allocator: std.mem.Allocator,
     io: std.Io,
     refs_manager: refs_mod.Refs,
-    store: storage_mod.StorageBackend,
+    store: loose.LooseStore,
     ref: []const u8,
 ) ![20]u8 {
     const branch_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{ref});
@@ -455,11 +338,6 @@ fn resolveRef(
     const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}", .{ref});
     defer allocator.free(tag_ref);
     if (refs_manager.read(allocator, io, tag_ref)) |sha| return sha else |_| {}
-
-    // Remote-tracking branch: origin/main -> refs/remotes/origin/main
-    const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}", .{ref});
-    defer allocator.free(remote_ref);
-    if (refs_manager.read(allocator, io, remote_ref)) |sha| return sha else |_| {}
 
     if (refs_manager.read(allocator, io, ref)) |sha| return sha else |_| {}
     if (Sha1.fromHex(ref)) |sha| return sha else |_| {}

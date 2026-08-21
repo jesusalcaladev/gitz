@@ -13,7 +13,7 @@ pub const StatInfo = struct {
 };
 
 pub const IndexEntry = struct {
-    sha: [20]u8 = @splat(0),
+    sha: [20]u8 = [_]u8{0} ** 20,
     mode: u32 = 0o100644,
     size: u32 = 0,
     flags: u16 = 0,
@@ -183,12 +183,12 @@ pub const Index = struct {
             const total = pos + entry.name.len + 1;
             const pad = (8 - (total % 8)) % 8;
             if (pad > 0) {
-                var pad_buf: [8]u8 = @splat(0);
+                var pad_buf: [8]u8 = [_]u8{0} ** 8;
                 try std.Io.File.writeStreamingAll(f, io, pad_buf[0..pad]);
             }
         }
 
-        var zero_sha: [20]u8 = @splat(0);
+        var zero_sha: [20]u8 = [_]u8{0} ** 20;
         try std.Io.File.writeStreamingAll(f, io, &zero_sha);
     }
 

@@ -1,10 +1,9 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const storage_mod = @import("../../core/storage.zig");
+const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
-const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var oneline = false;
@@ -60,21 +59,17 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
     if (show_all) {
-        // Show all branches — deduplicate commits shared across branches
+        // Show all branches
         const branches = try refs_manager.list(allocator, io.io, "heads");
         defer {
             for (branches) |b| allocator.free(b);
             allocator.free(branches);
         }
 
-        var visited = std.AutoHashMap([20]u8, void).init(allocator);
-        defer visited.deinit();
-
-        var first_branch = true;
         for (branches) |branch_ref| {
             const branch_sha = refs_manager.read(allocator, io.io, branch_ref) catch continue;
             const branch_name = if (std.mem.startsWith(u8, branch_ref, "refs/heads/"))
@@ -82,18 +77,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             else
                 branch_ref;
 
-            if (!first_branch) try io.print("\n", .{});
-            first_branch = false;
-
-            try io.print("{s}Branch: {s}{s}{s}\n", .{ ui.c.dim, ui.c.bcyan, branch_name, ui.c.reset });
+            try io.print("Branch: {s}\n", .{branch_name});
             var shown: usize = 0;
             var current_sha = branch_sha;
 
             while (shown < count) {
-                // Skip already-shown commits (shared across branches)
-                if (visited.contains(current_sha)) break;
-                visited.put(current_sha, {}) catch {};
-
                 const obj = store.read(allocator, io.io, current_sha) catch break;
                 const commit = switch (obj) {
                     .commit => |c| c,
@@ -126,6 +114,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                     current_sha = commit.parents[0];
                 } else break;
             }
+            try io.print("\n", .{});
         }
         return;
     }
@@ -169,7 +158,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
         // File filter: check if file was modified in this commit
         if (file_path) |fp| {
-            if (!commitTouchesFile(allocator, io.io, store, commit, fp)) {
+            if (!commitTouchesFile(allocator, io.io, &store, commit, fp)) {
                 if (commit.parents.len > 0) {
                     current_sha = commit.parents[0];
                 } else break;
@@ -193,15 +182,12 @@ fn printCommit(
     graph: bool,
 ) !void {
     const hex = Sha1.hex(sha);
-    const now_ts = std.Io.Timestamp.now(io.io, .real);
-    const now: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
-    const age = now - commit.author.timestamp;
 
     if (oneline) {
         if (graph) {
-            try io.print("{s}*{s} {s}{s}{s} ", .{ ui.c.magenta, ui.c.reset, ui.c.yellow, hex[0..7], ui.c.reset });
+            try io.print("* {s} ", .{hex[0..7]});
         } else {
-            try io.print("{s}{s}{s} ", .{ ui.c.yellow, hex[0..7], ui.c.reset });
+            try io.print("{s} ", .{hex[0..7]});
         }
         // Show first line of message only
         var msg_lines = std.mem.splitScalar(u8, commit.message, '\n');
@@ -210,17 +196,11 @@ fn printCommit(
         }
     } else {
         if (graph) {
-            try io.print("{s}*{s} ", .{ ui.c.magenta, ui.c.reset });
+            try io.print("* ", .{});
         }
-        try io.print("{s}commit {s}{s}\n", .{ ui.c.yellow, hex, ui.c.reset });
-        try io.print("{s}Author:{s} {s} <{s}>{s}\n", .{ ui.c.dim, ui.c.reset, commit.author.name, commit.author.email, ui.c.reset });
-
-        // Relative date
-        const age_str = formatAge(age);
-        try io.print("{s}Date:{s}   {s}{s}{s}\n\n", .{
-            ui.c.dim, ui.c.reset,
-            ui.c.bold, age_str, ui.c.reset,
-        });
+        try io.print("commit {s}\n", .{hex});
+        try io.print("Author: {s} <{s}>\n", .{ commit.author.name, commit.author.email });
+        try io.print("Date:   {d}\n\n", .{commit.author.timestamp});
 
         var msg_lines = std.mem.splitScalar(u8, commit.message, '\n');
         while (msg_lines.next()) |line| {
@@ -230,41 +210,13 @@ fn printCommit(
     }
 }
 
-fn formatAge(seconds: i64) []const u8 {
-    if (seconds < 0) return "just now";
-    if (seconds < 60) return "seconds ago";
-    if (seconds < 3600) {
-        const mins = @divTrunc(seconds, 60);
-        if (mins == 1) return "1 minute ago";
-        return "minutes ago";
-    }
-    if (seconds < 86400) {
-        const hrs = @divTrunc(seconds, 3600);
-        if (hrs == 1) return "1 hour ago";
-        return "hours ago";
-    }
-    if (seconds < 2592000) {
-        const days = @divTrunc(seconds, 86400);
-        if (days == 1) return "1 day ago";
-        return "days ago";
-    }
-    if (seconds < 31536000) {
-        const months = @divTrunc(seconds, 2592000);
-        if (months == 1) return "1 month ago";
-        return "months ago";
-    }
-    const years = @divTrunc(seconds, 31536000);
-    if (years == 1) return "1 year ago";
-    return "years ago";
-}
-
 fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str: []const u8, io: Io) !void {
     const sha = Sha1.fromHex(sha_str) catch {
         try io.eprint("fatal: invalid commit SHA '{s}'\n", .{sha_str});
         return;
     };
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
     const obj = store.read(allocator, io.io, sha) catch {
         try io.eprint("fatal: not a commit object '{s}'\n", .{sha_str});
         return;
@@ -290,7 +242,7 @@ fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str
 fn commitTouchesFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    store: storage_mod.StorageBackend,
+    store: *const loose.LooseStore,
     commit: object.Commit,
     file_path: []const u8,
 ) bool {

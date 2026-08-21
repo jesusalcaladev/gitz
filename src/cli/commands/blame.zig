@@ -1,9 +1,9 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
+const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
-const storage_mod = @import("../../core/storage.zig");
 
 /// Blame info for a single line
 const LineBlame = struct {
@@ -23,7 +23,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     const file_path = args[0];
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
         try io.eprint("fatal: no commits yet\n", .{});
@@ -65,14 +65,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         else => return,
     };
 
-    for (blame_result, 0..) |*blame, idx| {
+    for (blame_result) |*blame| {
         blame.sha = head_sha;
         blame.author = try allocator.dupe(u8, latest_commit.author.name);
         blame.timestamp = latest_commit.author.timestamp;
-        blame.content = if (idx < current_lines.items.len)
-            try allocator.dupe(u8, current_lines.items[idx])
-        else
-            "";
+        blame.content = ""; // will be filled later
         blame.owned = true;
     }
 
@@ -89,7 +86,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const parent_sha = commit.parents[0];
 
         // Read current commit's file content from its tree
-        const current_content = readFileFromTree(allocator, io.io, store, commit.tree, file_path);
+        const current_content = readFileFromTree(allocator, io.io, &store, commit.tree, file_path);
 
         // Read parent's content
         const parent_obj = store.read(allocator, io.io, parent_sha) catch break;
@@ -97,7 +94,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             .commit => |c| c,
             else => break,
         };
-        const parent_content = readFileFromTree(allocator, io.io, store, parent_commit.tree, file_path);
+        const parent_content = readFileFromTree(allocator, io.io, &store, parent_commit.tree, file_path);
 
         if (current_content == null or parent_content == null) break;
 
@@ -106,7 +103,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         defer allocator.free(cur);
         defer allocator.free(par);
 
-        // Copy author metadata before it might get freed
+        // Copy author name before it might get freed
+        const author_name = try allocator.dupe(u8, commit.author.name);
         const author_ts = commit.author.timestamp;
 
         // Compare line by line
@@ -118,22 +116,23 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             const par_line = par_lines.next() orelse "";
             if (line_idx < blame_result.len) {
                 if (!std.mem.eql(u8, cur_line, par_line)) {
-                    // This line was changed in this commit.
-                    // NOTE: each entry owns its own author copy — sharing one
-                    // slice here caused double-frees and garbled blame output
-                    // for commits touching several lines.
+                    // This line was changed in this commit
                     if (blame_result[line_idx].owned) {
                         allocator.free(blame_result[line_idx].author);
                         allocator.free(blame_result[line_idx].content);
                     }
                     blame_result[line_idx] = .{
                         .sha = current_sha,
-                        .author = try allocator.dupe(u8, commit.author.name),
+                        .author = author_name,
                         .timestamp = author_ts,
                         .content = try allocator.dupe(u8, cur_line),
                         .owned = true,
                     };
+                } else {
+                    allocator.free(author_name);
                 }
+            } else {
+                allocator.free(author_name);
             }
             line_idx += 1;
         }
@@ -145,39 +144,18 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     for (blame_result) |blame| {
         const hex = Sha1.hex(blame.sha);
         const ts = blame.timestamp;
-        const year = yearOf(ts);
-        // Sanitize author name — strip non-printable chars that can appear
-        // in commits imported from git repos with unusual encodings.
-        var sane_author_buf: [128]u8 = undefined;
-        var sane_len: usize = 0;
-        for (blame.author) |ch| {
-            if (ch >= 0x20 and ch < 0x7f and sane_len < sane_author_buf.len) {
-                sane_author_buf[sane_len] = ch;
-                sane_len += 1;
-            }
-        }
-        const sane_author: []const u8 = if (sane_len > 0) sane_author_buf[0..sane_len] else "unknown";
+        const year = @divFloor(ts + 946684800, 31557600) + 1970;
         try io.print("{s} ({s} {d:4}) {s}\n", .{
             hex[0..7],
-            sane_author,
+            blame.author,
             year,
             blame.content,
         });
     }
 }
 
-// Convert a Unix timestamp to a calendar year (Howard Hinnant's civil_from_days).
-fn yearOf(ts: i64) i64 {
-    const days_i64 = @divFloor(ts, 86400);
-    const z = days_i64 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
-    return yoe + era * 400;
-}
-
 /// Read a file's content from a tree object
-fn readFileFromTree(allocator: std.mem.Allocator, io: std.Io, store: storage_mod.StorageBackend, tree_sha: [20]u8, file_path: []const u8) ?[]const u8 {
+fn readFileFromTree(allocator: std.mem.Allocator, io: std.Io, store: *const loose.LooseStore, tree_sha: [20]u8, file_path: []const u8) ?[]const u8 {
     const tree_obj = store.read(allocator, io, tree_sha) catch return null;
     const tree = switch (tree_obj) {
         .tree => |t| t,

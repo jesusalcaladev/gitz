@@ -2,11 +2,10 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const object = @import("../../core/object.zig");
-const storage_mod = @import("../../core/storage.zig");
+const loose = @import("../../core/loose.zig");
 const refs_mod = @import("../../core/refs.zig");
 const index_mod = @import("../../core/index.zig");
 const config_cmd = @import("config.zig");
-const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var message: ?[]const u8 = null;
@@ -47,10 +46,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
-    const tree_sha = try idx.writeTree(store, allocator, io.io);
+    const tree_sha = try idx.writeTree(&store, allocator, io.io);
 
     // Get author info from config
     const author_name = config_cmd.getUserName(allocator, git_dir, io);
@@ -127,22 +126,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     const hex = Sha1.hex(commit_sha);
     if (amend) {
-        try io.print("{s}{s}{s} {s}{s}{s} (amend)\n", .{ ui.c.bgreen, hex[0..7], ui.c.reset, ui.c.bold, message.?, ui.c.reset });
+        try io.print("[{s}] {s} (amend)\n", .{ hex[0..7], message.? });
     } else {
-        // Determine branch name for context
-        const branch_ctx: []const u8 = blk: {
-            var hi = refs_manager.head(allocator, io.io) catch break :blk "HEAD";
-            defer hi.deinit(allocator);
-            break :blk switch (hi) {
-                .branch => |b| b.name.items,
-                .detached => "HEAD",
-            };
-        };
-        try io.print("{s}{s}{s} {s}{s}{s} {s}on {s}{s}{s}\n", .{
-            ui.c.bgreen, hex[0..7], ui.c.reset,
-            ui.c.bold, message.?, ui.c.reset,
-            ui.c.dim, ui.c.bcyan, branch_ctx, ui.c.reset,
-        });
+        try io.print("[{s}] {s}\n", .{ hex[0..7], message.? });
     }
 
     for (parents) |_| {}
@@ -151,13 +137,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // Rebuild index from committed tree to keep status accurate
     idx.deinit(allocator);
     idx = index_mod.Index.init(allocator);
-    rebuildIndexFromTree(&idx, store, allocator, io.io, tree_sha, "");
+    rebuildIndexFromTree(&idx, &store, allocator, io.io, tree_sha, "");
     try idx.writeToFile(git_dir, allocator, io.io);
     idx.deinit(allocator);
 }
 
 /// Recursively rebuild index entries from a tree object
-fn rebuildIndexFromTree(idx: *index_mod.Index, store: storage_mod.StorageBackend, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) void {
+fn rebuildIndexFromTree(idx: *index_mod.Index, store: *const loose.LooseStore, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) void {
     const tree_obj = store.read(allocator, io, tree_sha) catch return;
     const tree = switch (tree_obj) {
         .tree => |t| t,
@@ -194,20 +180,13 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
     defer idx.deinit(allocator);
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
 
     for (idx.entries.items) |*entry| {
         const clean_name = if (std.mem.startsWith(u8, entry.name, "./"))
             entry.name[2..]
         else
             entry.name;
-
-        // Quick check: stat the file first to skip if mtime unchanged
-        const stat = std.Io.Dir.cwd().statFile(io.io, clean_name, .{}) catch continue;
-        const current_mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
-        if (current_mtime == entry.mtime and @as(u64, @intCast(stat.size)) == entry.size) {
-            continue; // File hasn't changed — skip expensive SHA computation
-        }
 
         const content = std.Io.Dir.cwd().readFileAlloc(io.io, clean_name, allocator, .unlimited) catch continue;
         defer allocator.free(content);
@@ -217,6 +196,7 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
             const blob = object.GitObject{ .blob = .{ .content = content } };
             const new_sha = try store.write(allocator, io.io, blob);
 
+            const stat = std.Io.Dir.cwd().statFile(io.io, clean_name, .{}) catch continue;
             entry.sha = new_sha;
             entry.size = @intCast(stat.size);
             entry.mtime = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));

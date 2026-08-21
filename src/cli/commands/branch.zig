@@ -92,10 +92,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try refs_manager.delete(allocator, io.io, old_ref);
 
             // Update HEAD if it pointed to old branch
-            const head_path = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir});
-            defer allocator.free(head_path);
-            var head_file = std.Io.Dir.cwd().openFile(io.io, head_path, .{}) catch return;
-            defer head_file.close(io.io);
+            var head_file = std.Io.Dir.cwd().openFile(io.io,
+                try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir}),
+                .{},
+            ) catch return;
+            defer            head_file.close(io.io);
             var head_buf: [256]u8 = undefined;
             const n = try head_file.readStreaming(io.io, &.{&head_buf});
             const head_content = std.mem.trim(u8, head_buf[0..n], &[_]u8{ '\n', '\r', ' ' });

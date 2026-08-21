@@ -39,8 +39,6 @@ comptime {
     _ = @import("core/streampack.zig");
     _ = @import("core/threadpool.zig");
     _ = @import("core/objectstore.zig");
-    _ = @import("core/storage.zig");
-    _ = @import("core/shard_store.zig");
     _ = @import("core/zlib.zig");
     _ = @import("cli/commands/init.zig");
     _ = @import("cli/commands/add.zig");
@@ -68,13 +66,5 @@ comptime {
     _ = @import("transport/smart_http.zig");
     _ = @import("transport/auth.zig");
     _ = @import("cli/commands/config.zig");
-    _ = @import("cli/commands/sync.zig");
-    _ = @import("cli/commands/pack_refs.zig");
-    _ = @import("cli/commands/search.zig");
-    _ = @import("cli/commands/review.zig");
-    _ = @import("cli/commands/show.zig");
-    _ = @import("cli/commands/clean.zig");
-    _ = @import("cli/commands/shortlog.zig");
-    _ = @import("cli/commands/worktree.zig");
     _ = @import("tests/integration/compat.zig");
 }

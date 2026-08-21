@@ -2,11 +2,10 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs = @import("../../core/refs.zig");
-const storage_mod = @import("../../core/storage.zig");
+const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
 const ignore_mod = @import("../../core/ignore.zig");
-const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     _ = args;
@@ -20,11 +19,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     switch (head_info) {
         .branch => |b| {
-            try io.print("{s}On branch {s}{s}{s}\n", .{ ui.c.bold, ui.c.bcyan, b.name.items, ui.c.reset });
+            try io.print("On branch {s}\n", .{b.name.items});
         },
         .detached => |d| {
             const hex = Sha1.hex(d.sha);
-            try io.print("{s}HEAD detached at {s}{s}{s}\n", .{ ui.c.dim, ui.c.yellow, hex[0..7], ui.c.reset });
+            try io.print("HEAD detached at {s}\n", .{hex[0..7]});
         },
     }
 
@@ -41,7 +40,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         head_shas.deinit();
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = loose.LooseStore.init(git_dir);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
     if (head_sha) |sha| {
@@ -59,7 +58,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                         else => null,
                     };
                     if (tree) |t| {
-                        try flattenTreeSha(store, allocator, io.io, t, "", &head_shas);
+                        try flattenTreeSha(&store, allocator, io.io, t, "", &head_shas);
                     }
                 }
             }
@@ -85,8 +84,6 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer staged_added.deinit(allocator);
     var staged_modified = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer staged_modified.deinit(allocator);
-    var staged_deleted = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
-    defer staged_deleted.deinit(allocator);
     var unstaged_modified = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer unstaged_modified.deinit(allocator);
     var unstaged_deleted = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
@@ -171,91 +168,45 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
-    const has_staged = staged_added.items.len > 0 or staged_modified.items.len > 0 or staged_deleted.items.len > 0;
+    const has_staged = staged_added.items.len > 0 or staged_modified.items.len > 0;
     const has_unstaged = unstaged_modified.items.len > 0 or unstaged_deleted.items.len > 0;
 
     if (!has_staged and !has_unstaged and untracked.items.len == 0) {
-        try io.print("{s}{s}nothing to commit, working tree clean{s}\n", .{ ui.c.bgreen, ui.c.reset, ui.c.reset });
+        try io.print("nothing to commit, working tree clean\n", .{});
         return;
     }
 
     if (has_staged) {
-        try io.print("{s}{s}Changes to be committed:{s}\n", .{ ui.c.bold, ui.c.green, ui.c.reset });
-        try io.print("  {s}(use \"gitz restore --staged <file>...\" to unstage){s}\n", .{ ui.c.dim, ui.c.reset });
+        try io.print("Changes to be committed:\n", .{});
+        try io.print("  (use \"gitz restore --staged <file>...\" to unstage)\n", .{});
         for (staged_added.items) |name| {
-            try io.print("\t{s}new file:   {s}{s}{s}\n", .{ ui.c.green, ui.c.bold, name, ui.c.reset });
+            try io.print("\tnew file:   {s}\n", .{name});
         }
         for (staged_modified.items) |name| {
-            try io.print("\t{s}modified:   {s}{s}{s}\n", .{ ui.c.green, ui.c.bold, name, ui.c.reset });
-        }
-        for (staged_deleted.items) |name| {
-            try io.print("\t{s}deleted:    {s}{s}{s}\n", .{ ui.c.red, ui.c.bold, name, ui.c.reset });
+            try io.print("\tmodified:   {s}\n", .{name});
         }
         try io.print("\n", .{});
     }
 
     if (has_unstaged) {
-        try io.print("{s}{s}Changes not staged for commit:{s}\n", .{ ui.c.bold, ui.c.yellow, ui.c.reset });
-        try io.print("  {s}(use \"gitz add <file>...\" to update what will be committed){s}\n", .{ ui.c.dim, ui.c.reset });
+        try io.print("Changes not staged for commit:\n", .{});
+        try io.print("  (use \"gitz add <file>...\" to update what will be committed)\n", .{});
         for (unstaged_modified.items) |name| {
-            try io.print("\t{s}modified:   {s}{s}{s}\n", .{ ui.c.yellow, ui.c.bold, name, ui.c.reset });
+            try io.print("\tmodified:   {s}\n", .{name});
         }
         for (unstaged_deleted.items) |name| {
-            try io.print("\t{s}deleted:    {s}{s}{s}\n", .{ ui.c.red, ui.c.bold, name, ui.c.reset });
+            try io.print("\tdeleted:    {s}\n", .{name});
         }
         try io.print("\n", .{});
     }
 
     if (untracked.items.len > 0) {
-        try io.print("{s}{s}Untracked files:{s}\n", .{ ui.c.bold, ui.c.red, ui.c.reset });
-        try io.print("  {s}(use \"gitz add <file>...\" to include in what will be committed){s}\n", .{ ui.c.dim, ui.c.reset });
+        try io.print("Untracked files:\n", .{});
+        try io.print("  (use \"gitz add <file>...\" to include in what will be committed)\n", .{});
         for (untracked.items) |name| {
-            try io.print("\t{s}{s}{s}\n", .{ ui.c.red, name, ui.c.reset });
+            try io.print("\t{s}\n", .{name});
         }
         try io.print("\n", .{});
-    }
-
-    // Summary line
-    var summary_parts = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
-    defer summary_parts.deinit(allocator);
-
-    if (staged_added.items.len + staged_modified.items.len + staged_deleted.items.len > 0) {
-        const part = try std.fmt.allocPrint(allocator, "{s}{s}{s}staged{s}", .{
-            ui.c.green,
-            if (staged_added.items.len + staged_modified.items.len + staged_deleted.items.len > 0) ui.sym.ok else "",
-            ui.c.reset, ui.c.reset,
-        });
-        try summary_parts.append(allocator, part);
-    }
-    if (unstaged_modified.items.len + unstaged_deleted.items.len > 0) {
-        const part = try std.fmt.allocPrint(allocator, "{s}{s}{s}unstaged{s}", .{
-            ui.c.yellow,
-            if (unstaged_modified.items.len + unstaged_deleted.items.len > 0) ui.sym.warn else "",
-            ui.c.reset, ui.c.reset,
-        });
-        try summary_parts.append(allocator, part);
-    }
-    if (untracked.items.len > 0) {
-        const part = try std.fmt.allocPrint(allocator, "{s}{d}{s} untracked", .{
-            ui.c.red, untracked.items.len, ui.c.reset,
-        });
-        try summary_parts.append(allocator, part);
-    }
-
-    if (summary_parts.items.len > 0) {
-        try io.print("{s}{s}{s}", .{ ui.c.dim, ui.sym.arrow, ui.c.reset });
-        for (summary_parts.items, 0..) |part, idx2| {
-            if (idx2 > 0) {
-                try io.print("{s} · {s}", .{ ui.c.dim, ui.c.reset });
-            }
-            try io.print("{s}", .{part});
-        }
-        try io.print("\n", .{});
-    }
-
-    // Free summary parts
-    for (summary_parts.items) |part| {
-        allocator.free(part);
     }
 }
 
@@ -281,7 +232,7 @@ fn findWorkingFile(files: []const WorkingFile, name: []const u8) ?WorkingFile {
 }
 
 /// Recursively flatten tree into SHA map with full paths
-fn flattenTreeSha(store: storage_mod.StorageBackend, allocator: std.mem.Allocator, io: std.Io, tree: object.Tree, prefix: []const u8, map: *std.StringHashMap([20]u8)) !void {
+fn flattenTreeSha(store: *const loose.LooseStore, allocator: std.mem.Allocator, io: std.Io, tree: object.Tree, prefix: []const u8, map: *std.StringHashMap([20]u8)) !void {
     for (tree.entries) |entry| {
         const full_path = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
