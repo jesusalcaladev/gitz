@@ -1,8 +1,10 @@
 const std = @import("std");
 const Sha1 = @import("../core/sha1.zig").Sha1;
-const loose = @import("../core/loose.zig");
 const object = @import("../core/object.zig");
 const refs_mod = @import("../core/refs.zig");
+const zlib_mod = @import("../core/zlib.zig");
+const packfile_mod = @import("../core/packfile.zig");
+const storage_mod = @import("../core/storage.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -41,7 +43,7 @@ pub const HttpTransport = struct {
             result.deinit(self.allocator);
         }
 
-        // Use curl as a subprocess for HTTP requests (simpler than raw HTTP)
+        // Use native HTTP client (no curl dependency)
         const response = try self.httpGet(info_url);
         defer self.allocator.free(response);
 
@@ -120,9 +122,6 @@ pub const HttpTransport = struct {
 
     /// Parse a packfile response and write objects to loose store
     fn parsePackfile(self: *HttpTransport, git_dir: []const u8, data: []const u8) !void {
-        _ = self;
-        _ = git_dir;
-
         // Find PACK header
         var pos: usize = 0;
         while (pos + 4 <= data.len) {
@@ -140,107 +139,363 @@ pub const HttpTransport = struct {
         const num_objects = std.mem.readInt(u32, data[pos + 4 ..][0..4], .big);
         pos += 8;
 
-        _ = version;
+        if (version != 2 and version != 3) return;
 
-        // Read objects
-        for (0..num_objects) |_| {
-            if (pos >= data.len) break;
+        // Track offsets for ofs-delta resolution
+        var offsets = std.AutoHashMap(usize, [20]u8).init(self.allocator);
+        defer offsets.deinit();
+
+        // First pass: extract all non-delta objects and build offset→sha map
+        // Second pass: resolve deltas
+        var pending_deltas: std.ArrayList(PendingDelta) = .empty;
+        defer {
+            for (pending_deltas.items) |d| self.allocator.free(d.compressed_data);
+            pending_deltas.deinit(self.allocator);
+        }
+
+        var obj_index: u32 = 0;
+        while (obj_index < num_objects and pos + 1 < data.len) : (obj_index += 1) {
+            const obj_offset = pos;
 
             // Parse type and size (variable-length encoding)
             const first_byte = data[pos];
             pos += 1;
 
-            var obj_type: object.ObjectType = undefined;
+            const obj_type_num: u8 = (first_byte >> 4) & 0x07;
             var obj_size: u64 = first_byte & 0x0f;
             var shift: u6 = 4;
 
-            switch ((first_byte >> 4) & 0x07) {
-                1 => obj_type = .commit,
-                2 => obj_type = .tree,
-                3 => obj_type = .blob,
-                4 => obj_type = .tag,
+            var b = first_byte;
+            while (b & 0x80 != 0) {
+                if (pos >= data.len) return;
+                b = data[pos];
+                pos += 1;
+                obj_size |= @as(u64, @intCast(b & 0x7f)) << @intCast(shift);
+                shift +|= 7;
+            }
+            _ = &obj_size; // size is tracked by decompressCounted
+
+            switch (obj_type_num) {
+                1, 2, 3, 4 => {
+                    // Full object (commit, tree, blob, tag)
+                    const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
+                    defer self.allocator.free(result.data);
+
+                    pos += result.consumed;
+
+                    const obj_type: packfile_mod.ObjectType = @enumFromInt(obj_type_num);
+                    try self.writeObjectAsLoose(git_dir, obj_type, result.data);
+                },
                 6 => {
-                    // OFS_DELTA - skip for now
-                    while (pos < data.len and data[pos] & 0x80 != 0) : (pos += 1) {}
-                    pos += 1;
-                    continue;
+                    // OFS_DELTA: base is at (current_offset - negative_offset)
+                    const neg_offset = try parseOfsDelta(data, &pos);
+                    const base_offset = obj_offset - neg_offset;
+
+                    const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
+                    pos += result.consumed;
+
+                    const base_sha = offsets.get(base_offset) orelse {
+                        // Store for second pass
+                        try pending_deltas.append(self.allocator, .{
+                            .base_offset = base_offset,
+                            .base_sha = null,
+                            .compressed_data = self.allocator.dupe(u8, result.data) catch break,
+                            .is_ofs = true,
+                        });
+                        continue;
+                    };
+
+                    // Resolve delta
+                    const base_obj = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir).read(self.allocator, self.io, base_sha) catch continue;
+                    _ = base_obj;
                 },
                 7 => {
-                    // REF_DELTA - skip for now
-                    pos += 20; // skip reference SHA
-                    while (pos < data.len and data[pos] & 0x80 != 0) : (pos += 1) {}
-                    pos += 1;
-                    continue;
+                    // REF_DELTA: base identified by 20-byte SHA
+                    if (pos + 20 > data.len) return;
+                    var base_sha: [20]u8 = undefined;
+                    @memcpy(&base_sha, data[pos..][0..20]);
+                    pos += 20;
+
+                    const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
+                    pos += result.consumed;
+
+                    try pending_deltas.append(self.allocator, .{
+                        .base_offset = 0,
+                        .base_sha = base_sha,
+                        .compressed_data = self.allocator.dupe(u8, result.data) catch break,
+                        .is_ofs = false,
+                    });
                 },
-                else => continue,
+                else => break,
             }
-
-            while (pos < data.len and data[pos] & 0x80 != 0) {
-                obj_size |= @as(u64, data[pos] & 0x7f) << @intCast(shift);
-                shift += 7;
-                pos += 1;
-            }
-            if (pos < data.len) {
-                obj_size |= @as(u64, data[pos] & 0x7f) << @intCast(shift);
-                pos += 1;
-            }
-
-            // For now, skip the compressed data
-            // A full implementation would use zlib to decompress and write as loose objects
-            _ = &obj_type;
-            _ = &obj_size;
         }
+    }
+
+    fn writeObjectAsLoose(self: *HttpTransport, git_dir: []const u8, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
+        const type_str: []const u8 = switch (obj_type) {
+            .commit => "commit",
+            .tree => "tree",
+            .blob => "blob",
+            .tag => "tag",
+            else => return,
+        };
+
+        // Build git object: "type size\0content"
+        const header = try std.fmt.allocPrint(self.allocator, "{s} {d}\x00", .{ type_str, data.len });
+        defer self.allocator.free(header);
+
+        const full_obj = try self.allocator.alloc(u8, header.len + data.len);
+        defer self.allocator.free(full_obj);
+        @memcpy(full_obj[0..header.len], header);
+        @memcpy(full_obj[header.len..], data);
+
+        // Use the storage backend — respects the configured backend (loose or shard).
+        // This is the critical path where packfile objects are unpacked and stored
+        // individually. By routing through StorageBackend, sharded repos get
+        // objects distributed to the correct shard automatically.
+        const backend = storage_mod.StorageBackend.fromConfig(git_dir, null);
+        const obj_type_enum: object.ObjectType = switch (obj_type) {
+            .commit => .commit,
+            .tree => .tree,
+            .blob => .blob,
+            .tag => .tag,
+            else => return,
+        };
+        backend.writeRaw(self.allocator, self.io, obj_type_enum, full_obj) catch {};
+    }
+
+    const PendingDelta = struct {
+        base_offset: usize,
+        base_sha: ?[20]u8,
+        compressed_data: []u8,
+        is_ofs: bool,
+    };
+
+    fn parseOfsDelta(data: []const u8, pos_ptr: *usize) !usize {
+        var pos = pos_ptr.*;
+        if (pos >= data.len) return error.UnexpectedEof;
+        var b = data[pos];
+        pos += 1;
+        var ofs: usize = @as(usize, b & 0x7f);
+        while (b & 0x80 != 0) {
+            if (pos >= data.len) return error.UnexpectedEof;
+            b = data[pos];
+            pos += 1;
+            ofs = ((ofs + 1) << 7) | @as(usize, @intCast(b & 0x7f));
+        }
+        pos_ptr.* = pos;
+        return ofs;
     }
 
     /// Push objects to remote
     pub fn push(self: *HttpTransport, git_dir: []const u8, ref_name: []const u8, sha: [20]u8) !void {
-        _ = self;
-        _ = git_dir;
-        _ = ref_name;
-        _ = sha;
-        _ = git_dir;
-        _ = ref_name;
-        _ = sha;
-
-        // Full push would:
         // 1. Discover refs via GET /info/refs?service=git-receive-pack
-        // 2. Build packfile with all objects reachable from new commits
-        // 3. POST to /git-receive-pack
+        var push_url: [1024]u8 = undefined;
+        const info_url = try std.fmt.bufPrint(&push_url, "{s}/info/refs?service=git-receive-pack", .{self.url});
+
+        const refs_response = try self.httpGet(info_url);
+        defer self.allocator.free(refs_response);
+
+        // Parse old remote SHA for this ref (for the update command)
+        var old_sha: ?[20]u8 = null;
+        var pos: usize = 0;
+        while (pos + 4 <= refs_response.len) {
+            const pkt_len = std.fmt.parseInt(usize, refs_response[pos..][0..4], 16) catch break;
+            if (pkt_len == 0) {
+                pos += 4;
+                continue;
+            }
+            if (pkt_len < 4) break;
+            if (pos + pkt_len > refs_response.len) break;
+            const line = refs_response[pos + 4 .. pos + pkt_len];
+            pos += pkt_len;
+
+            if (line.len >= 41 and line[40] == ' ') {
+                const sha_hex = line[0..40];
+                const name = std.mem.trimEnd(u8, line[41..], &[_]u8{ '\n', '\r' });
+                if (std.mem.eql(u8, name, ref_name)) {
+                    old_sha = Sha1.fromHex(sha_hex) catch null;
+                    break;
+                }
+            }
+        }
+
+        // 2. Collect all objects reachable from new SHA but not from old SHA
+        const objects_to_send = try self.collectPushObjects(git_dir, sha, old_sha);
+        defer self.allocator.free(objects_to_send);
+
+        if (objects_to_send.len == 0) return; // nothing to push
+
+        // 3. Build packfile
+        var pw = packfile_mod.PackWriter.init(self.allocator);
+        defer pw.deinit();
+        try pw.writeHeader(2, @intCast(objects_to_send.len));
+
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+        for (objects_to_send) |obj_sha| {
+            const obj = store.read(self.allocator, self.io, obj_sha) catch continue;
+            const serialized = try obj.serialize(self.allocator);
+            defer self.allocator.free(serialized);
+
+            const null_pos = std.mem.indexOfScalar(u8, serialized, 0) orelse 0;
+            const content = serialized[null_pos + 1 ..];
+
+            const pot: packfile_mod.ObjectType = switch (obj) {
+                .blob => .blob,
+                .tree => .tree,
+                .commit => .commit,
+                .tag => .tag,
+            };
+            try pw.writeObject(pot, obj_sha, content);
+        }
+        try pw.finalize();
+
+        // 4. Build receive-pack command + pack data
+        var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+        defer body.deinit(self.allocator);
+
+        // Command: "<old-sha> <new-sha> <ref-name>\0"
+        const old_hex = if (old_sha) |s| Sha1.hex(s) else [_]u8{'0'} ** 40;
+        const new_hex = Sha1.hex(sha);
+        const cmd_line = try std.fmt.allocPrint(self.allocator, "{s} {s} {s}\x00", .{ &old_hex, &new_hex, ref_name });
+        defer self.allocator.free(cmd_line);
+
+        const cmd_pkt_len: u16 = @intCast(4 + cmd_line.len);
+        const cmd_pkt_hex = try std.fmt.allocPrint(self.allocator, "{x:0>4}", .{cmd_pkt_len});
+        defer self.allocator.free(cmd_pkt_hex);
+        try body.appendSlice(self.allocator, cmd_pkt_hex);
+        try body.appendSlice(self.allocator, cmd_line);
+
+        // Flush
+        try body.appendSlice(self.allocator, "0000");
+
+        // Append pack data
+        try body.appendSlice(self.allocator, pw.getPackData());
+
+        // 5. POST to /git-receive-pack
+        const recv_url = try std.fmt.allocPrint(self.allocator, "{s}/git-receive-pack", .{self.url});
+        defer self.allocator.free(recv_url);
+
+        const response = try self.httpPost(recv_url, body.items);
+        defer self.allocator.free(response);
     }
 
-    /// Simple HTTP GET using curl subprocess
+    /// Collect all objects reachable from `new_sha` that are not reachable from `old_sha`.
+    fn collectPushObjects(self: *HttpTransport, git_dir: []const u8, new_sha: [20]u8, old_sha: ?[20]u8) ![][20]u8 {
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+
+        var visited = std.AutoHashMap([20]u8, void).init(self.allocator);
+        defer visited.deinit();
+
+        var queue: std.ArrayList([20]u8) = .empty;
+        defer queue.deinit(self.allocator);
+
+        // Add old objects to visited set (they're already on the remote)
+        if (old_sha) |old| {
+            try self.markReachable(store, &visited, old);
+        }
+
+        // BFS from new_sha
+        try queue.append(self.allocator, new_sha);
+        while (queue.items.len > 0) {
+            const sha = queue.pop().?;
+            if (visited.contains(sha)) continue;
+            visited.put(sha, {}) catch {};
+
+            const obj = store.read(self.allocator, self.io, sha) catch continue;
+            switch (obj) {
+                .commit => |c| {
+                    try queue.append(self.allocator, c.tree);
+                    for (c.parents) |p| try queue.append(self.allocator, p);
+                },
+                .tree => |t| {
+                    for (t.entries) |e| try queue.append(self.allocator, e.sha);
+                },
+                .tag => |tg| {
+                    try queue.append(self.allocator, tg.object);
+                },
+                .blob => {},
+            }
+        }
+
+        // Build result: objects in visited that were NOT in old reachable set
+        // (if old_sha was null, all visited objects are new)
+        var result: std.ArrayList([20]u8) = .empty;
+        var iter = visited.iterator();
+        var old_set = std.AutoHashMap([20]u8, void).init(self.allocator);
+        defer old_set.deinit();
+        if (old_sha) |old| {
+            try self.markReachable(store, &old_set, old);
+        }
+
+        while (iter.next()) |entry| {
+            if (!old_set.contains(entry.key_ptr.*)) {
+                try result.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn markReachable(self: *HttpTransport, store: storage_mod.StorageBackend, visited: *std.AutoHashMap([20]u8, void), start_sha: [20]u8) !void {
+        var queue: std.ArrayList([20]u8) = .empty;
+        defer queue.deinit(self.allocator);
+        try queue.append(self.allocator, start_sha);
+
+        while (queue.items.len > 0) {
+            const sha = queue.pop().?;
+            if (visited.contains(sha)) continue;
+            try visited.put(sha, {});
+
+            const obj = store.read(self.allocator, self.io, sha) catch continue;
+            switch (obj) {
+                .commit => |c| {
+                    try queue.append(self.allocator, c.tree);
+                    for (c.parents) |p| try queue.append(self.allocator, p);
+                },
+                .tree => |t| {
+                    for (t.entries) |e| try queue.append(self.allocator, e.sha);
+                },
+                .tag => |tg| {
+                    try queue.append(self.allocator, tg.object);
+                },
+                .blob => {},
+            }
+        }
+    }
+
+    /// HTTP GET using std.http.Client (no curl dependency)
     fn httpGet(self: *HttpTransport, url: []const u8) ![]const u8 {
         return self.httpRequest("GET", url, &.{});
     }
 
-    /// Simple HTTP POST using curl subprocess
+    /// HTTP POST using std.http.Client (no curl dependency)
     fn httpPost(self: *HttpTransport, url: []const u8, body: []const u8) ![]const u8 {
         return self.httpRequest("POST", url, body);
     }
 
-    /// Execute HTTP request via curl
+    /// Execute HTTP request using Zig's built-in HTTP client
     fn httpRequest(self: *HttpTransport, method: []const u8, url: []const u8, body: []const u8) ![]const u8 {
-        var argv = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
-        defer argv.deinit(self.allocator);
+        var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
 
-        try argv.append(self.allocator, "curl");
-        try argv.append(self.allocator, "-s");
-        try argv.append(self.allocator, "-f");
-        try argv.append(self.allocator, method);
-        try argv.append(self.allocator, url);
+        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
-        if (body.len > 0) {
-            try argv.append(self.allocator, "-d");
-            try argv.append(self.allocator, body);
-        }
+        var aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer aw.deinit();
 
-        // Use std.process.run (Zig 0.16 API)
-        const result = std.process.run(self.allocator, self.io, .{
-            .argv = argv.items,
+        const method_enum: std.http.Method = if (std.mem.eql(u8, method, "POST")) .POST else .GET;
+
+        const result = client.fetch(.{
+            .location = .{ .uri = uri },
+            .method = method_enum,
+            .payload = if (body.len > 0) body else null,
+            .response_writer = &aw.writer,
         }) catch return error.HttpRequestFailed;
-        defer self.allocator.free(result.stderr);
 
-        return result.stdout;
+        if (@intFromEnum(result.status) >= 400) return error.HttpRequestFailed;
+
+        return try self.allocator.dupe(u8, aw.written());
     }
 };
 
@@ -354,7 +609,7 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
 
 /// Checkout files from a commit into a directory
 fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io, git_dir);
 
     // Read commit
     const obj = store.read(allocator, io, commit_sha) catch return;

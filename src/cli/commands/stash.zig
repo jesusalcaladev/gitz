@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 
@@ -62,7 +62,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
 /// Save working tree state as a commit object
 fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]const u8, io: Io) !void {
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
     // Get HEAD tree to know which files are tracked
@@ -87,7 +87,7 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
                     else => null,
                 };
                 if (commit) |c| {
-                    collectTrackedFiles(allocator, io.io, &store, c.tree, "", &tracked_files);
+                    collectTrackedFiles(allocator, io.io, store, c.tree, "", &tracked_files);
                 }
             }
         }
@@ -206,7 +206,7 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
             };
             if (head_commit2) |hc2| {
                 // Restore all tracked files from HEAD tree
-                restoreTreeToWorking(allocator, io.io, &store, hc2.tree, "");
+                restoreTreeToWorking(allocator, io.io, store, hc2.tree, "");
             }
         }
     }
@@ -225,7 +225,7 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
 fn collectTrackedFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
-    store: *const loose.LooseStore,
+    store: storage_mod.StorageBackend,
     tree_sha: [20]u8,
     prefix: []const u8,
     tracked: *std.StringHashMap(object.TreeEntry),
@@ -342,7 +342,7 @@ fn collectUntrackedFiles(
                             };
                             defer allocator.free(file_content);
 
-                            const store_obj = loose.LooseStore.init(git_dir);
+                            const store_obj = storage_mod.StorageBackend.fromRepoConfig(allocator, io, git_dir);
                             const blob = object.GitObject{ .blob = .{ .content = file_content } };
                             const sha = try store_obj.write(allocator, io, blob);
 
@@ -415,7 +415,7 @@ fn stashApply(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, rem
     }
 
     // Read the stash commit
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const stash_sha = entries.items[index].sha;
 
     const obj = store.read(allocator, io.io, stash_sha) catch {
@@ -431,7 +431,7 @@ fn stashApply(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, rem
     };
 
     // Recursively write each file from the stash tree to working directory
-    restoreTreeToWorking(allocator, io.io, &store, commit.tree, "");
+    restoreTreeToWorking(allocator, io.io, store, commit.tree, "");
     try io.print("Stash restored.\n", .{});
 
     // Remove from stash if pop
@@ -512,7 +512,7 @@ fn stashClear(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
 fn restoreTreeToWorking(
     allocator: std.mem.Allocator,
     io: std.Io,
-    store: *const loose.LooseStore,
+    store: storage_mod.StorageBackend,
     tree_sha: [20]u8,
     prefix: []const u8,
 ) void {

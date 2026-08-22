@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const objectstore_mod = @import("../../core/objectstore.zig");
 const refs_mod = @import("../../core/refs.zig");
 
@@ -15,7 +15,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer reachable.deinit();
 
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     const heads = try refs_manager.list(allocator, io.io, "heads");
     defer {
@@ -104,7 +104,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 fn markReachable(
     allocator: std.mem.Allocator,
     io: std.Io,
-    store: loose.LooseStore,
+    store: storage_mod.StorageBackend,
     reachable: *std.AutoHashMap([20]u8, void),
     sha: [20]u8,
 ) !void {

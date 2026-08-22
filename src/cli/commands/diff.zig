@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const refs = @import("../../core/refs.zig");
 const index_mod = @import("../../core/index.zig");
@@ -34,7 +34,7 @@ fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_colo
     };
     defer idx.deinit(allocator);
 
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs.Refs.init(git_dir);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
@@ -150,7 +150,7 @@ fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_colo
 }
 
 fn diffWorking(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_color: bool) !void {
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs.Refs.init(git_dir);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
@@ -261,7 +261,7 @@ fn printDiff(allocator: std.mem.Allocator, io: Io, file_name: []const u8, old_co
     try io.print("+++ b/{s}\n", .{file_name});
 
     for (diff_result.hunks) |hunk| {
-        try io.print("@@ -{d},+{d} @@\n", .{ hunk.old_start, hunk.new_start });
+        try io.print("@@ -{d},{d} +{d},{d} @@\n", .{ hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count });
 
         for (hunk.lines) |line| {
             switch (line.type) {

@@ -1,9 +1,9 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
+const storage_mod = @import("../../core/storage.zig");
 
 /// Blame info for a single line
 const LineBlame = struct {
@@ -23,7 +23,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     const file_path = args[0];
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
         try io.eprint("fatal: no commits yet\n", .{});
@@ -89,7 +89,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const parent_sha = commit.parents[0];
 
         // Read current commit's file content from its tree
-        const current_content = readFileFromTree(allocator, io.io, &store, commit.tree, file_path);
+        const current_content = readFileFromTree(allocator, io.io, store, commit.tree, file_path);
 
         // Read parent's content
         const parent_obj = store.read(allocator, io.io, parent_sha) catch break;
@@ -97,7 +97,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             .commit => |c| c,
             else => break,
         };
-        const parent_content = readFileFromTree(allocator, io.io, &store, parent_commit.tree, file_path);
+        const parent_content = readFileFromTree(allocator, io.io, store, parent_commit.tree, file_path);
 
         if (current_content == null or parent_content == null) break;
 
@@ -158,7 +158,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 }
 
 /// Read a file's content from a tree object
-fn readFileFromTree(allocator: std.mem.Allocator, io: std.Io, store: *const loose.LooseStore, tree_sha: [20]u8, file_path: []const u8) ?[]const u8 {
+fn readFileFromTree(allocator: std.mem.Allocator, io: std.Io, store: storage_mod.StorageBackend, tree_sha: [20]u8, file_path: []const u8) ?[]const u8 {
     const tree_obj = store.read(allocator, io, tree_sha) catch return null;
     const tree = switch (tree_obj) {
         .tree => |t| t,

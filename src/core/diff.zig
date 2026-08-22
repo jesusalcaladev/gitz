@@ -57,15 +57,7 @@ pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines:
                 .type = .added,
             };
         }
-        return Diff{
-            .hunks = try allocator.dupe(Hunk, &.{Hunk{
-                .old_start = 0,
-                .old_count = 0,
-                .new_start = 1,
-                .new_count = @intCast(m),
-                .lines = lines,
-            }}),
-        };
+        return try buildHunksWithContext(allocator, lines);
     }
 
     if (m == 0) {
@@ -77,15 +69,7 @@ pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines:
                 .type = .deleted,
             };
         }
-        return Diff{
-            .hunks = try allocator.dupe(Hunk, &.{Hunk{
-                .old_start = 1,
-                .old_count = @intCast(n),
-                .new_start = 0,
-                .new_count = 0,
-                .lines = lines,
-            }}),
-        };
+        return try buildHunksWithContext(allocator, lines);
     }
 
     // Compute LCS using DP table
@@ -157,15 +141,110 @@ pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines:
         return Diff{ .hunks = &.{} };
     }
 
-    return Diff{
-        .hunks = try allocator.dupe(Hunk, &.{Hunk{
-            .old_start = 1,
-            .old_count = @intCast(n),
-            .new_start = 1,
-            .new_count = @intCast(m),
-            .lines = try result_lines.toOwnedSlice(allocator),
-        }}),
-    };
+    return try buildHunksWithContext(allocator, try result_lines.toOwnedSlice(allocator));
+}
+
+/// Split a flat list of DiffLines into hunks with surrounding context lines,
+/// mirroring `git diff` output. Consecutive changes within 2×context lines
+/// of each other are merged into a single hunk.
+pub const CONTEXT_LINES: usize = 3;
+
+pub fn buildHunksWithContext(allocator: Allocator, lines: []DiffLine) !Diff {
+    if (lines.len == 0) return Diff{ .hunks = &.{} };
+
+    var hunks: std.ArrayList(Hunk) = .empty;
+    defer hunks.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < lines.len) {
+        // Skip context-only prefix lines
+        if (lines[i].type == .context) {
+            i += 1;
+            continue;
+        }
+
+        // Found a change at index i. Expand left/right by CONTEXT_LINES.
+        const start = if (i > CONTEXT_LINES) i - CONTEXT_LINES else 0;
+
+        // Find the end of this change group (scan forward for consecutive changes
+        // separated by no more than 2*CONTEXT_LINES context lines).
+        var end = i;
+        var j = i;
+        while (j < lines.len) {
+            if (lines[j].type != .context) {
+                end = j;
+            } else {
+                // Count consecutive context lines
+                var ctx_count: usize = 0;
+                var k = j;
+                while (k < lines.len and lines[k].type == .context) : (k += 1) {
+                    ctx_count += 1;
+                }
+                if (ctx_count > 2 * CONTEXT_LINES) break;
+                end = j + ctx_count; // extend past the context block
+                j = j + ctx_count;
+                continue;
+            }
+            j += 1;
+        }
+
+        // Expand right by CONTEXT_LINES
+        end = @min(end + CONTEXT_LINES + 1, lines.len);
+
+        const hunk_lines = try allocator.dupe(DiffLine, lines[start..end]);
+
+        // Compute hunk header (old_start, old_count, new_start, new_count)
+        var old_start: u32 = 0;
+        var new_start: u32 = 0;
+        var old_count: u32 = 0;
+        var new_count: u32 = 0;
+        var first_old = true;
+        var first_new = true;
+        for (hunk_lines) |line| {
+            switch (line.type) {
+                .context => {
+                    if (first_old) {
+                        old_start = line.old_line orelse 0;
+                        first_old = false;
+                    }
+                    if (first_new) {
+                        new_start = line.new_line orelse 0;
+                        first_new = false;
+                    }
+                    old_count += 1;
+                    new_count += 1;
+                },
+                .added => {
+                    if (first_new) {
+                        new_start = line.new_line orelse 0;
+                        first_new = false;
+                    }
+                    new_count += 1;
+                },
+                .deleted => {
+                    if (first_old) {
+                        old_start = line.old_line orelse 0;
+                        first_old = false;
+                    }
+                    old_count += 1;
+                },
+            }
+        }
+
+        try hunks.append(allocator, .{
+            .old_start = old_start,
+            .old_count = old_count,
+            .new_start = new_start,
+            .new_count = new_count,
+            .lines = hunk_lines,
+        });
+
+        i = end;
+    }
+
+    const result = Diff{ .hunks = try hunks.toOwnedSlice(allocator) };
+    allocator.free(lines);
+    return result;
 }
 
 // ============================================================================
@@ -226,4 +305,29 @@ test "diff replace middle" {
     const result = try myersDiff(testing.allocator, &old, &new);
     defer result.deinit(testing.allocator);
     try testing.expect(result.hunks.len > 0);
+}
+
+test "diff hunk header format" {
+    // Change in the middle should produce a hunk with correct old/new start+count
+    const old = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" };
+    const new = [_][]const u8{ "1", "2", "3", "4", "X", "6", "7", "8", "9", "10" };
+    const result = try myersDiff(testing.allocator, &old, &new);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.hunks.len == 1);
+    const h = result.hunks[0];
+    // The changed line is at position 5 (1-based), with 3 context lines on each side
+    try testing.expect(h.old_start >= 1 and h.old_start <= 2);
+    try testing.expect(h.new_start >= 1 and h.new_start <= 2);
+    // Hunk should contain context + 1 delete + 1 add
+    try testing.expect(h.lines.len >= 5); // at least ctx + del + add + ctx
+}
+
+test "diff two separate hunks" {
+    // Changes far apart should produce two separate hunks
+    const old = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15" };
+    const new = [_][]const u8{ "X", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "Y" };
+    const result = try myersDiff(testing.allocator, &old, &new);
+    defer result.deinit(testing.allocator);
+    // With 3 context lines, changes at line 1 and line 15 are >6 lines apart
+    try testing.expect(result.hunks.len >= 2);
 }

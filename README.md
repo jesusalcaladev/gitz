@@ -16,6 +16,8 @@
 - **Respects .gitignore** — full parser with `!`, `**`, `*`, `?` support
 - **Colored diff** — ANSI colors for added/removed lines
 - **Interactive rebase** — `gitz rebase -i` with pick/squash/drop menu
+- **Pluggable storage backend** — loose objects or sharded directories, configurable per-repo
+- **Shard store for horizontal scaling** — distribute objects across N shards by SHA prefix
 - **Written in Zig** — single binary, no dependencies, blazing fast
 
 ## 🚀 Quick Start
@@ -200,6 +202,41 @@ Objects use standard git format:
 - Tree: `tree <size>\0<entries>`
 - Commit: `commit <size>\0<tree + parents + author + message>`
 - All objects are zlib-compressed
+
+## 🧩 Pluggable Storage Backend
+
+GitZ separates the **wire protocol** (always packfiles, git-compatible) from the
+**internal storage** (pluggable). This allows scaling beyond git's single-filesystem model.
+
+### Loose backend (default)
+
+Standard git layout: `objects/XX/YYYY...YYYY`
+
+```bash
+gitz init  # uses loose by default
+```
+
+### Shard backend
+
+Distributes objects across N shards by SHA-1 prefix. Each shard can live on a
+different physical volume for horizontal I/O scaling.
+
+```bash
+gitz init
+gitz config storage.backend shard
+gitz config storage.shards 16
+
+# Objects are now stored as:
+# .gitz/objects/shard_00/XX/YYYY...YYYY
+# .gitz/objects/shard_01/XX/YYYY...YYYY
+# ...
+# .gitz/objects/shard_0f/XX/YYYY...YYYY
+```
+
+The shard index is `sha[0] % num_shards`, providing uniform distribution.
+The wire protocol is unaffected — objects are unpacked from incoming packfiles
+and routed to the correct shard. When sending, objects are collected from
+their shards and packed on the fly.
 
 ## 📋 Roadmap
 

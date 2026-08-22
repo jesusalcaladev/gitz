@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs_mod = @import("../../core/refs.zig");
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
 
@@ -46,7 +46,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     // Resolve target commit
     const commit_sha = resolveCommit(allocator, io.io, refs_manager, store, target.?) catch {
@@ -96,13 +96,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         },
         .mixed => {
             // Move HEAD and reset index to match target commit's tree
-            try resetIndex(allocator, git_dir, io.io, &store, commit_sha);
+            try resetIndex(allocator, git_dir, io.io, store, commit_sha);
             try io.print("HEAD is now at {s}\n", .{hex[0..7]});
         },
         .hard => {
             // Move HEAD, reset index, and overwrite working tree
-            try resetIndex(allocator, git_dir, io.io, &store, commit_sha);
-            try resetWorkingTree(allocator, git_dir, io.io, &store, commit_sha);
+            try resetIndex(allocator, git_dir, io.io, store, commit_sha);
+            try resetWorkingTree(allocator, git_dir, io.io, store, commit_sha);
             try io.print("HEAD is now at {s}\n", .{hex[0..7]});
         },
     }
@@ -110,7 +110,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 }
 
 /// Reset index to match the given commit's tree (recursive)
-fn resetIndex(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: *const loose.LooseStore, commit_sha: [20]u8) !void {
+fn resetIndex(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: storage_mod.StorageBackend, commit_sha: [20]u8) !void {
     const commit_obj = store.read(allocator, io, commit_sha) catch return;
     const commit = switch (commit_obj) {
         .commit => |c| c,
@@ -124,7 +124,7 @@ fn resetIndex(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, sto
     try idx.writeToFile(git_dir, allocator, io);
 }
 
-fn flattenTreeToIndex(idx: *index_mod.Index, store: *const loose.LooseStore, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) !void {
+fn flattenTreeToIndex(idx: *index_mod.Index, store: storage_mod.StorageBackend, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) !void {
     const tree_obj = store.read(allocator, io, tree_sha) catch return;
     const tree = switch (tree_obj) {
         .tree => |t| t,
@@ -151,7 +151,7 @@ fn flattenTreeToIndex(idx: *index_mod.Index, store: *const loose.LooseStore, all
 }
 
 /// Reset working tree to match the given commit's tree
-fn resetWorkingTree(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: *const loose.LooseStore, commit_sha: [20]u8) !void {
+fn resetWorkingTree(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: storage_mod.StorageBackend, commit_sha: [20]u8) !void {
     _ = git_dir;
     const commit_obj = store.read(allocator, io, commit_sha) catch return;
     const commit = switch (commit_obj) {
@@ -189,7 +189,7 @@ fn resolveCommit(
     allocator: std.mem.Allocator,
     io: std.Io,
     refs_manager: refs_mod.Refs,
-    store: loose.LooseStore,
+    store: storage_mod.StorageBackend,
     ref: []const u8,
 ) ![20]u8 {
     if (refs_manager.read(allocator, io, ref)) |sha| {

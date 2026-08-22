@@ -1,9 +1,9 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
+const storage_mod = @import("../../core/storage.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var no_ff = false;
@@ -28,7 +28,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
 
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     // Resolve current branch
     var head_info = refs_manager.head(allocator, io.io) catch {
@@ -57,13 +57,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     // Check if target is ancestor of current (already merged)
-    if (isAncestor(allocator, io.io, &store, current_sha, target_sha)) {
+    if (isAncestor(allocator, io.io, store, current_sha, target_sha)) {
         try io.print("Already up to date.\n", .{});
         return;
     }
 
     // Check if current is ancestor of target → fast-forward
-    const is_ff = isAncestor(allocator, io.io, &store, target_sha, current_sha);
+    const is_ff = isAncestor(allocator, io.io, store, target_sha, current_sha);
 
     if (is_ff and !no_ff) {
         // Fast-forward: move CURRENT branch pointer to target SHA
@@ -160,7 +160,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 }
 
 /// Check if 'possible_ancestor' is an ancestor of 'commit'
-fn isAncestor(allocator: std.mem.Allocator, io: std.Io, store: *const loose.LooseStore, commit_sha: [20]u8, possible_ancestor: [20]u8) bool {
+fn isAncestor(allocator: std.mem.Allocator, io: std.Io, store: storage_mod.StorageBackend, commit_sha: [20]u8, possible_ancestor: [20]u8) bool {
     var visited = std.AutoHashMap([20]u8, void).init(allocator);
     defer visited.deinit();
 

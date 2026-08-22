@@ -4,6 +4,7 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
+const storage_mod = @import("../../core/storage.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var abort_mode = false;
@@ -44,7 +45,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
 
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
         try io.eprint("fatal: not a gitz repository\n", .{});
@@ -106,11 +107,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (interactive) {
-        try interactiveRebase(allocator, git_dir, io, &store, &refs_manager, &shas_to_replay, &commits_to_replay, onto_sha, &head_info);
+        try interactiveRebase(allocator, git_dir, io, store, &refs_manager, &shas_to_replay, &commits_to_replay, onto_sha, &head_info);
         return;
     }
 
-    try replayCommits(allocator, git_dir, io, &store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
+    try replayCommits(allocator, git_dir, io, store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
     try io.print("Successfully rebased and updated refs/heads/{s}.\n", .{switch (head_info) {
         .branch => |b| b.name.items,
         .detached => "(detached)",
@@ -121,7 +122,7 @@ fn replayCommits(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
     io: Io,
-    store: *const loose.LooseStore,
+    store: storage_mod.StorageBackend,
     refs_manager: *const refs_mod.Refs,
     commits: *std.ArrayList(object.Commit),
     new_base: [20]u8,
@@ -170,7 +171,7 @@ fn interactiveRebase(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
     io: Io,
-    store: *const loose.LooseStore,
+    store: storage_mod.StorageBackend,
     refs_manager: *const refs_mod.Refs,
     shas: *std.ArrayList([20]u8),
     commits: *std.ArrayList(object.Commit),
@@ -328,7 +329,7 @@ fn resolveRef(
     allocator: std.mem.Allocator,
     io: std.Io,
     refs_manager: refs_mod.Refs,
-    store: loose.LooseStore,
+    store: storage_mod.StorageBackend,
     ref: []const u8,
 ) ![20]u8 {
     const branch_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{ref});

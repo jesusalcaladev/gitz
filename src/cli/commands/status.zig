@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs = @import("../../core/refs.zig");
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
 const ignore_mod = @import("../../core/ignore.zig");
@@ -40,7 +40,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         head_shas.deinit();
     }
 
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
     if (head_sha) |sha| {
@@ -58,7 +58,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                         else => null,
                     };
                     if (tree) |t| {
-                        try flattenTreeSha(&store, allocator, io.io, t, "", &head_shas);
+                        try flattenTreeSha(store, allocator, io.io, t, "", &head_shas);
                     }
                 }
             }
@@ -232,7 +232,7 @@ fn findWorkingFile(files: []const WorkingFile, name: []const u8) ?WorkingFile {
 }
 
 /// Recursively flatten tree into SHA map with full paths
-fn flattenTreeSha(store: *const loose.LooseStore, allocator: std.mem.Allocator, io: std.Io, tree: object.Tree, prefix: []const u8, map: *std.StringHashMap([20]u8)) !void {
+fn flattenTreeSha(store: storage_mod.StorageBackend, allocator: std.mem.Allocator, io: std.Io, tree: object.Tree, prefix: []const u8, map: *std.StringHashMap([20]u8)) !void {
     for (tree.entries) |entry| {
         const full_path = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })

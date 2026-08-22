@@ -39,6 +39,8 @@ comptime {
     _ = @import("core/streampack.zig");
     _ = @import("core/threadpool.zig");
     _ = @import("core/objectstore.zig");
+    _ = @import("core/storage.zig");
+    _ = @import("core/shard_store.zig");
     _ = @import("core/zlib.zig");
     _ = @import("cli/commands/init.zig");
     _ = @import("cli/commands/add.zig");

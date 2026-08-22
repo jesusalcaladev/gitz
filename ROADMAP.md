@@ -88,6 +88,9 @@ gitz push                    ✅ Push commits a remote
 | Auth (SSH keys, tokens) | `auth.zig` | ✅ | Auto-detect credentials |
 | ObjectStore unified | `objectstore.zig` | ✅ | Loose + pack transparente |
 | Zlib compression | `zlib.zig` | ✅ | Git-compatible objects |
+| **Pluggable storage backend** | `storage.zig` | ✅ | **Backends intercambiables sin tocar el código** |
+| **Shard store (distribuido)** | `shard_store.zig` | ✅ | **Objetos distribuidos por SHA prefix, I/O paralelo** |
+| **Config-driven backend** | `storage.zig` | ✅ | `gitz config storage.backend shard` |
 
 ---
 
