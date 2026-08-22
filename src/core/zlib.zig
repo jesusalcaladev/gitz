@@ -33,6 +33,19 @@ pub const zlib = struct {
 
     /// Decompress zlib-format data using streamRemaining.
     pub fn decompress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+        const result = try decompressCounted(allocator, data);
+        return result.data;
+    }
+
+    /// Decompress zlib data and report how many compressed bytes were consumed.
+    /// This is essential for packfile parsing where multiple zlib-compressed
+    /// objects are concatenated back-to-back.
+    pub const DecompressResult = struct {
+        data: []u8,
+        consumed: usize,
+    };
+
+    pub fn decompressCounted(allocator: std.mem.Allocator, data: []const u8) !DecompressResult {
         var reader = std.Io.Reader.fixed(data);
 
         var decomp_buf: [std.compress.flate.max_window_len]u8 = undefined;
@@ -43,7 +56,10 @@ pub const zlib = struct {
 
         _ = decomp.reader.streamRemaining(&aw.writer) catch 0;
 
-        return try aw.toOwnedSlice();
+        return .{
+            .data = try aw.toOwnedSlice(),
+            .consumed = reader.seek,
+        };
     }
 };
 

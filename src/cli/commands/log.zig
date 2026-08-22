@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 
@@ -59,7 +59,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
     if (show_all) {
@@ -158,7 +158,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
         // File filter: check if file was modified in this commit
         if (file_path) |fp| {
-            if (!commitTouchesFile(allocator, io.io, &store, commit, fp)) {
+            if (!commitTouchesFile(allocator, io.io, store, commit, fp)) {
                 if (commit.parents.len > 0) {
                     current_sha = commit.parents[0];
                 } else break;
@@ -216,7 +216,7 @@ fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str
         return;
     };
 
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const obj = store.read(allocator, io.io, sha) catch {
         try io.eprint("fatal: not a commit object '{s}'\n", .{sha_str});
         return;
@@ -242,7 +242,7 @@ fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str
 fn commitTouchesFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    store: *const loose.LooseStore,
+    store: storage_mod.StorageBackend,
     commit: object.Commit,
     file_path: []const u8,
 ) bool {

@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const object = @import("../../core/object.zig");
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const refs_mod = @import("../../core/refs.zig");
 const index_mod = @import("../../core/index.zig");
 const config_cmd = @import("config.zig");
@@ -46,10 +46,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
-    const tree_sha = try idx.writeTree(&store, allocator, io.io);
+    const tree_sha = try idx.writeTree(store, allocator, io.io);
 
     // Get author info from config
     const author_name = config_cmd.getUserName(allocator, git_dir, io);
@@ -137,13 +137,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // Rebuild index from committed tree to keep status accurate
     idx.deinit(allocator);
     idx = index_mod.Index.init(allocator);
-    rebuildIndexFromTree(&idx, &store, allocator, io.io, tree_sha, "");
+    rebuildIndexFromTree(&idx, store, allocator, io.io, tree_sha, "");
     try idx.writeToFile(git_dir, allocator, io.io);
     idx.deinit(allocator);
 }
 
 /// Recursively rebuild index entries from a tree object
-fn rebuildIndexFromTree(idx: *index_mod.Index, store: *const loose.LooseStore, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) void {
+fn rebuildIndexFromTree(idx: *index_mod.Index, store: storage_mod.StorageBackend, allocator: std.mem.Allocator, io: std.Io, tree_sha: [20]u8, prefix: []const u8) void {
     const tree_obj = store.read(allocator, io, tree_sha) catch return;
     const tree = switch (tree_obj) {
         .tree => |t| t,
@@ -180,7 +180,7 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
     defer idx.deinit(allocator);
 
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     for (idx.entries.items) |*entry| {
         const clean_name = if (std.mem.startsWith(u8, entry.name, "./"))

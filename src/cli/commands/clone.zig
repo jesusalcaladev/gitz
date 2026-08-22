@@ -1,6 +1,11 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const zlib_mod = @import("../../core/zlib.zig");
+const http = @import("../../transport/http.zig");
+const refs_mod = @import("../../core/refs.zig");
+const storage_mod = @import("../../core/storage.zig");
+const object = @import("../../core/object.zig");
+const Sha1 = @import("../../core/sha1.zig").Sha1;
 
 pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     if (args.len == 0) {
@@ -25,232 +30,199 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
 
     try io.print("Cloning into '{s}'...\n", .{dest});
 
-    // Use git clone --bare into a temp directory
-    const tmp_dir = ".gitz_tmp_clone";
-    std.Io.Dir.cwd().deleteTree(io.io, tmp_dir) catch {};
+    // Create destination directory structure
+    std.Io.Dir.cwd().createDirPath(io.io, dest) catch {};
 
-    var child_argv = [_][]const u8{ "git", "clone", "--bare", url, tmp_dir };
+    // Create .gitz structure
+    const gitz_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dest});
+    defer allocator.free(gitz_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, gitz_dir) catch {};
 
-    var child = std.process.spawn(io.io, .{
-        .argv = &child_argv,
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch {
-        try io.eprint("fatal: 'git' is required for clone (install git first)\n", .{});
-        return;
-    };
+    const refs_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/heads", .{dest});
+    defer allocator.free(refs_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, refs_dir) catch {};
 
-    drainChild(&child, io);
-    const term = child.wait(io.io) catch {
-        try io.eprint("fatal: git clone failed\n", .{});
-        return;
-    };
+    const tags_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/tags", .{dest});
+    defer allocator.free(tags_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, tags_dir) catch {};
 
-    if (term != .exited or term.exited != 0) {
-        try io.eprint("fatal: git clone failed\n", .{});
-        std.Io.Dir.cwd().deleteTree(io.io, tmp_dir) catch {};
-        return;
-    }
-
-    // Import objects and refs from the bare clone
-    var object_count: u32 = 0;
-
-    // Use git pack-objects or just copy objects directly
-    // The simplest approach: copy the entire objects directory
-    copyObjects(allocator, io, tmp_dir, dest, &object_count) catch {};
-
-    // Copy refs using git show-ref
-    const ref_count = copyRefs(allocator, io, tmp_dir, dest) catch 0;
+    const objects_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/objects", .{dest});
+    defer allocator.free(objects_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, objects_dir) catch {};
 
     // Write HEAD
-    const head_src = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{tmp_dir});
-    defer allocator.free(head_src);
-    if (readFile(io, head_src)) |h| {
-        defer allocator.free(h);
-        io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dest})) catch {};
-        io.writeFile(try std.fmt.allocPrint(allocator, "{s}/.gitz/HEAD", .{dest}), h) catch {};
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/HEAD", .{dest});
+    defer allocator.free(head_path);
+    var hf = try std.Io.Dir.cwd().createFile(io.io, head_path, .{});
+    defer hf.close(io.io);
+    try std.Io.File.writeStreamingAll(hf, io.io, "ref: refs/heads/main\n");
+
+    // Write remote config
+    const remotes_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes", .{dest});
+    defer allocator.free(remotes_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, remotes_dir) catch {};
+    const remote_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes/origin", .{dest});
+    defer allocator.free(remote_path);
+    io.writeFile(remote_path, url) catch {};
+
+    // Use native HTTP transport to discover refs and fetch objects
+    var transport = http.HttpTransport.init(allocator, io.io, url) catch {
+        try io.eprint("fatal: could not connect to '{s}'\n", .{url});
+        return;
+    };
+    defer transport.deinit();
+
+    const remote_refs = transport.discoverRefs() catch {
+        try io.eprint("fatal: could not read from remote repository.\n", .{});
+        try io.eprint("Please make sure you have the correct access rights\n", .{});
+        try io.eprint("and the repository exists.\n", .{});
+        return;
+    };
+    defer {
+        for (remote_refs) |r| allocator.free(r.name);
+        allocator.free(remote_refs);
     }
 
-    // Write remote
-    io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes", .{dest})) catch {};
-    io.writeFile(try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes/origin", .{dest}), url) catch {};
+    if (remote_refs.len == 0) {
+        try io.eprint("fatal: no refs found on remote\n", .{});
+        return;
+    }
 
-    // Cleanup
-    std.Io.Dir.cwd().deleteTree(io.io, tmp_dir) catch {};
+    // Find default branch (main or master)
+    var head_sha: ?[20]u8 = null;
+    var default_branch: ?[]const u8 = null;
+    for (remote_refs) |ref| {
+        if (std.mem.eql(u8, ref.name, "refs/heads/main") or
+            std.mem.eql(u8, ref.name, "refs/heads/master"))
+        {
+            head_sha = ref.sha;
+            default_branch = ref.name;
+            break;
+        }
+    }
+    if (head_sha == null) {
+        head_sha = remote_refs[0].sha;
+        default_branch = remote_refs[0].name;
+    }
+
+    // Write all remote refs locally
+    const refs_manager = refs_mod.Refs.init(gitz_dir);
+    var ref_count: u32 = 0;
+    for (remote_refs) |ref| {
+        if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
+            refs_manager.write(allocator, io.io, ref.name, ref.sha) catch continue;
+            ref_count += 1;
+
+            // Write remote-tracking ref
+            const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/origin/{s}", .{ref.name[11..]});
+            defer allocator.free(remote_ref);
+            const remote_ref_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/remotes/origin", .{dest});
+            defer allocator.free(remote_ref_dir);
+            std.Io.Dir.cwd().createDirPath(io.io, remote_ref_dir) catch {};
+            refs_manager.write(allocator, io.io, remote_ref, ref.sha) catch {};
+        } else if (std.mem.startsWith(u8, ref.name, "refs/tags/")) {
+            refs_manager.write(allocator, io.io, ref.name, ref.sha) catch {};
+            ref_count += 1;
+        }
+    }
+
+    // Set HEAD to default branch
+    if (default_branch) |db| {
+        const branch_name = if (std.mem.startsWith(u8, db, "refs/heads/")) db[11..] else db;
+        const symbolic_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{branch_name});
+        defer allocator.free(symbolic_ref);
+        refs_manager.writeSymbolic(allocator, io.io, "HEAD", symbolic_ref) catch {};
+    }
+
+    // Fetch all objects
+    transport.fetch(gitz_dir, remote_refs, &.{}) catch {
+        try io.eprint("warning: fetch incomplete, some objects may be missing\n", .{});
+    };
+
+    // Checkout files from HEAD commit
+    if (head_sha) |sha| {
+        checkoutFiles(allocator, io, gitz_dir, sha, dest) catch {
+            try io.eprint("warning: checkout incomplete\n", .{});
+        };
+    }
+
+    var object_count: u32 = 0;
+    // Count objects in the new repo
+    const obj_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/objects", .{dest});
+    defer allocator.free(obj_dir);
+    countObjects(allocator, io, obj_dir, &object_count) catch {};
 
     try io.print("Cloned into '{s}'\n", .{dest});
     try io.print("  {d} refs, {d} objects\n", .{ ref_count, object_count });
 }
 
-/// Copy all objects from git bare repo to gitz loose format
-fn copyObjects(allocator: std.mem.Allocator, io: Io, bare_repo: []const u8, dest: []const u8, count: *u32) !void {
-    io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dest})) catch {};
-    io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz/objects", .{dest})) catch {};
+/// Recursively count loose objects in the objects directory.
+fn countObjects(allocator: std.mem.Allocator, io: Io, dir_path: []const u8, count: *u32) !void {
+    var dir = std.Io.Dir.cwd().openDir(io.io, dir_path, .{}) catch return;
+    defer dir.close(io.io);
 
-    // Get list of ALL objects with their types using git for-each-object or similar
-    // Use: git --git-dir <bare> cat-file --batch-all-objects --batch-check
-    // This outputs: "<sha> <type> <size>" for each object
-    var batch_argv = [_][]const u8{ "git", "--git-dir", bare_repo, "cat-file", "--batch-all-objects", "--batch-check" };
-
-    var batch_child = std.process.spawn(io.io, .{
-        .argv = &batch_argv,
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch return;
-
-    var batch_output = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    defer batch_output.deinit(allocator);
-    readChildOutput(&batch_child, io, &batch_output, allocator);
-    _ = batch_child.wait(io.io) catch {};
-
-    // Parse each line: "<sha> <type> <size>"
-    var lines = std.mem.splitScalar(u8, batch_output.items, '\n');
-    while (lines.next()) |line| {
-        if (line.len < 42) continue;
-
-        // Find first space
-        const first_space = std.mem.indexOf(u8, line, " ") orelse continue;
-        const sha_hex = line[0..first_space];
-        if (sha_hex.len != 40) continue;
-
-        const rest = line[first_space + 1 ..];
-        const second_space = std.mem.indexOf(u8, rest, " ") orelse continue;
-        const obj_type = rest[0..second_space];
-
-        // Now dump the raw object content
-        var dump_argv = [_][]const u8{ "git", "--git-dir", bare_repo, "cat-file", obj_type, sha_hex };
-
-        var dump_child = std.process.spawn(io.io, .{
-            .argv = &dump_argv,
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        }) catch continue;
-
-        var raw_data = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-        defer raw_data.deinit(allocator);
-        readChildOutput(&dump_child, io, &raw_data, allocator);
-        _ = dump_child.wait(io.io) catch {};
-
-        if (raw_data.items.len == 0) continue;
-
-        // Build the gitz loose object: "<type> <size>\0<content>"
-        const size_str = std.fmt.allocPrint(allocator, "{d}", .{raw_data.items.len}) catch continue;
-        defer allocator.free(size_str);
-
-        var obj_content = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-        defer obj_content.deinit(allocator);
-
-        obj_content.appendSlice(allocator, obj_type) catch continue;
-        obj_content.append(allocator, ' ') catch continue;
-        obj_content.appendSlice(allocator, size_str) catch continue;
-        obj_content.append(allocator, 0) catch continue; // null byte
-        obj_content.appendSlice(allocator, raw_data.items) catch continue;
-
-        // Compute SHA from the full object content (git-compatible)
-        const sha = @import("../../core/sha1.zig").Sha1.hash(obj_content.items);
-        const hex = @import("../../core/sha1.zig").Sha1.hex(sha);
-
-        // Ensure parent directory exists
-        const prefix_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/objects/{s}", .{ dest, hex[0..2] });
-        defer allocator.free(prefix_dir);
-        io.makeDir(prefix_dir) catch {};
-
-        const obj_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/objects/{s}/{s}", .{ dest, hex[0..2], hex[2..40] });
-        defer allocator.free(obj_path);
-
-        // Compress with zlib for git compatibility
-        const compressed = zlib_mod.zlib.compress(allocator, obj_content.items) catch obj_content.items;
-        defer if (compressed.ptr != obj_content.items.ptr) allocator.free(compressed);
-        io.writeFile(obj_path, compressed) catch {};
-        count.* += 1;
-    }
-}
-
-/// Copy refs from git bare repo to gitz format
-fn copyRefs(allocator: std.mem.Allocator, io: Io, bare_repo: []const u8, dest: []const u8) !u32 {
-    io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/heads", .{dest})) catch {};
-    io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/tags", .{dest})) catch {};
-    io.makeDir(try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/remotes", .{dest})) catch {};
-
-    var ref_argv = [_][]const u8{ "git", "--git-dir", bare_repo, "show-ref" };
-
-    var ref_child = std.process.spawn(io.io, .{
-        .argv = &ref_argv,
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch return 0;
-
-    var ref_output = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    defer ref_output.deinit(allocator);
-    readChildOutput(&ref_child, io, &ref_output, allocator);
-    _ = ref_child.wait(io.io) catch {};
-
-    var count: u32 = 0;
-    var lines = std.mem.splitScalar(u8, ref_output.items, '\n');
-    while (lines.next()) |line| {
-        if (line.len < 41) continue;
-        if (line[40] != ' ') continue;
-
-        const sha_hex = line[0..40];
-        const ref_name = std.mem.trim(u8, line[41..], " \n\r");
-
-        if (std.mem.eql(u8, ref_name, "HEAD")) continue;
-
-        const ref_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/{s}", .{ dest, ref_name });
-        defer allocator.free(ref_path);
-
-        // Ensure parent directory exists
-        if (std.mem.lastIndexOf(u8, ref_path, "/")) |slash_pos| {
-            const parent = ref_path[0..slash_pos];
-            io.makeDir(parent) catch {};
-        }
-
-        const content = try std.fmt.allocPrint(allocator, "{s}\n", .{sha_hex});
-        defer allocator.free(content);
-        io.writeFile(ref_path, content) catch {};
-        count += 1;
-    }
-
-    return count;
-}
-
-fn readChildOutput(child: *std.process.Child, io: Io, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
-    while (child.stdout) |*s| {
-        var read_buf: [65536]u8 = undefined;
-        const n = s.readStreaming(io.io, &.{&read_buf}) catch 0;
-        if (n == 0) {
-            s.close(io.io);
-            child.stdout = null;
-            break;
-        }
-        buf.appendSlice(allocator, read_buf[0..n]) catch {};
-    }
-    while (child.stderr) |*s| {
-        s.close(io.io);
-        child.stderr = null;
-    }
-}
-
-fn drainChild(child: *std.process.Child, io: Io) void {
-    while (child.stdout) |*s| {
-        var buf: [4096]u8 = undefined;
-        const n = s.readStreaming(io.io, &.{&buf}) catch 0;
-        if (n == 0) {
-            s.close(io.io);
-            child.stdout = null;
-            break;
+    var iter = dir.iterate();
+    while (iter.next(io.io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+            defer allocator.free(sub_path);
+            try countObjects(allocator, io, sub_path, count);
+        } else if (entry.name.len == 38) {
+            count.* += 1;
         }
     }
-    while (child.stderr) |*s| {
-        s.close(io.io);
-        child.stderr = null;
+}
+
+/// Checkout files from a commit into a directory
+fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+
+    // Read commit
+    const obj = store.read(allocator, io.io, commit_sha) catch return;
+    const commit = switch (obj) {
+        .commit => |c| c,
+        else => return,
+    };
+
+    // Read tree
+    const tree_obj = store.read(allocator, io.io, commit.tree) catch return;
+    const tree = switch (tree_obj) {
+        .tree => |t| t,
+        else => return,
+    };
+
+    for (tree.entries) |entry| {
+        checkoutTreeEntry(allocator, io, git_dir, entry, dest) catch continue;
     }
 }
 
-fn readFile(io: Io, path: []const u8) ?[]u8 {
-    return io.readFileAlloc(path) catch null;
+fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, entry: object.TreeEntry, dest: []const u8) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const blob_obj = store.read(allocator, io.io, entry.sha) catch return;
+
+    switch (blob_obj) {
+        .blob => |b| {
+            const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest, entry.name });
+            defer allocator.free(file_path);
+
+            // Ensure parent directory exists
+            if (std.fs.path.dirname(file_path)) |dir| {
+                std.Io.Dir.cwd().createDirPath(io.io, dir) catch {};
+            }
+
+            var file = std.Io.Dir.cwd().createFile(io.io, file_path, .{}) catch return;
+            defer file.close(io.io);
+            try std.Io.File.writeStreamingAll(file, io.io, b.content);
+        },
+        .tree => |t| {
+            // Recurse into subdirectory
+            const sub_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest, entry.name });
+            defer allocator.free(sub_dir);
+            std.Io.Dir.cwd().createDirPath(io.io, sub_dir) catch {};
+            for (t.entries) |sub_entry| {
+                checkoutTreeEntry(allocator, io, git_dir, sub_entry, dest) catch continue;
+            }
+        },
+        else => {},
+    }
 }

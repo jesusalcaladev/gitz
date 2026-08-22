@@ -3,7 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs_mod = @import("../../core/refs.zig");
 const object = @import("../../core/object.zig");
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     const refs_manager = refs_mod.Refs.init(git_dir);
@@ -96,7 +96,7 @@ fn createAnnotatedTag(
     io: Io,
 ) !void {
     const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     const target_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
         try io.eprint("fatal: no commits yet\n", .{});

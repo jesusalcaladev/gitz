@@ -75,7 +75,9 @@ pub const LooseStore = struct {
     pub fn writeRaw(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, obj_type: ObjectType, data: []const u8) !void {
         _ = obj_type;
 
-        try std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(allocator, "{s}/objects", .{self.git_dir}));
+        const objects_dir = try std.fmt.allocPrint(allocator, "{s}/objects", .{self.git_dir});
+        defer allocator.free(objects_dir);
+        try std.Io.Dir.cwd().createDirPath(io, objects_dir);
 
         const sha = Sha1.hash(data);
         const hex = Sha1.hex(sha);

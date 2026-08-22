@@ -3,7 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const index_mod = @import("../../core/index.zig");
 const object = @import("../../core/object.zig");
-const loose = @import("../../core/loose.zig");
+const storage_mod = @import("../../core/storage.zig");
 const ignore_mod = @import("../../core/ignore.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
@@ -46,7 +46,7 @@ fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.In
     const content = buf[0..n];
 
     // Write blob to object store
-    const store = loose.LooseStore.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const blob = object.GitObject{ .blob = .{ .content = content } };
     const sha = try store.write(allocator, io.io, blob);
 
