@@ -18,8 +18,11 @@ pub fn build(b: *std.Build) void {
     // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    if (b.option([]const u8, "args", "Arguments to pass to gitz (space-separated)")) |raw_args| {
+        var it = std.mem.splitScalar(u8, raw_args, ' ');
+        while (it.next()) |arg| {
+            if (arg.len > 0) run_cmd.addArg(arg);
+        }
     }
     const run_step = b.step("run", "Run gitz");
     run_step.dependOn(&run_cmd.step);

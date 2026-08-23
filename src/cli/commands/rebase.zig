@@ -101,6 +101,34 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         cur = commit.parents[0];
     }
 
+    // Fast-forward case: current branch is strictly behind upstream.
+    // Just move the ref and sync the working tree.
+    ff_check: {
+        var probe = current_sha;
+        while (true) {
+            const pobj = store.read(allocator, io.io, probe) catch break :ff_check;
+            const pc = switch (pobj) {
+                .commit => |c| c,
+                else => break :ff_check,
+            };
+            if (pc.parents.len == 0) break :ff_check;
+            probe = pc.parents[0];
+            if (std.mem.eql(u8, &probe, &onto_sha)) {
+                switch (head_info) {
+                    .branch => |b| {
+                        const rn = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
+                        defer allocator.free(rn);
+                        try refs_manager.write(allocator, io.io, rn, onto_sha);
+                    },
+                    .detached => {},
+                }
+                checkoutCommitToWorktree(allocator, io, git_dir, onto_sha) catch {};
+                try io.print("Fast-forwarded to {s}.\n", .{Sha1.hex(onto_sha)[0..7]});
+                return;
+            }
+        }
+    }
+
     if (commits_to_replay.items.len == 0) {
         try io.print("Nothing to do.\n", .{});
         return;
@@ -164,6 +192,67 @@ fn replayCommits(
             try std.Io.File.writeStreamingAll(hf, io.io, wline);
         },
     }
+
+    // Sync the working tree to the rebased HEAD so files match the new history.
+    checkoutCommitToWorktree(allocator, io, git_dir, current_parent) catch {};
+}
+
+/// Write all blobs reachable from the commit's root tree into the working tree.
+fn checkoutCommitToWorktree(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8) !void {
+    const store2 = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const obj = store2.read(allocator, io.io, commit_sha) catch return;
+    const commit = switch (obj) {
+        .commit => |c| c,
+        else => return,
+    };
+    try checkoutTreeRecursive(allocator, io, git_dir, &store2, commit.tree, ".");
+}
+
+fn checkoutTreeRecursive(
+    allocator: std.mem.Allocator,
+    io: Io,
+    git_dir: []const u8,
+    store: *const storage_mod.StorageBackend,
+    tree_sha: [20]u8,
+    prefix: []const u8,
+) !void {
+    const tree_obj = store.read(allocator, io.io, tree_sha) catch return;
+    const tree = switch (tree_obj) {
+        .tree => |t| t,
+        else => return,
+    };
+
+    for (tree.entries) |entry| {
+        if (std.mem.indexOfScalar(u8, entry.name, '/') != null or std.mem.eql(u8, entry.name, "..")) continue;
+
+        const rel_path = if (std.mem.eql(u8, prefix, "."))
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        defer allocator.free(rel_path);
+
+        const child = store.read(allocator, io.io, entry.sha) catch continue;
+        switch (child) {
+            .blob => |b| {
+                std.Io.Dir.cwd().createDirPath(io.io, dirOf(rel_path)) catch {};
+                var file = std.Io.Dir.cwd().createFile(io.io, rel_path, .{}) catch continue;
+                defer file.close(io.io);
+                try std.Io.File.writeStreamingAll(file, io.io, b.content);
+            },
+            .tree => {
+                std.Io.Dir.cwd().createDirPath(io.io, rel_path) catch {};
+                try checkoutTreeRecursive(allocator, io, git_dir, store, entry.sha, rel_path);
+            },
+            else => {},
+        }
+    }
+}
+
+fn dirOf(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
+        return path[0..idx];
+    }
+    return ".";
 }
 
 /// Interactive rebase TUI with arrow key navigation
@@ -339,6 +428,11 @@ fn resolveRef(
     const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}", .{ref});
     defer allocator.free(tag_ref);
     if (refs_manager.read(allocator, io, tag_ref)) |sha| return sha else |_| {}
+
+    // Remote-tracking branch: origin/main -> refs/remotes/origin/main
+    const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}", .{ref});
+    defer allocator.free(remote_ref);
+    if (refs_manager.read(allocator, io, remote_ref)) |sha| return sha else |_| {}
 
     if (refs_manager.read(allocator, io, ref)) |sha| return sha else |_| {}
     if (Sha1.fromHex(ref)) |sha| return sha else |_| {}

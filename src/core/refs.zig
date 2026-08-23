@@ -94,7 +94,7 @@ pub const Refs = struct {
 
     pub fn head(self: Refs, allocator: std.mem.Allocator, io: std.Io) !HeadInfo {
         const sha = self.read(allocator, io, "HEAD") catch {
-            return HeadInfo{ .detached = .{ .sha = [_]u8{0} ** 20 } };
+            return HeadInfo{ .detached = .{ .sha = (@as([20]u8, @splat(0))) } };
         };
 
         const head_content = self.readFileContent(allocator, io, "HEAD") catch {

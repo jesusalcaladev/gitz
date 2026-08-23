@@ -24,17 +24,26 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const fetch_args = [_][]const u8{name};
     try @import("fetch.zig").execute(allocator, git_dir, &fetch_args, io);
 
-    // Step 2: Merge or rebase
+    // Determine the current branch so we rebase onto <remote>/<same-branch>
+    const refs_manager = @import("../../core/refs.zig").Refs.init(git_dir);
+    const current_branch: ?[]const u8 = blk: {
+        var head_info = refs_manager.head(allocator, io.io) catch break :blk null;
+        defer head_info.deinit(allocator);
+        break :blk switch (head_info) {
+            .branch => |b| allocator.dupe(u8, b.name.items) catch null,
+            .detached => null,
+        };
+    };
+
+    const target_branch = current_branch orelse "main";
+
     if (merge_mode) {
-        try io.print("Merging {s}/main into current branch...\n", .{name});
-        const merge_args = [_][]const u8{ try std.fmt.allocPrint(allocator, "{s}/main", .{name}) };
-        defer allocator.free(merge_args[0]);
+        try io.print("Merging {s}/{s} into current branch...\n", .{ name, target_branch });
+        const merge_args = [_][]const u8{try std.fmt.allocPrint(allocator, "{s}/{s}", .{ name, target_branch })};
         try @import("merge.zig").execute(allocator, git_dir, &merge_args, io);
     } else {
-        // Default: rebase
-        try io.print("Rebasing onto {s}/main...\n", .{name});
-        const rebase_args = [_][]const u8{ try std.fmt.allocPrint(allocator, "{s}/main", .{name}) };
-        defer allocator.free(rebase_args[0]);
+        try io.print("Rebasing onto {s}/{s}...\n", .{ name, target_branch });
+        const rebase_args = [_][]const u8{try std.fmt.allocPrint(allocator, "{s}/{s}", .{ name, target_branch })};
         try @import("rebase.zig").execute(allocator, git_dir, &rebase_args, io);
     }
 }

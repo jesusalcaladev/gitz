@@ -138,27 +138,27 @@ pub const MergeFileResult = struct {
 test "merge base found" {
     const engine = MergeEngine.init(testing.allocator);
     const history_a = [_][20]u8{
-        [_]u8{0x03} ** 20,
-        [_]u8{0x02} ** 20,
-        [_]u8{0x01} ** 20,
+        (@as([20]u8, @splat(0x03))),
+        (@as([20]u8, @splat(0x02))),
+        (@as([20]u8, @splat(0x01))),
     };
     const history_b = [_][20]u8{
-        [_]u8{0x05} ** 20,
-        [_]u8{0x04} ** 20,
-        [_]u8{0x02} ** 20,
-        [_]u8{0x01} ** 20,
+        (@as([20]u8, @splat(0x05))),
+        (@as([20]u8, @splat(0x04))),
+        (@as([20]u8, @splat(0x02))),
+        (@as([20]u8, @splat(0x01))),
     };
 
     const base = engine.findMergeBase(&history_a, &history_b);
     try testing.expect(base != null);
-    const expected: [20]u8 = .{0x02} ** 20;
+    const expected: [20]u8 = @splat(0x02);
     try testing.expectEqual(expected, base.?);
 }
 
 test "merge base not found" {
     const engine = MergeEngine.init(testing.allocator);
-    const history_a = [_][20]u8{ [_]u8{0x01} ** 20, [_]u8{0x02} ** 20 };
-    const history_b = [_][20]u8{ [_]u8{0x03} ** 20, [_]u8{0x04} ** 20 };
+    const history_a = [_][20]u8{ (@as([20]u8, @splat(0x01))), (@as([20]u8, @splat(0x02))) };
+    const history_b = [_][20]u8{ (@as([20]u8, @splat(0x03))), (@as([20]u8, @splat(0x04))) };
 
     const base = engine.findMergeBase(&history_a, &history_b);
     try testing.expectEqual(@as(?[20]u8, null), base);
@@ -214,12 +214,12 @@ test "merge file - no base conflict" {
 test "is fast forward" {
     const engine = MergeEngine.init(testing.allocator);
     const history = [_][20]u8{
-        [_]u8{0x03} ** 20,
-        [_]u8{0x02} ** 20,
-        [_]u8{0x01} ** 20,
+        (@as([20]u8, @splat(0x03))),
+        (@as([20]u8, @splat(0x02))),
+        (@as([20]u8, @splat(0x01))),
     };
 
-    try testing.expect(engine.isFastForward(&history, [_]u8{0x02} ** 20));
-    try testing.expect(engine.isFastForward(&history, [_]u8{0x01} ** 20));
-    try testing.expect(!engine.isFastForward(&history, [_]u8{0x04} ** 20));
+    try testing.expect(engine.isFastForward(&history, (@as([20]u8, @splat(0x02)))));
+    try testing.expect(engine.isFastForward(&history, (@as([20]u8, @splat(0x01)))));
+    try testing.expect(!engine.isFastForward(&history, (@as([20]u8, @splat(0x04)))));
 }

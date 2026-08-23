@@ -143,7 +143,7 @@ pub fn writeIndex(allocator: std.mem.Allocator, shas: []const [20]u8, offsets: [
     try buf.appendSlice(allocator, &.{ 0, 0, 0, 2 });
 
     // Build fanout table
-    var fanout: [256]u32 = [_]u32{0} ** 256;
+    var fanout: [256]u32 = @splat(0);
     for (shas) |sha| {
         fanout[sha[0]] += 1;
     }
@@ -174,9 +174,9 @@ pub fn writeIndex(allocator: std.mem.Allocator, shas: []const [20]u8, offsets: [
     }
 
     // Pack SHA-1 placeholder
-    try buf.appendSlice(allocator, &[_]u8{0} ** 20);
+    try buf.appendSlice(allocator, &(@as([20]u8, @splat(0))));
     // Index SHA-1 placeholder
-    try buf.appendSlice(allocator, &[_]u8{0} ** 20);
+    try buf.appendSlice(allocator, &(@as([20]u8, @splat(0))));
 
     return try buf.toOwnedSlice(allocator);
 }

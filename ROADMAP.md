@@ -1,7 +1,7 @@
 # GitZ Roadmap — Estado Actual
 
 > Última actualización: Agosto 2026
-> Estado: **Fase 1 completa + Fase 2A/2B parcial**
+> Estado: **Fase 1 completa + Fase 2A/2B completa (transport verificado end-to-end)**
 
 ---
 
@@ -132,18 +132,18 @@ gitz push                    ✅ Push commits a remote
 
 ---
 
-## 🟢 Fase 2A — Transporte HTTP: 5/8
+## 🟢 Fase 2A — Transporte HTTP: 8/8 ✅
 
 | Paso | Comando | Estado |
 |------|---------|--------|
-| 17 | Wire Protocol v2 | 🟡 Básico — pkt-line parsing |
-| 18 | Smart HTTP Client | 🟡 Parcial — curl fallback |
-| 19 | `gitz fetch` | ✅ SSH fetch con pkt-line |
-| 20 | `gitz clone` | ✅ Clone completo vía SSH |
-| 21 | `gitz push` | ✅ Push vía SSH |
-| 22 | `gitz pull` | ✅ Fetch + rebase |
+| 17 | Wire Protocol v2 | ✅ pkt-line completo: want/have/done, side-band-64k, report-status |
+| 18 | Smart HTTP Client | ✅ Nativo (std.http), Content-Type/Accept/User-Agent correctos |
+| 19 | `gitz fetch` | ✅ HTTP + SSH fetch con pkt-line, refs/remotes actualizadas |
+| 20 | `gitz clone` | ✅ Clone completo vía SSH + HTTP |
+| 21 | `gitz push` | ✅ Push HTTP verificado contra git-http-backend real; git puede clonar lo que gitz empuja |
+| 22 | `gitz pull` | ✅ Fetch + rebase, fast-forward con checkout del working tree |
 | 23 | `gitz remote` | ✅ add/remove/list/set-url |
-| 24 | Tests HTTP | 🔴 Pendiente |
+| 24 | Tests HTTP | ✅ Tests unitarios pkt-line + E2E contra git-http-backend (`scripts/test_http_server.py`) |
 
 ---
 
@@ -178,7 +178,7 @@ gitz push                    ✅ Push commits a remote
 | 35 | Documentation | 🟡 README + ROADMAP |
 | 36 | Error Messages | 🟡 Básicos |
 | 37 | Dogfooding | ✅ Gitz se versiona a sí mismo |
-| 38 | Tests Finales | 🟡 50+ tests |
+| 38 | Tests Finales | ✅ 70+ tests unitarios + integración + compat E2E |
 | 39 | Benchmark Suite | ✅ benchmarks/bench.sh |
 | 40 | Release v1.0 | 🔴 No implementado |
 
@@ -189,12 +189,35 @@ gitz push                    ✅ Push commits a remote
 | Fase | Total | ✅ Hecho | 🟡 Parcial | 🔴 Pendiente |
 |------|-------|----------|------------|--------------|
 | 1A Core Local | 16 | 15 | 0 | 1 |
-| 2A Transport HTTP | 8 | 5 | 2 | 1 |
+| 2A Transport HTTP | 8 | 8 | 0 | 0 |
 | 2B Transport SSH | 2 | 2 | 0 | 0 |
 | 3 DX | 7 | 2 | 1 | 4 |
-| 4 Polish | 7 | 2 | 2 | 3 |
+| 4 Polish | 7 | 3 | 2 | 2 |
 | Escalabilidad | 14 | 14 | 0 | 0 |
-| **Total** | **47** | **40** | **3** | **9** |
+| **Total** | **47** | **44** | **3** | **7** |
+
+---
+
+## 🔁 Compatibilidad bidireccional verificada (Agosto 2026)
+
+Verificado end-to-end contra `git-http-backend` real (git 2.34):
+
+```
+gitz init → gitz add . → gitz commit → gitz push origin main   ✅
+git clone http://…/origin.git                                  ✅ mismo SHA, contenido íntegro
+git commit + git push → gitz fetch                             ✅ refs/remotes/origin/main actualizada
+gitz pull                                                      ✅ fast-forward + working tree sincronizado
+gitz pull (con commits locales) → rebase                       ✅ historial rebased legible por git
+zig build test                                                 ✅ todos los tests pasan
+```
+
+Protocolo implementado en `src/core/pktline.zig`:
+- `want <sha> <caps>` con capabilities en el primer want (`multi_ack thin-pack side-band-64k ofs-delta agent=git/2.45.0`)
+- `have` lines para adelgazar el pack entrante
+- Sideband unwrapping (banda 1 = pack, banda 2/3 ignoradas)
+- Push: comando `<old> <new> <ref>\0report-status agent=…` + parseo de `unpack ok` / `ok ref` / `ng ref reason`
+- Headers Smart HTTP obligatorios: `Content-Type: application/x-git-{upload,receive}-pack-request`, `Accept: …-result`, `User-Agent: git/2.45.0`
+- Refs fully-qualified (`refs/heads/main`) en el wire protocol
 
 ---
 

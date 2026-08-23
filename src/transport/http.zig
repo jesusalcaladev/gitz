@@ -5,6 +5,7 @@ const refs_mod = @import("../core/refs.zig");
 const zlib_mod = @import("../core/zlib.zig");
 const packfile_mod = @import("../core/packfile.zig");
 const storage_mod = @import("../core/storage.zig");
+const pktline = @import("../core/pktline.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -71,7 +72,12 @@ pub const HttpTransport = struct {
 
             if (ref_line.len >= 41 and ref_line[40] == ' ') {
                 const sha_hex = ref_line[0..40];
-                const name = std.mem.trimEnd(u8, ref_line[41..], &[_]u8{ '\n', '\r' });
+                // Strip capabilities after \0 (e.g. "HEAD\x00multi_ack ...")
+                var raw_name = std.mem.trimEnd(u8, ref_line[41..], &[_]u8{ '\n', '\r' });
+                if (std.mem.indexOfScalar(u8, raw_name, 0)) |nul| {
+                    raw_name = raw_name[0..nul];
+                }
+                const name = raw_name;
 
                 const sha = Sha1.fromHex(sha_hex) catch continue;
                 const owned_name = self.allocator.dupe(u8, name) catch continue;
@@ -88,36 +94,48 @@ pub const HttpTransport = struct {
 
     /// Fetch objects from remote
     pub fn fetch(self: *HttpTransport, git_dir: []const u8, refs: []RemoteRef, have_shas: []const [20]u8) !void {
-        _ = have_shas;
 
         // Build the upload-pack request body
         var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
         defer body.deinit(self.allocator);
 
-        // Report wanted refs
-        for (refs) |ref| {
-            var line_buf: [128]u8 = undefined;
-            const hex = Sha1.hex(ref.sha);
-            const line = try std.fmt.bufPrint(&line_buf, "want {s}\n", .{&hex});
-            var pkt_buf: [132]u8 = undefined;
-            const pkt_len = 4 + line.len;
-            const pkt_hex = std.fmt.bytesToHex([2]u8{ @intCast(pkt_len >> 8), @intCast(pkt_len & 0xff) }, .lower);
-            const pkt = try std.fmt.bufPrint(&pkt_buf, "{s}{s}", .{&pkt_hex, line});
-            try body.appendSlice(self.allocator, pkt);
+        // Report wanted refs. First want must carry capabilities.
+        const caps = "multi_ack thin-pack side-band-64k ofs-delta agent=git/2.45.0";
+        for (refs, 0..) |ref, i| {
+            const want_pkt = try pktline.buildWantLineCaps(self.allocator, ref.sha, caps, i == 0);
+            defer self.allocator.free(want_pkt);
+            try body.appendSlice(self.allocator, want_pkt);
         }
+        if (refs.len == 0) return error.NoWantedRefs;
 
         try body.appendSlice(self.allocator, "0000");
+
+        // Advertise what we already have so the server can thin the pack.
+        for (have_shas) |sha| {
+            const have_pkt = try pktline.buildHaveLine(self.allocator, sha);
+            defer self.allocator.free(have_pkt);
+            try body.appendSlice(self.allocator, have_pkt);
+        }
+
         try body.appendSlice(self.allocator, "0009done\n");
 
         var upload_url: [1024]u8 = undefined;
         const url = try std.fmt.bufPrint(&upload_url, "{s}/git-upload-pack", .{self.url});
 
-        // POST the request
-        const response = try self.httpPost(url, body.items);
+        // POST the request with Smart HTTP content types (required by git servers)
+        const response = try self.httpRequest("POST", url, body.items, &.{
+            .{ .name = "Content-Type", .value = "application/x-git-upload-pack-request" },
+            .{ .name = "Accept", .value = "application/x-git-upload-pack-result" },
+        });
         defer self.allocator.free(response);
 
-        // Parse the packfile from response
-        try self.parsePackfile(git_dir, response);
+        // We negotiated side-band-64k: unwrap the framing first so interleaved
+        // progress packets don't corrupt the pack stream.
+        const unframed = try pktline.stripSideband(self.allocator, response);
+        defer self.allocator.free(unframed);
+
+        // Parse the packfile from the unwrapped stream (falls back internally).
+        try self.parsePackfile(git_dir, if (unframed.len > 0) unframed else response);
     }
 
     /// Parse a packfile response and write objects to loose store
@@ -354,17 +372,12 @@ pub const HttpTransport = struct {
         var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
         defer body.deinit(self.allocator);
 
-        // Command: "<old-sha> <new-sha> <ref-name>\0"
-        const old_hex = if (old_sha) |s| Sha1.hex(s) else [_]u8{'0'} ** 40;
-        const new_hex = Sha1.hex(sha);
-        const cmd_line = try std.fmt.allocPrint(self.allocator, "{s} {s} {s}\x00", .{ &old_hex, &new_hex, ref_name });
-        defer self.allocator.free(cmd_line);
-
-        const cmd_pkt_len: u16 = @intCast(4 + cmd_line.len);
-        const cmd_pkt_hex = try std.fmt.allocPrint(self.allocator, "{x:0>4}", .{cmd_pkt_len});
-        defer self.allocator.free(cmd_pkt_hex);
-        try body.appendSlice(self.allocator, cmd_pkt_hex);
-        try body.appendSlice(self.allocator, cmd_line);
+        // Command pkt with report-status capability (required by servers)
+        var old_bytes: [20]u8 = if (old_sha) |s| s else @splat(0);
+        _ = &old_bytes;
+        const cmd_pkt = try pktline.buildPushCommand(self.allocator, old_bytes, sha, ref_name);
+        defer self.allocator.free(cmd_pkt);
+        try body.appendSlice(self.allocator, cmd_pkt);
 
         // Flush
         try body.appendSlice(self.allocator, "0000");
@@ -372,12 +385,21 @@ pub const HttpTransport = struct {
         // Append pack data
         try body.appendSlice(self.allocator, pw.getPackData());
 
-        // 5. POST to /git-receive-pack
+        // 5. POST to /git-receive-pack with proper Smart HTTP headers
         const recv_url = try std.fmt.allocPrint(self.allocator, "{s}/git-receive-pack", .{self.url});
         defer self.allocator.free(recv_url);
 
-        const response = try self.httpPost(recv_url, body.items);
+        const response = try self.httpRequest("POST", recv_url, body.items, &.{
+            .{ .name = "Content-Type", .value = "application/x-git-receive-pack-request" },
+            .{ .name = "Accept", .value = "application/x-git-receive-pack-result" },
+        });
         defer self.allocator.free(response);
+
+        // 6. Parse the report-status reply and surface failures to the caller.
+        const report = try pktline.parsePushReport(self.allocator, response);
+        if (!report.unpack_ok or !report.ref_ok) {
+            return error.PushRejected;
+        }
     }
 
     /// Collect all objects reachable from `new_sha` that are not reachable from `old_sha`.
@@ -466,16 +488,31 @@ pub const HttpTransport = struct {
 
     /// HTTP GET using std.http.Client (no curl dependency)
     fn httpGet(self: *HttpTransport, url: []const u8) ![]const u8 {
-        return self.httpRequest("GET", url, &.{});
+        return self.httpRequest("GET", url, &.{}, &.{
+            .{ .name = "Accept", .value = "application/x-git-upload-pack-advertisement" },
+        });
     }
 
     /// HTTP POST using std.http.Client (no curl dependency)
     fn httpPost(self: *HttpTransport, url: []const u8, body: []const u8) ![]const u8 {
-        return self.httpRequest("POST", url, body);
+        return self.httpRequest("POST", url, body, &.{});
     }
 
-    /// Execute HTTP request using Zig's built-in HTTP client
-    fn httpRequest(self: *HttpTransport, method: []const u8, url: []const u8, body: []const u8) ![]const u8 {
+    pub const Header = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    /// Execute HTTP request using Zig's built-in HTTP client.
+    /// Sends User-Agent git/2.45.0 for maximum server compatibility plus any
+    /// Smart HTTP content-type headers required by the endpoint.
+    fn httpRequest(
+        self: *HttpTransport,
+        method: []const u8,
+        url: []const u8,
+        body: []const u8,
+        extra_headers: []const Header,
+    ) ![]const u8 {
         var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -484,12 +521,28 @@ pub const HttpTransport = struct {
         var aw = std.Io.Writer.Allocating.init(self.allocator);
         defer aw.deinit();
 
+        var std_headers: std.http.Client.Request.Headers = .{};
+        std_headers.user_agent = .{ .override = "git/2.45.0" };
+
+        var extra: [3]std.http.Header = undefined;
+        var n_extra: usize = 0;
+        for (extra_headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) {
+                std_headers.content_type = .{ .override = h.value };
+            } else if (n_extra < extra.len) {
+                extra[n_extra] = .{ .name = h.name, .value = h.value };
+                n_extra += 1;
+            }
+        }
+
         const method_enum: std.http.Method = if (std.mem.eql(u8, method, "POST")) .POST else .GET;
 
         const result = client.fetch(.{
             .location = .{ .uri = uri },
             .method = method_enum,
             .payload = if (body.len > 0) body else null,
+            .headers = std_headers,
+            .extra_headers = extra[0..n_extra],
             .response_writer = &aw.writer,
         }) catch return error.HttpRequestFailed;
 

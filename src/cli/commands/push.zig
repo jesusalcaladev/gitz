@@ -71,9 +71,24 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     var transport = try http.HttpTransport.init(allocator, io.io, url.?);
     defer transport.deinit();
 
-    try transport.push(git_dir, ref, push_sha);
+    // The wire protocol requires the fully-qualified ref name.
+    const full_ref = if (std.mem.startsWith(u8, ref, "refs/"))
+        try allocator.dupe(u8, ref)
+    else
+        try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{ref});
+    defer allocator.free(full_ref);
 
-    const hex = Sha1.hex(push_sha);
+    transport.push(git_dir, full_ref, push_sha) catch |err| {
+        try io.eprint("error: failed to push '{s}' to {s}\n", .{ ref, url.? });
+        switch (err) {
+            error.PushRejected => {
+                try io.eprint("! [remote rejected] {s} (check remote permissions/history)\n", .{ref});
+                return;
+            },
+            else => return err,
+        }
+    };
+
     try io.print("To {s}\n", .{url.?});
-    try io.print("   {s}..{s}  {s} -> {s}\n", .{ hex[0..7], hex[0..7], ref, ref });
+    try io.print("   *       {s} -> {s}\n", .{ ref, full_ref });
 }
