@@ -212,5 +212,17 @@ pub fn getRemoteUrl(allocator: std.mem.Allocator, git_dir: []const u8, name: []c
     if (config.get(section, "url")) |url| {
         return allocator.dupe(u8, url) catch null;
     }
-    return null;
+
+    // Fallback: plain remotes/<name> file written by `gitz clone`
+    const remote_path = std.fmt.allocPrint(allocator, "{s}/remotes/{s}", .{ git_dir, name }) catch return null;
+    defer allocator.free(remote_path);
+    const raw = io.readFileAlloc(remote_path) catch return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    // Keep raw alive: dupe the trimmed slice so caller can free it.
+    defer allocator.free(raw);
+    return allocator.dupe(u8, trimmed) catch null;
 }

@@ -6,8 +6,19 @@ const zlib_mod = @import("../core/zlib.zig");
 const packfile_mod = @import("../core/packfile.zig");
 const storage_mod = @import("../core/storage.zig");
 const pktline = @import("../core/pktline.zig");
+const delta_mod = @import("../core/delta.zig");
 
 const Allocator = std.mem.Allocator;
+
+fn typeName(t: packfile_mod.ObjectType) []const u8 {
+    return switch (t) {
+        .commit => "commit",
+        .tree => "tree",
+        .blob => "blob",
+        .tag => "tag",
+        else => "unknown",
+    };
+}
 
 /// A parsed remote reference
 pub const RemoteRef = struct {
@@ -138,7 +149,10 @@ pub const HttpTransport = struct {
         try self.parsePackfile(git_dir, if (unframed.len > 0) unframed else response);
     }
 
-    /// Parse a packfile response and write objects to loose store
+    /// Parse a packfile response and write objects to loose store.
+    /// Handles full objects plus OFS_DELTA and REF_DELTA chains with
+    /// iterative resolution (deltas whose bases appear later in the pack,
+    /// or whose bases are already in the local object store).
     fn parsePackfile(self: *HttpTransport, git_dir: []const u8, data: []const u8) !void {
         // Find PACK header
         var pos: usize = 0;
@@ -152,102 +166,172 @@ pub const HttpTransport = struct {
 
         if (pos + 8 > data.len) return; // No pack data
 
-        // Read version and object count
         const version = std.mem.readInt(u32, data[pos..][0..4], .big);
         const num_objects = std.mem.readInt(u32, data[pos + 4 ..][0..4], .big);
         pos += 8;
 
         if (version != 2 and version != 3) return;
 
-        // Track offsets for ofs-delta resolution
-        var offsets = std.AutoHashMap(usize, [20]u8).init(self.allocator);
-        defer offsets.deinit();
-
-        // First pass: extract all non-delta objects and build offset→sha map
-        // Second pass: resolve deltas
-        var pending_deltas: std.ArrayList(PendingDelta) = .empty;
+        // Phase 1: parse every entry into memory.
+        // offset→sha map fills as objects are resolved.
+        var entries: std.ArrayList(PackEntry) = .empty;
         defer {
-            for (pending_deltas.items) |d| self.allocator.free(d.compressed_data);
-            pending_deltas.deinit(self.allocator);
+            for (entries.items) |*e| {
+                if (e.raw_delta) |rd| self.allocator.free(rd);
+                if (e.resolved_data) |rd| self.allocator.free(rd);
+            }
+            entries.deinit(self.allocator);
         }
 
         var obj_index: u32 = 0;
         while (obj_index < num_objects and pos + 1 < data.len) : (obj_index += 1) {
             const obj_offset = pos;
 
-            // Parse type and size (variable-length encoding)
             const first_byte = data[pos];
             pos += 1;
-
-            const obj_type_num: u8 = (first_byte >> 4) & 0x07;
-            var obj_size: u64 = first_byte & 0x0f;
-            var shift: u6 = 4;
-
+            const type_num: u8 = (first_byte >> 4) & 0x07;
             var b = first_byte;
             while (b & 0x80 != 0) {
-                if (pos >= data.len) return;
+                if (pos >= data.len) return error.UnexpectedEof;
                 b = data[pos];
                 pos += 1;
-                obj_size |= @as(u64, @intCast(b & 0x7f)) << @intCast(shift);
-                shift +|= 7;
             }
-            _ = &obj_size; // size is tracked by decompressCounted
 
-            switch (obj_type_num) {
+            var entry = PackEntry{ .offset = obj_offset, .type_num = type_num };
+
+            switch (type_num) {
                 1, 2, 3, 4 => {
-                    // Full object (commit, tree, blob, tag)
                     const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
-                    defer self.allocator.free(result.data);
-
                     pos += result.consumed;
-
-                    const obj_type: packfile_mod.ObjectType = @enumFromInt(obj_type_num);
-                    try self.writeObjectAsLoose(git_dir, obj_type, result.data);
+                    entry.resolved_data = result.data;
+                    entry.resolved = true;
                 },
                 6 => {
-                    // OFS_DELTA: base is at (current_offset - negative_offset)
-                    const neg_offset = try parseOfsDelta(data, &pos);
-                    const base_offset = obj_offset - neg_offset;
-
+                    // OFS_DELTA: base at (offset - negative_offset)
+                    const neg = try parseOfsDelta(data, &pos);
+                    entry.base_offset = obj_offset - neg;
                     const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
                     pos += result.consumed;
-
-                    const base_sha = offsets.get(base_offset) orelse {
-                        // Store for second pass
-                        try pending_deltas.append(self.allocator, .{
-                            .base_offset = base_offset,
-                            .base_sha = null,
-                            .compressed_data = self.allocator.dupe(u8, result.data) catch break,
-                            .is_ofs = true,
-                        });
-                        continue;
-                    };
-
-                    // Resolve delta
-                    const base_obj = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir).read(self.allocator, self.io, base_sha) catch continue;
-                    _ = base_obj;
+                    entry.raw_delta = result.data;
                 },
                 7 => {
-                    // REF_DELTA: base identified by 20-byte SHA
-                    if (pos + 20 > data.len) return;
-                    var base_sha: [20]u8 = undefined;
-                    @memcpy(&base_sha, data[pos..][0..20]);
+                    // REF_DELTA: base identified by SHA
+                    if (pos + 20 > data.len) return error.UnexpectedEof;
+                    @memcpy(&entry.base_sha.?, data[pos..][0..20]);
                     pos += 20;
-
                     const result = zlib_mod.zlib.decompressCounted(self.allocator, data[pos..]) catch break;
                     pos += result.consumed;
-
-                    try pending_deltas.append(self.allocator, .{
-                        .base_offset = 0,
-                        .base_sha = base_sha,
-                        .compressed_data = self.allocator.dupe(u8, result.data) catch break,
-                        .is_ofs = false,
-                    });
+                    entry.raw_delta = result.data;
                 },
-                else => break,
+                else => return error.InvalidPackObjectType,
+            }
+
+            try entries.append(self.allocator, entry);
+        }
+
+        // Phase 2: iteratively resolve deltas until no progress is made.
+        // Each pass resolves deltas whose base became available in the previous pass.
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+        var resolved_count: usize = 0;
+        var progress = true;
+        while (progress) {
+            progress = false;
+            resolved_count = 0;
+            for (entries.items) |*e| {
+                if (e.resolved) continue;
+                if (e.raw_delta == null) continue;
+
+                // Find the base data
+                var base_type: ?packfile_mod.ObjectType = null;
+                var base_data: ?[]const u8 = null;
+                var base_is_owned = false;
+
+                if (e.type_num == 6) {
+                    // Base by pack offset — must be another entry in this pack
+                    for (entries.items) |*cand| {
+                        if (cand.offset == e.base_offset and cand.resolved) {
+                            base_type = cand.looseType();
+                            base_data = cand.resolved_data.?;
+                            break;
+                        }
+                    }
+                } else {
+                    // REF_DELTA: look in-pack first, then local store
+                    for (entries.items) |*cand| {
+                        if (cand.resolved and cand.sha != null and std.mem.eql(u8, &cand.sha.?, &e.base_sha.?)) {
+                            base_type = cand.looseType();
+                            base_data = cand.resolved_data.?;
+                            break;
+                        }
+                    }
+                    if (base_data == null) {
+                        const base_obj = store.read(self.allocator, self.io, e.base_sha.?) catch null;
+                        if (base_obj) |bo| {
+                            base_type = switch (bo) {
+                                .commit => .commit,
+                                .tree => .tree,
+                                .blob => .blob,
+                                .tag => .tag,
+                            };
+                            const serialized = bo.serialize(self.allocator) catch continue;
+                            defer self.allocator.free(serialized);
+                            const nul = std.mem.indexOfScalar(u8, serialized, 0) orelse continue;
+                            base_data = self.allocator.dupe(u8, serialized[nul + 1 ..]) catch continue;
+                            base_is_owned = true;
+                        }
+                    }
+                }
+
+                const bt = base_type orelse continue;
+                const bd = base_data orelse continue;
+
+                const applied = delta_mod.applyDelta(self.allocator, bd, e.raw_delta.?) catch {
+                    if (base_is_owned) self.allocator.free(@constCast(bd));
+                    continue;
+                };
+
+                if (base_is_owned) self.allocator.free(@constCast(bd));
+                // A delta inherits its base's object type
+                e.type_num = @intFromEnum(bt);
+                e.resolved_data = applied;
+                e.resolved = true;
+                progress = true;
             }
         }
+
+        // Phase 3: write everything to the store and record SHAs.
+        for (entries.items) |*e| {
+            if (!e.resolved) continue; // unresolvable chain — skip
+            const ot: packfile_mod.ObjectType = @enumFromInt(e.type_num);
+            try self.writeObjectAsLoose(git_dir, ot, e.resolved_data.?);
+
+            // Record SHA so later REF_DELTAs can find it.
+            const header = try std.fmt.allocPrint(self.allocator, "{s} {d}\x00", .{ typeName(ot), e.resolved_data.?.len });
+            defer self.allocator.free(header);
+            var h = std.crypto.hash.Sha1.init(.{});
+            h.update(header);
+            h.update(e.resolved_data.?);
+            var sha: [20]u8 = undefined;
+            h.final(&sha);
+            e.sha = sha;
+        }
     }
+
+    const PackEntry = struct {
+        offset: usize,
+        type_num: u8,
+        base_offset: usize = 0,
+        base_sha: ?[20]u8 = null,
+        raw_delta: ?[]u8 = null,
+        resolved: bool = false,
+        resolved_data: ?[]u8 = null,
+        sha: ?[20]u8 = null,    fn looseType(self: PackEntry) ?packfile_mod.ObjectType {
+        return switch (self.type_num) {
+            1...4 => @enumFromInt(self.type_num),
+            else => null,
+        }; 
+    }
+    };
 
     fn writeObjectAsLoose(self: *HttpTransport, git_dir: []const u8, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
         const type_str: []const u8 = switch (obj_type) {

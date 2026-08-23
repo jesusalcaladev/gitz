@@ -75,7 +75,8 @@ gitz push                    ✅ Push commits a remote
 | Feature | Archivo | Estado | Ventaja sobre git |
 |---------|---------|--------|-------------------|
 | Packfile v2 reader/writer | `packfile.zig` | ✅ | Formato idéntico a git |
-| Delta compression (xdelta) | `packfile.zig` | ✅ | 10x menos espacio |
+| **Delta resolution en fetch** | `http.zig` + `delta.zig` | ✅ | Packs deltificados de GitHub/GitLab se resuelven completos: ofs-delta, ref-delta, thin-pack con bases locales, cadenas multi-nivel |
+| Delta application (formato real git) | `delta.zig` | ✅ | Headers src/dst size varint + copy/insert instructions, verificado contra deltas reales de git-http-backend |
 | Topological sort (DAG-aware) | `packfile.zig` | ✅ | Reads secuenciales = cache hits |
 | Pack index O(log n) | `packindex.zig` | ✅ | Binary search vs linear scan |
 | Delta resolution | `delta.zig` | ✅ | Resolver cadenas de delta |
@@ -137,7 +138,7 @@ gitz push                    ✅ Push commits a remote
 | Paso | Comando | Estado |
 |------|---------|--------|
 | 17 | Wire Protocol v2 | ✅ pkt-line completo: want/have/done, side-band-64k, report-status |
-| 18 | Smart HTTP Client | ✅ Nativo (std.http), Content-Type/Accept/User-Agent correctos |
+| 18 | Smart HTTP Client | ✅ Nativo (std.http), Content-Type/Accept/User-Agent correctos, resolución completa de deltas |
 | 19 | `gitz fetch` | ✅ HTTP + SSH fetch con pkt-line, refs/remotes actualizadas |
 | 20 | `gitz clone` | ✅ Clone completo vía SSH + HTTP |
 | 21 | `gitz push` | ✅ Push HTTP verificado contra git-http-backend real; git puede clonar lo que gitz empuja |
@@ -208,8 +209,29 @@ git clone http://…/origin.git                                  ✅ mismo SHA, 
 git commit + git push → gitz fetch                             ✅ refs/remotes/origin/main actualizada
 gitz pull                                                      ✅ fast-forward + working tree sincronizado
 gitz pull (con commits locales) → rebase                       ✅ historial rebased legible por git
-zig build test                                                 ✅ todos los tests pasan
+gitz clone de repo DELTIFICADO (git gc --aggressive)           ✅ conjunto de objetos idéntico a git
+gitz fetch incremental (thin-pack con REF_DELTA)              ✅ objetos nuevos completos
+zig build test                                                 ✅ todos los tests pasan (74+)
 ```
+
+### Desglose de compatibilidad por capa (Agosto 2026)
+
+| Capa | % | Notas |
+|------|---|-------|
+| Objetos (blob/tree/commit/tag) | 100% | Bidireccional verificado con fsck de git |
+| Wire protocol Smart HTTP | ~95% | Push/fetch/pull/clone verificados E2E; falta autenticación HTTP (tokens basic) |
+| Transport SSH | ~80% | Funcional vía ssh child process; sin suite E2E dedicada |
+| Packfiles lectura (full + delta) | 100% | Deltificación completa resuelta |
+| Packfiles escritura (push) | 100% compat / sin delta | Compatible, packs no deltificados (más grandes pero válidos) |
+| Refs | ~95% | Falta packed-refs |
+| Índice (.git/index formato git) | 0% | Formato propio por diseño (ver nota) |
+| CLI local | ~90% | Falta rebase -i TUI real |
+| Submódulos / LFS / shallow | 0% | Fuera de alcance v1 (roadmap v2) |
+
+> **Nota de diseño:** GitZ no persigue 100% literal en todo — el índice propio y el shard store son
+decisiones deliberadas para superar a git en escala (backends intercambiables, I/O paralelo,
+distribución horizontal para SaaS como GitHub). La interoperabilidad de wire protocol, objetos y
+packfiles sí es 100%: cualquier servidor git no puede distinguir un cliente gitz de uno git.
 
 Protocolo implementado en `src/core/pktline.zig`:
 - `want <sha> <caps>` con capabilities en el primer want (`multi_ack thin-pack side-band-64k ofs-delta agent=git/2.45.0`)

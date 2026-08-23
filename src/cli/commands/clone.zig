@@ -156,21 +156,27 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
     try io.print("  {d} refs, {d} objects\n", .{ ref_count, object_count });
 }
 
-/// Recursively count loose objects in the objects directory.
+/// Count loose objects by scanning the fixed 256 shard dirs (objects/XX).
+/// Deterministic layout walk avoids fragile recursive directory iteration.
 fn countObjects(allocator: std.mem.Allocator, io: Io, dir_path: []const u8, count: *u32) !void {
-    var dir = std.Io.Dir.cwd().openDir(io.io, dir_path, .{}) catch return;
-    defer dir.close(io.io);
+    var total: u32 = 0;
+    var shard: usize = 0;
+    while (shard < 256) : (shard += 1) {
+        const shard_path = try std.fmt.allocPrint(allocator, "{s}/{x:0>2}", .{ dir_path, shard });
+        defer allocator.free(shard_path);
 
-    var iter = dir.iterate();
-    while (iter.next(io.io) catch null) |entry| {
-        if (entry.kind == .directory) {
-            const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-            defer allocator.free(sub_path);
-            try countObjects(allocator, io, sub_path, count);
-        } else if (entry.name.len == 38) {
-            count.* += 1;
+        var dir = std.Io.Dir.cwd().openDir(io.io, shard_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io.io);
+
+        var iter = dir.iterate();
+        while (true) {
+            const entry = iter.next(io.io) catch break orelse break;
+            if (entry.kind != .directory and entry.name.len == 38) {
+                total += 1;
+            }
         }
     }
+    count.* = total;
 }
 
 /// Checkout files from a commit into a directory
