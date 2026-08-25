@@ -219,7 +219,7 @@ zig build test                                                 ✅ todos los tes
 | Capa | % | Notas |
 |------|---|-------|
 | Objetos (blob/tree/commit/tag) | 100% | Bidireccional verificado con fsck de git |
-| Wire protocol Smart HTTP | ~95% | Push/fetch/pull/clone verificados E2E; falta autenticación HTTP (tokens basic) |
+| Wire protocol Smart HTTP + Auth | 100% | Push/fetch/pull/clone verificados E2E **con Basic Auth**: creds en URL (`https://user:token@host/repo`), env `GITZ_HTTP_USERNAME/PASSWORD`, y tokens (`GIT_TOKEN`/`GITHUB_TOKEN`) |
 | Transport SSH | ~80% | Funcional vía ssh child process; sin suite E2E dedicada |
 | Packfiles lectura (full + delta) | 100% | Deltificación completa resuelta |
 | Packfiles escritura (push) | 100% compat / sin delta | Compatible, packs no deltificados (más grandes pero válidos) |
@@ -243,11 +243,24 @@ Protocolo implementado en `src/core/pktline.zig`:
 
 ---
 
+### Autenticación HTTP (Agosto 2026) ✅
+
+Verificado E2E contra servidor Smart HTTP que exige Basic Auth:
+
+- Credenciales embebidas en URL: `gitz clone https://user:token@github.com/user/repo.git` ✅
+- Env fallback: `GITZ_HTTP_USERNAME` + `GITZ_HTTP_PASSWORD` ✅
+- Tokens: `GIT_TOKEN` / `GITHUB_TOKEN` (username auto `x-access-token`, formato GitHub) ✅
+- Password incorrecto → error limpio "correct access rights" + exit 128 ✅
+- El header `Authorization` viaja en las 3 peticiones: info/refs GET, upload-pack POST y receive-pack POST
+- Fix adicional: clone fallido ahora devuelve exit 128 (antes 0, rompía scripts)
+- Tests TDD unitarios: extracción de userinfo (incl. token-only y @ en path), vector RFC 7617 de base64
+
 ## Siguientes pasos prioritarios
 
 1. **`gitz rebase -i` con TUI** — Último paso del core local (flechas, pick/squash/drop)
-2. **Fix blame encoding** — Mostrar contenido correctamente en blame output
-3. **Fix stash** — Solo aplicar archivos modificados, no todos los tracked
+2. **packed-refs** — Lectura/escritura para repos con muchas refs
+3. **Fix blame encoding** — Mostrar contenido correctamente en blame output
+4. **Fix stash** — Solo aplicar archivos modificados, no todos los tracked
 4. **Shell completions** — bash/zsh/fish
 5. **Documentation** — man pages
 6. **`gitz search`** — Buscar en contenido de commits

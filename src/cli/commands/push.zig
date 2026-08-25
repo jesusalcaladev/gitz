@@ -4,6 +4,7 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs_mod = @import("../../core/refs.zig");
 const http = @import("../../transport/http.zig");
 const remote_cmd = @import("remote.zig");
+const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var remote_name: ?[]const u8 = null;
@@ -89,6 +90,16 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     };
 
-    try io.print("To {s}\n", .{url.?});
-    try io.print("   *       {s} -> {s}\n", .{ ref, full_ref });
+    const hex = Sha1.hex(push_sha);
+    try io.print("{s}To {s}{s}\n", .{ ui.c.dim, url.?, ui.c.reset });
+    try io.print("{s}   {s}{s}{s}  {s}{s} -> {s}{s}\n", .{
+        ui.c.bgreen,
+        hex[0..7],
+        ui.c.reset,
+        if (force) " (forced)" else "",
+        ref,
+        ui.c.reset,
+        full_ref,
+        ui.c.reset,
+    });
 }

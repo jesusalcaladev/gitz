@@ -5,6 +5,7 @@ const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
+const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var abort_mode = false;
@@ -269,22 +270,27 @@ fn interactiveRebase(
 ) !void {
     const Action = enum { pick, squash, reword, edit, drop };
 
+    const action_label = [_][]const u8{ "pick  ", "squash", "reword", "edit  ", "drop  " };
+    const action_color = [_][]const u8{ ui.c.green, ui.c.yellow, ui.c.magenta, ui.c.blue, ui.c.red };
+
     const n = commits.items.len;
     var actions = try allocator.alloc(Action, n);
     defer allocator.free(actions);
     for (actions) |*a| a.* = .pick;
 
-    // Clear screen
+    // Clear screen and draw the static chrome once.
     try io.print("\x1b[2J\x1b[H", .{});
-    try io.print("\x1b[1;36m=== Interactive Rebase ===\x1b[0m onto \x1b[1;33m{s}\x1b[0m\n\n", .{Sha1.hex(onto)[0..7]});
-    try io.print("\x1b[2m[p]ick  [s]quash  [r]eword  [e]dit  [d]rop | [j/k] nav | [Enter] confirm | [q] abort\x1b[0m\n\n", .{});
+    try io.print(
+        "{s}{s}  Interactive Rebase  {s}{s}onto {s}{s}{s}\n\n",
+        .{ ui.c.bold, ui.c.bcyan, ui.c.reset, ui.c.dim, ui.c.reset, ui.c.yellow, Sha1.hex(onto)[0..7] },
+    );
+    try io.print("{s}  {d} commit(s){s}\n\n", .{ ui.c.dim, n, ui.c.reset });
 
     var cursor: usize = 0;
 
-    // Main loop
     while (true) {
-        // Move cursor to list area and redraw
-        try io.print("\x1b[5;1H", .{});
+        // Redraw the list area.
+        try io.print("\x1b[{d};1H", .{5});
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -294,42 +300,63 @@ fn interactiveRebase(
             const hex = Sha1.hex(sha);
             var msg_lines = std.mem.splitScalar(u8, commit.message, '\n');
             const first_line = msg_lines.next() orelse "";
+            const ai = @intFromEnum(actions[display_idx]);
 
-            const action_str = switch (actions[display_idx]) {
-                .pick => "pick   ",
-                .squash => "squash ",
-                .reword => "reword ",
-                .edit => "edit   ",
-                .drop => "drop   ",
-            };
-
-            // Cursor indicator + colored action
             if (display_idx == cursor) {
-                try io.print("\x1b[1;7m> {s}\x1b[0m {s} {s}\x1b[0m\n", .{ action_str, hex[0..7], first_line });
+                try io.print(
+                    "{s}{s} {s}[{s}]{s} {s}{s}{s} {s}\x1b[K\n",
+                    .{ ui.c.reverse, ui.sym.cursor, action_color[ai], action_label[ai], ui.c.reset, ui.c.bold, hex[0..7], ui.c.reset, first_line },
+                );
             } else {
-                try io.print("  {s} {s} {s}\n", .{ action_str, hex[0..7], first_line });
+                try io.print(
+                    "  {s}[{s}]{s} {s}{s}{s} {s}\x1b[K\n",
+                    .{ action_color[ai], action_label[ai], ui.c.reset, ui.c.dim, hex[0..7], ui.c.reset, first_line },
+                );
             }
         }
 
-        // Read one byte from stdin
+        // Status footer.
+        try io.print(
+            "\n{s} j/k or arrows: move   p pick  s squash  r reword  e edit  d drop   Enter: start   q: abort {s}",
+            .{ ui.c.reverse, ui.c.reset },
+        );
+
+        // Read a keypress, decoding CSI arrow sequences (ESC [ A/B/C/D).
         var stdin = std.Io.File.stdin();
-        var input_buf: [1]u8 = undefined;
+        var input_buf: [8]u8 = undefined;
         const n_read = stdin.readStreaming(io.io, &.{&input_buf}) catch 0;
         if (n_read == 0) break;
+        const keys = input_buf[0..n_read];
 
-        const c = input_buf[0];
-        if (c == 'q' or c == 0x1b) {
+        if (keys[0] == 'q') {
             try io.print("\x1b[2J\x1b[H", .{});
             try io.print("Rebase aborted.\n", .{});
             return;
         }
-        if (c == '\n' or c == '\r') break;
-        if (c == 'j' or c == 'B') { // down
+        if (keys[0] == '\n' or keys[0] == '\r') break;
+        if (keys[0] == 0x1b) {
+            if (n_read >= 3 and keys[1] == '[') {
+                switch (keys[2]) {
+                    'A' => { // up = older commit
+                        if (cursor < n - 1) cursor += 1;
+                    },
+                    'B' => { // down = newer commit
+                        if (cursor > 0) cursor -= 1;
+                    },
+                    else => {},
+                }
+            } else {
+                // Bare ESC: abort like git's default editor behaviour on ^C.
+                try io.print("\x1b[2J\x1b[H", .{});
+                try io.print("Rebase aborted.\n", .{});
+                return;
+            }
+        } else if (keys[0] == 'j') {
             if (cursor > 0) cursor -= 1;
-        } else if (c == 'k' or c == 'A') { // up
+        } else if (keys[0] == 'k') {
             if (cursor < n - 1) cursor += 1;
         } else {
-            actions[cursor] = switch (c) {
+            actions[cursor] = switch (keys[0]) {
                 'p' => .pick,
                 's' => .squash,
                 'r' => .reword,
@@ -392,7 +419,7 @@ fn interactiveRebase(
         },
     }
 
-    try io.print("Successfully rebased ({d} rebased, {d} dropped).\n", .{ rebased, dropped });
+    try io.print("{s}{s}{s} Successfully rebased{s} ({d} rebased, {d} dropped).\n", .{ ui.c.bold, ui.c.bgreen, ui.sym.ok, ui.c.reset, rebased, dropped });
 }
 
 fn abortRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {

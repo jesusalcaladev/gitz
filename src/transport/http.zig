@@ -26,17 +26,122 @@ pub const RemoteRef = struct {
     sha: [20]u8,
 };
 
+// ── HTTP Basic Auth ─────────────────────────────────────────────────────
+// Credentials come from, in order:
+//   1. URL-embedded userinfo: https://user:token@host/repo.git (like git)
+//   2. Env: GITZ_HTTP_USERNAME + GITZ_HTTP_PASSWORD
+//   3. Env: GIT_TOKEN / GITHUB_TOKEN (username defaults to x-access-token)
+
+pub const Credentials = struct {
+    username: []const u8,
+    password: []const u8,
+};
+
+pub const ResolvedAuth = struct {
+    /// Value for the Authorization header, e.g. "Basic dXNlcjpwYXNz", or null.
+    auth_header: ?[]const u8,
+    /// URL with any embedded userinfo stripped.
+    clean_url: []const u8,
+};
+
+/// Extract `user:pass` embedded before the host part of an http(s) URL.
+/// An '@' appearing only inside the path is not treated as userinfo.
+pub fn extractUrlCredentials(allocator: Allocator, url: []const u8) !struct { creds: ?Credentials, clean_url: []const u8 } {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse
+        return .{ .creds = null, .clean_url = try allocator.dupe(u8, url) };
+    const rest = url[scheme_end + 3 ..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse
+        return .{ .creds = null, .clean_url = try allocator.dupe(u8, url) };
+    if (slash) |s| {
+        if (s < at) return .{ .creds = null, .clean_url = try allocator.dupe(u8, url) };
+    }
+    const userinfo = rest[0..at];
+    const colon = std.mem.indexOfScalar(u8, userinfo, ':');
+    const user = if (colon) |c| userinfo[0..c] else userinfo;
+    const pass = if (colon) |c| userinfo[c + 1 ..] else "";
+    return .{
+        .creds = .{
+            .username = try allocator.dupe(u8, user),
+            .password = try allocator.dupe(u8, pass),
+        },
+        .clean_url = try std.fmt.allocPrint(allocator, "{s}://{s}", .{ url[0..scheme_end], rest[at + 1 ..] }),
+    };
+}
+
+/// Build the value of an `Authorization` header: "Basic base64(user:pass)".
+pub fn buildBasicAuthValue(allocator: Allocator, creds: Credentials) ![]const u8 {
+    const raw = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ creds.username, creds.password });
+    defer allocator.free(raw);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, enc.calcSize(raw.len));
+    defer allocator.free(b64);
+    _ = enc.encode(b64, raw);
+    return try std.fmt.allocPrint(allocator, "Basic {s}", .{b64});
+}
+
+/// Read an environment variable without libc via /proc/self/environ.
+fn readEnvOwned(allocator: Allocator, io: std.Io, name: []const u8) ?[]const u8 {
+    var f = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return null;
+    defer f.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    const n = f.readStreaming(io, &.{&buf}) catch return null;
+    if (n == 0) return null;
+    var entries = std.mem.splitScalar(u8, buf[0..n], 0);
+    while (entries.next()) |entry| {
+        if (std.mem.startsWith(u8, entry, name) and entry.len > name.len and entry[name.len] == '=') {
+            return allocator.dupe(u8, entry[name.len + 1 ..]) catch null;
+        }
+    }
+    return null;
+}
+
+/// Resolve authentication for a remote URL: embedded userinfo first,
+/// then GITZ_HTTP_USERNAME/GITZ_HTTP_PASSWORD, then GIT_TOKEN/GITHUB_TOKEN.
+pub fn resolveAuth(allocator: Allocator, io: std.Io, url: []const u8) !ResolvedAuth {
+    var creds: ?Credentials = null;
+    const from_url = try extractUrlCredentials(allocator, url);
+    const clean_url = from_url.clean_url;
+    if (from_url.creds) |c| {
+        creds = c;
+    } else if (readEnvOwned(allocator, io, "GITZ_HTTP_USERNAME")) |user| {
+        const pass = readEnvOwned(allocator, io, "GITZ_HTTP_PASSWORD") orelse try allocator.dupe(u8, "");
+        creds = .{ .username = user, .password = pass };
+    } else if (readEnvOwned(allocator, io, "GIT_TOKEN")) |token| {
+        creds = .{
+            .username = try allocator.dupe(u8, "x-access-token"),
+            .password = token,
+        };
+    } else if (readEnvOwned(allocator, io, "GITHUB_TOKEN")) |token| {
+        creds = .{
+            .username = try allocator.dupe(u8, "x-access-token"),
+            .password = token,
+        };
+    }
+    if (creds) |c| {
+        return .{ .auth_header = try buildBasicAuthValue(allocator, c), .clean_url = clean_url };
+    }
+    return .{ .auth_header = null, .clean_url = clean_url };
+}
+
 /// HTTP transport for Smart Git protocol
 pub const HttpTransport = struct {
     allocator: Allocator,
     io: std.Io,
+    /// Remote URL with any embedded credentials stripped.
     url: []const u8,
+    /// Authorization header value (e.g. "Basic ..."), or null for anonymous.
+    auth_header: ?[]const u8,
+    /// Shallow fetch depth (--depth N), or null for a full fetch.
+    depth: ?u32 = null,
 
     pub fn init(allocator: Allocator, io: std.Io, url: []const u8) !HttpTransport {
+        const auth = try resolveAuth(allocator, io, url);
         return .{
             .allocator = allocator,
             .io = io,
-            .url = url,
+            .url = auth.clean_url,
+            .auth_header = auth.auth_header,
         };
     }
 
@@ -119,6 +224,13 @@ pub const HttpTransport = struct {
         }
         if (refs.len == 0) return error.NoWantedRefs;
 
+        // Shallow fetch: ask the server to cut history at the given depth.
+        if (self.depth) |d| {
+            const deepen_pkt = try pktline.buildDeepenLine(self.allocator, d);
+            defer self.allocator.free(deepen_pkt);
+            try body.appendSlice(self.allocator, deepen_pkt);
+        }
+
         try body.appendSlice(self.allocator, "0000");
 
         // Advertise what we already have so the server can thin the pack.
@@ -140,6 +252,11 @@ pub const HttpTransport = struct {
         });
         defer self.allocator.free(response);
 
+        // Record shallow boundaries so later commands know history is truncated.
+        if (self.depth != null) {
+            self.recordShallow(git_dir, response) catch {};
+        }
+
         // We negotiated side-band-64k: unwrap the framing first so interleaved
         // progress packets don't corrupt the pack stream.
         const unframed = try pktline.stripSideband(self.allocator, response);
@@ -147,6 +264,28 @@ pub const HttpTransport = struct {
 
         // Parse the packfile from the unwrapped stream (falls back internally).
         try self.parsePackfile(git_dir, if (unframed.len > 0) unframed else response);
+    }
+
+    /// Parse "shallow <sha>" band-1 lines from an upload-pack reply and
+    /// persist them to <git_dir>/shallow (one hex SHA per line).
+    fn recordShallow(self: *HttpTransport, git_dir: []const u8, response: []const u8) !void {
+        const shas = try pktline.extractShallowShas(self.allocator, response);
+        defer if (shas.len > 0) self.allocator.free(shas);
+        if (shas.len == 0) return;
+
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(self.allocator);
+        for (shas) |sha| {
+            const hex = Sha1.hex(sha);
+            try content.appendSlice(self.allocator, &hex);
+            try content.append(self.allocator, '\n');
+        }
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/shallow", .{git_dir});
+        defer self.allocator.free(path);
+        var f = try std.Io.Dir.cwd().createFile(self.io, path, .{});
+        defer f.close(self.io);
+        try std.Io.File.writeStreamingAll(f, self.io, content.items);
     }
 
     /// Parse a packfile response and write objects to loose store.
@@ -608,8 +747,14 @@ pub const HttpTransport = struct {
         var std_headers: std.http.Client.Request.Headers = .{};
         std_headers.user_agent = .{ .override = "git/2.45.0" };
 
-        var extra: [3]std.http.Header = undefined;
+        var extra: [5]std.http.Header = undefined;
         var n_extra: usize = 0;
+        // Send credentials on every request when configured (info/refs GET,
+        // upload-pack POST and receive-pack POST all require them).
+        if (self.auth_header) |auth| {
+            extra[n_extra] = .{ .name = "Authorization", .value = auth };
+            n_extra += 1;
+        }
         for (extra_headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) {
                 std_headers.content_type = .{ .override = h.value };
@@ -781,4 +926,70 @@ fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8, 
         defer file.close(io);
         try std.Io.File.writeStreamingAll(file, io, content);
     }
+}
+
+// ============================================================================
+// HTTP Basic Auth — TDD tests (written before implementation)
+// ============================================================================
+
+test "extractUrlCredentials: https with user:pass" {
+    const a = std.testing.allocator;
+    const r = try extractUrlCredentials(a, "https://alice:s3cret@example.com/repo.git");
+    defer a.free(r.clean_url);
+    defer if (r.creds) |c| {
+        a.free(c.username);
+        a.free(c.password);
+    };
+    try std.testing.expect(r.creds != null);
+    try std.testing.expectEqualStrings("alice", r.creds.?.username);
+    try std.testing.expectEqualStrings("s3cret", r.creds.?.password);
+    try std.testing.expectEqualStrings("https://example.com/repo.git", r.clean_url);
+}
+
+test "extractUrlCredentials: token-only userinfo (user, empty pass)" {
+    const a = std.testing.allocator;
+    const r = try extractUrlCredentials(a, "https://ghp_abc123@github.com/user/repo.git");
+    defer a.free(r.clean_url);
+    defer if (r.creds) |c| {
+        a.free(c.username);
+        a.free(c.password);
+    };
+    try std.testing.expect(r.creds != null);
+    try std.testing.expectEqualStrings("ghp_abc123", r.creds.?.username);
+    try std.testing.expectEqualStrings("", r.creds.?.password);
+    try std.testing.expectEqualStrings("https://github.com/user/repo.git", r.clean_url);
+}
+
+test "extractUrlCredentials: plain URL has no creds" {
+    const a = std.testing.allocator;
+    const r = try extractUrlCredentials(a, "https://github.com/user/repo.git");
+    defer a.free(r.clean_url);
+    try std.testing.expect(r.creds == null);
+    try std.testing.expectEqualStrings("https://github.com/user/repo.git", r.clean_url);
+}
+
+test "extractUrlCredentials: @ in path is not userinfo" {
+    const a = std.testing.allocator;
+    const r = try extractUrlCredentials(a, "https://example.com/user@2/repo.git");
+    defer a.free(r.clean_url);
+    try std.testing.expect(r.creds == null);
+    try std.testing.expectEqualStrings("https://example.com/user@2/repo.git", r.clean_url);
+}
+
+test "buildBasicAuthValue: known base64 vector" {
+    const a = std.testing.allocator;
+    // RFC 7617 example: user:pass -> Basic dXNlcjpwYXNz
+    const v = try buildBasicAuthValue(a, .{ .username = "user", .password = "pass" });
+    defer a.free(v);
+    try std.testing.expectEqualStrings("Basic dXNlcjpwYXNz", v);
+}
+
+test "buildBasicAuthValue: unicode-free token as password" {
+    const a = std.testing.allocator;
+    const v = try buildBasicAuthValue(a, .{ .username = "x-access-token", .password = "ghp_zzz" });
+    defer a.free(v);
+    // Verified independently: echo -n 'x-access-token:ghp_zzz' | base64
+    try std.testing.expect(std.mem.startsWith(u8, v, "Basic "));
+    try std.testing.expectEqual(@as(usize, 6 + 32), v.len); // 22 chars -> b64 30... sanity via exact:
+    try std.testing.expectEqualStrings("Basic eC1hY2Nlc3MtdG9rZW46Z2hwX3p6eg==", v);
 }

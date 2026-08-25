@@ -103,6 +103,13 @@ pub fn buildWantLine(allocator: std.mem.Allocator, sha: [20]u8) ![]u8 {
     return try result.toOwnedSlice(allocator);
 }
 
+/// Build a pkt-line "deepen <n>" message for shallow fetches.
+pub fn buildDeepenLine(allocator: std.mem.Allocator, depth: u32) ![]u8 {
+    const line = try std.fmt.allocPrint(allocator, "deepen {d}\n", .{depth});
+    defer allocator.free(line);
+    return try encodePkt(allocator, line);
+}
+
 /// Build a pkt-line flush packet.
 pub fn flushPacket() []const u8 {
     return "0000";
@@ -228,6 +235,33 @@ pub fn stripSideband(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+/// Extract SHAs from band-1 "shallow <sha>" lines in a sideband-framed
+/// upload-pack response. Servers send these before the pack data when the
+/// client requested a shallow fetch (--depth). Returns an empty slice when
+/// the server sent no shallow lines (full history within the given depth).
+pub fn extractShallowShas(allocator: std.mem.Allocator, data: []const u8) ![][20]u8 {
+    var out: std.ArrayList([20]u8) = .empty;
+    errdefer out.deinit(allocator);
+    var pos: usize = 0;
+    while (pos + 4 <= data.len) {
+        const pkt_len = std.fmt.parseInt(usize, data[pos..][0..4], 16) catch break;
+        pos += 4;
+        if (pkt_len == 0) continue; // flush
+        if (pkt_len < 4 or pos + pkt_len - 4 > data.len) break;
+        const payload = data[pos .. pos + pkt_len - 4];
+        pos += pkt_len - 4;
+        // Only band-1 carries protocol data; skip progress/error bands.
+        if (payload.len < 48 or payload[0] != 1) continue;
+        const line = payload[1..];
+        if (!std.mem.startsWith(u8, line, "shallow ")) continue;
+        const hex = std.mem.trimEnd(u8, line[8..], &[_]u8{ '\n', '\r', ' ' });
+        if (hex.len < 40) continue;
+        const sha = Sha1.fromHex(hex[0..40]) catch continue;
+        try out.append(allocator, sha);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 test "encodePkt basic" {
     const allocator = std.testing.allocator;
     const pkt = try encodePkt(allocator, "done\n");
@@ -297,6 +331,39 @@ test "parse push report rejected" {
     try std.testing.expect(report.ng_reason != null);
     try std.testing.expect(std.mem.indexOf(u8, report.ng_reason.?, "non-fast-forward") != null);
     allocator.free(report.ng_reason.?);
+}
+
+test "buildDeepenLine format" {
+    const allocator = std.testing.allocator;
+    const pkt = try buildDeepenLine(allocator, 1);
+    defer allocator.free(pkt);
+    try std.testing.expectEqualStrings("000ddeepen 1\n", pkt);
+}
+
+test "extractShallowShas parses band-1 shallow lines" {
+    const allocator = std.testing.allocator;
+    const l1 = try encodePkt(allocator, "\x01shallow 0123456789abcdef0123456789abcdef01234567\n");
+    defer allocator.free(l1);
+    const l2 = try encodePkt(allocator, "\x02progress\n");
+    defer allocator.free(l2);
+    const data = try std.fmt.allocPrint(allocator, "{s}{s}0000", .{ l1, l2 });
+    defer allocator.free(data);
+    const shas = try extractShallowShas(allocator, data);
+    defer allocator.free(shas);
+    try std.testing.expectEqual(@as(usize, 1), shas.len);
+    const hex = Sha1.hex(shas[0]);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", &hex);
+}
+
+test "extractShallowShas returns empty without shallow lines" {
+    const allocator = std.testing.allocator;
+    const l1 = try encodePkt(allocator, "\x01NAK\n");
+    defer allocator.free(l1);
+    const data = try std.fmt.allocPrint(allocator, "{s}0000", .{l1});
+    defer allocator.free(data);
+    const shas = try extractShallowShas(allocator, data);
+    defer allocator.free(shas);
+    try std.testing.expectEqual(@as(usize, 0), shas.len);
 }
 
 test "stripSideband extracts pack data" {

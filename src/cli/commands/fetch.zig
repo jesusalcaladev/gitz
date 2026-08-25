@@ -4,6 +4,7 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs_mod = @import("../../core/refs.zig");
 const http = @import("../../transport/http.zig");
 const remote_cmd = @import("remote.zig");
+const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var remote_name: ?[]const u8 = null;
@@ -33,7 +34,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
-    try io.print("Fetching {s}\n", .{name});
+    try io.print("{s}{s}Fetching{s} {s}{s}\n", .{ ui.c.bold, ui.c.bcyan, ui.c.reset, ui.c.bold, name });
 
     var transport = try http.HttpTransport.init(allocator, io.io, url.?);
     defer transport.deinit();
@@ -100,12 +101,20 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
-    try io.print("From {s}\n", .{url.?});
+    try io.print("{s}From {s}{s}\n", .{ ui.c.dim, url.?, ui.c.reset });
     for (refs) |ref| {
         if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
             const branch_name = ref.name[11..];
             const hex = Sha1.hex(ref.sha);
-            try io.print(" * branch              {s} -> {s}\n", .{ hex[0..7], branch_name });
+            try io.print("   {s}{s}{s} {s}{s} -> {s}/{s}\n", .{
+                ui.c.yellow,
+                hex[0..7],
+                ui.c.reset,
+                ui.sym.arrow,
+                branch_name,
+                name,
+                branch_name,
+            });
         }
     }
 }

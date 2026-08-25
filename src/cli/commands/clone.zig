@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const ui = @import("../../util/ui.zig");
 const zlib_mod = @import("../../core/zlib.zig");
 const http = @import("../../transport/http.zig");
 const refs_mod = @import("../../core/refs.zig");
@@ -13,11 +14,33 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
         std.process.exit(1);
     }
 
-    const url = args[0];
+    var depth: ?u32 = null;
+    var url: ?[]const u8 = null;
+    var positional: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--depth") and i + 1 < args.len) {
+                i += 1;
+                depth = std.fmt.parseInt(u32, args[i], 10) catch null;
+            } else if (std.mem.startsWith(u8, arg, "--depth=")) {
+                depth = std.fmt.parseInt(u32, arg[8..], 10) catch null;
+            } else if (!std.mem.startsWith(u8, arg, "-")) {
+                if (positional == 0) url = arg;
+                positional += 1;
+            }
+        }
+        if (url == null) {
+            try io.eprint("usage: gitz clone [--depth <n>] <url> [directory]\n", .{});
+            std.process.exit(1);
+        }
+    }
 
-    const dest = if (args.len > 1) args[1] else dest: {
-        const last_slash = std.mem.lastIndexOf(u8, url, "/") orelse url.len;
-        var name = url[last_slash..];
+    const dest = if (positional > 1 and !std.mem.startsWith(u8, args[1], "-")) args[1] else dest: {
+        const u = url.?;
+        const last_slash = std.mem.lastIndexOf(u8, u, "/") orelse u.len;
+        var name = u[last_slash..];
         if (name.len > 0 and name[0] == '/') name = name[1..];
         if (std.mem.lastIndexOf(u8, name, ":")) |colon_pos| {
             name = name[colon_pos + 1 ..];
@@ -28,7 +51,10 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
         break :dest name;
     };
 
-    try io.print("Cloning into '{s}'...\n", .{dest});
+    try io.print("{s}{s}Cloning into{s} '{s}'{s}...\n", .{ ui.c.bold, ui.c.bcyan, ui.c.reset, dest, ui.c.reset });
+    if (depth) |d| {
+        try io.print("{s}  shallow clone, depth {d}{s}\n", .{ ui.c.dim, d, ui.c.reset });
+    }
 
     // Create destination directory structure
     std.Io.Dir.cwd().createDirPath(io.io, dest) catch {};
@@ -63,11 +89,11 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
     std.Io.Dir.cwd().createDirPath(io.io, remotes_dir) catch {};
     const remote_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes/origin", .{dest});
     defer allocator.free(remote_path);
-    io.writeFile(remote_path, url) catch {};
+    io.writeFile(remote_path, url.?) catch {};
 
     // Use native HTTP transport to discover refs and fetch objects
-    var transport = http.HttpTransport.init(allocator, io.io, url) catch {
-        try io.eprint("fatal: could not connect to '{s}'\n", .{url});
+    var transport = http.HttpTransport.init(allocator, io.io, url.?) catch {
+        try io.eprint("fatal: could not connect to '{s}'\n", .{url.?});
         return;
     };
     defer transport.deinit();
@@ -76,7 +102,7 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
         try io.eprint("fatal: could not read from remote repository.\n", .{});
         try io.eprint("Please make sure you have the correct access rights\n", .{});
         try io.eprint("and the repository exists.\n", .{});
-        return;
+        std.process.exit(128);
     };
     defer {
         for (remote_refs) |r| allocator.free(r.name);
@@ -85,7 +111,7 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
 
     if (remote_refs.len == 0) {
         try io.eprint("fatal: no refs found on remote\n", .{});
-        return;
+        std.process.exit(128);
     }
 
     // Find default branch (main or master)
@@ -134,16 +160,24 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
         refs_manager.writeSymbolic(allocator, io.io, "HEAD", symbolic_ref) catch {};
     }
 
-    // Fetch all objects
+    // Fetch all objects (shallow when --depth was given)
+    transport.depth = depth;
+    try io.print("{s}  {s}Receiving objects{s}\n", .{ ui.c.dim, ui.c.cyan, ui.c.reset });
     transport.fetch(gitz_dir, remote_refs, &.{}) catch {
         try io.eprint("warning: fetch incomplete, some objects may be missing\n", .{});
     };
+    ui.clearLine(io);
 
-    // Checkout files from HEAD commit
+    // Checkout files from HEAD commit with a live progress bar
     if (head_sha) |sha| {
-        checkoutFiles(allocator, io, gitz_dir, sha, dest) catch {
+        var total_files: u32 = 0;
+        countTreeFiles(allocator, io, gitz_dir, sha, &total_files);
+
+        var progress = ui.Progress{ .total = total_files };
+        checkoutFiles(allocator, io, gitz_dir, sha, dest, &progress) catch {
             try io.eprint("warning: checkout incomplete\n", .{});
         };
+        ui.clearLine(io);
     }
 
     var object_count: u32 = 0;
@@ -152,8 +186,46 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
     defer allocator.free(obj_dir);
     countObjects(allocator, io, obj_dir, &object_count) catch {};
 
-    try io.print("Cloned into '{s}'\n", .{dest});
-    try io.print("  {d} refs, {d} objects\n", .{ ref_count, object_count });
+    try io.print("{s}{s}{s} Cloned into '{s}'{s}\n", .{ ui.c.bold, ui.c.bgreen, ui.sym.ok, dest, ui.c.reset });
+    try io.print("  {s}{d}{s} refs {s}{s}{s} {s}{d}{s} objects\n", .{
+        ui.c.bold,
+        ref_count,
+        ui.c.reset,
+        ui.c.dim,
+        ui.sym.dot,
+        ui.c.reset,
+        ui.c.bold,
+        object_count,
+        ui.c.reset,
+    });
+}
+
+/// Count blobs reachable from a commit so the checkout progress bar knows its total.
+fn countTreeFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8, count: *u32) void {
+    count.* = 0;
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const obj = store.read(allocator, io.io, commit_sha) catch return;
+    const commit = switch (obj) {
+        .commit => |c| c,
+        else => return,
+    };
+    countTreeEntries(allocator, io, &store, commit.tree, count);
+}
+
+fn countTreeEntries(allocator: std.mem.Allocator, io: Io, store: *const storage_mod.StorageBackend, tree_sha: [20]u8, count: *u32) void {
+    const tree_obj = store.read(allocator, io.io, tree_sha) catch return;
+    const tree = switch (tree_obj) {
+        .tree => |t| t,
+        else => return,
+    };
+    for (tree.entries) |entry| {
+        const child = store.read(allocator, io.io, entry.sha) catch continue;
+        switch (child) {
+            .blob => count.* += 1,
+            .tree => countTreeEntries(allocator, io, store, entry.sha, count),
+            else => {},
+        }
+    }
 }
 
 /// Count loose objects by scanning the fixed 256 shard dirs (objects/XX).
@@ -179,8 +251,8 @@ fn countObjects(allocator: std.mem.Allocator, io: Io, dir_path: []const u8, coun
     count.* = total;
 }
 
-/// Checkout files from a commit into a directory
-fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
+/// Checkout files from a commit into a directory, updating a progress counter.
+fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8, progress: *ui.Progress) !void {
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
     // Read commit
@@ -198,11 +270,11 @@ fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, comm
     };
 
     for (tree.entries) |entry| {
-        checkoutTreeEntry(allocator, io, git_dir, entry, dest) catch continue;
+        checkoutTreeEntry(allocator, io, git_dir, entry, dest, progress) catch continue;
     }
 }
 
-fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, entry: object.TreeEntry, dest: []const u8) !void {
+fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, entry: object.TreeEntry, dest: []const u8, progress: *ui.Progress) !void {
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const blob_obj = store.read(allocator, io.io, entry.sha) catch return;
 
@@ -219,6 +291,7 @@ fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, 
             var file = std.Io.Dir.cwd().createFile(io.io, file_path, .{}) catch return;
             defer file.close(io.io);
             try std.Io.File.writeStreamingAll(file, io.io, b.content);
+            ui.tick(io, "Checking out", progress);
         },
         .tree => |t| {
             // Recurse into subdirectory
@@ -226,7 +299,7 @@ fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, 
             defer allocator.free(sub_dir);
             std.Io.Dir.cwd().createDirPath(io.io, sub_dir) catch {};
             for (t.entries) |sub_entry| {
-                checkoutTreeEntry(allocator, io, git_dir, sub_entry, dest) catch continue;
+                checkoutTreeEntry(allocator, io, git_dir, sub_entry, dest, progress) catch continue;
             }
         },
         else => {},
