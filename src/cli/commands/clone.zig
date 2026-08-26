@@ -51,9 +51,9 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
         break :dest name;
     };
 
-    try io.print("{s}{s}Cloning into{s} '{s}'{s}...\n", .{ ui.c.bold, ui.c.bcyan, ui.c.reset, dest, ui.c.reset });
+    try io.print("\n{s}{s}  gitz clone{s}  {s}{s}{s}\n\n", .{ ui.c.bold, ui.c.bcyan, ui.c.reset, ui.c.bold, dest, ui.c.reset });
     if (depth) |d| {
-        try io.print("{s}  shallow clone, depth {d}{s}\n", .{ ui.c.dim, d, ui.c.reset });
+        try io.print("{s}  {s}{s} shallow clone, depth {d}{s}\n", .{ ui.c.dim, ui.sym.arrow, ui.c.reset, d, ui.c.reset });
     }
 
     // Create destination directory structure
@@ -162,11 +162,12 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
 
     // Fetch all objects (shallow when --depth was given)
     transport.depth = depth;
-    try io.print("{s}  {s}Receiving objects{s}\n", .{ ui.c.dim, ui.c.cyan, ui.c.reset });
+    try io.print("{s}  {s}Receiving objects{s}", .{ ui.c.dim, ui.c.cyan, ui.c.reset });
     transport.fetch(gitz_dir, remote_refs, &.{}) catch {
         try io.eprint("warning: fetch incomplete, some objects may be missing\n", .{});
     };
     ui.clearLine(io);
+    try io.print("{s}  {s}{s} objects received{s}\n", .{ ui.c.dim, ui.sym.ok, ui.c.bgreen, ui.c.reset });
 
     // Checkout files from HEAD commit with a live progress bar
     if (head_sha) |sha| {
@@ -186,17 +187,17 @@ pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !
     defer allocator.free(obj_dir);
     countObjects(allocator, io, obj_dir, &object_count) catch {};
 
-    try io.print("{s}{s}{s} Cloned into '{s}'{s}\n", .{ ui.c.bold, ui.c.bgreen, ui.sym.ok, dest, ui.c.reset });
-    try io.print("  {s}{d}{s} refs {s}{s}{s} {s}{d}{s} objects\n", .{
-        ui.c.bold,
-        ref_count,
-        ui.c.reset,
+    // Show completion summary
+    try io.print("\n{s}{s}  Done{s}  {s}{d}{s} objects {s}{s}{s} {s}{d}{s} refs\n", .{
+        ui.c.bold, ui.c.bgreen, ui.c.reset,
+        ui.c.bold, object_count, ui.c.reset,
+        ui.c.dim, ui.sym.dot, ui.c.reset,
+        ui.c.bold, ref_count, ui.c.reset,
+    });
+    try io.print("{s}  {s} checked out to {s}{s}{s}{s}{s}\n\n", .{
+        ui.c.dim, ui.sym.arrow, ui.c.reset,
+        ui.c.bcyan, dest, ui.c.reset,
         ui.c.dim,
-        ui.sym.dot,
-        ui.c.reset,
-        ui.c.bold,
-        object_count,
-        ui.c.reset,
     });
 }
 
@@ -294,12 +295,13 @@ fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, 
             ui.tick(io, "Checking out", progress);
         },
         .tree => |t| {
-            // Recurse into subdirectory
+            // Recurse into subdirectory — pass sub_dir as the new dest
+            // so nested files get written under the correct path.
             const sub_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest, entry.name });
             defer allocator.free(sub_dir);
             std.Io.Dir.cwd().createDirPath(io.io, sub_dir) catch {};
             for (t.entries) |sub_entry| {
-                checkoutTreeEntry(allocator, io, git_dir, sub_entry, dest, progress) catch continue;
+                checkoutTreeEntry(allocator, io, git_dir, sub_entry, sub_dir, progress) catch continue;
             }
         },
         else => {},

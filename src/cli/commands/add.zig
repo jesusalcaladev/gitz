@@ -5,6 +5,7 @@ const index_mod = @import("../../core/index.zig");
 const object = @import("../../core/object.zig");
 const storage_mod = @import("../../core/storage.zig");
 const ignore_mod = @import("../../core/ignore.zig");
+const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     if (args.len == 0) {
@@ -19,22 +20,53 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer ignore_stack.deinit();
     ignore_stack.loadFile(io.io, ".gitignore") catch {};
 
+    // First collect all files to add so we know the total for the progress bar
+    var all_files = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    defer {
+        for (all_files.items) |f| allocator.free(f);
+        all_files.deinit(allocator);
+    }
+
     for (args) |path| {
         if (std.mem.eql(u8, path, ".")) {
-            try addDirectory(allocator, git_dir, &idx, ".", io, &ignore_stack);
+            try collectFilesRecursive(allocator, ".", &all_files, &ignore_stack);
         } else {
-            // Check if path is ignored
-            if (ignore_stack.isIgnored(path, false)) {
-                continue; // silently skip ignored files
+            if (ignore_stack.isIgnored(path, false)) continue;
+            // Check if it's a directory
+            if (isDirectory(path)) {
+                try collectFilesRecursive(allocator, path, &all_files, &ignore_stack);
+            } else {
+                const owned = try allocator.dupe(u8, path);
+                try all_files.append(allocator, owned);
             }
-            addFile(allocator, git_dir, &idx, path, io) catch {
-                try io.eprint("fatal: pathspec '{s}' did not match any files\n", .{path});
-            };
         }
     }
 
+    if (all_files.items.len == 0) {
+        try io.print("Nothing to add.\n", .{});
+        return;
+    }
+
+    const total: u32 = @intCast(all_files.items.len);
+    var progress = ui.Progress{ .total = total };
+
+    for (all_files.items) |file_path| {
+        addFile(allocator, git_dir, &idx, file_path, io) catch {
+            try io.eprint("fatal: pathspec '{s}' did not match any files\n", .{file_path});
+            continue;
+        };
+        ui.tick(io, "Staging", &progress);
+    }
+    ui.clearLine(io);
+
     try idx.writeToFile(git_dir, allocator, io.io);
     idx.deinit(allocator);
+
+    // Show summary
+    try io.print("{s}{s}{s} {d} file(s) staged\n", .{
+        ui.c.bgreen, ui.sym.ok, ui.c.reset,
+        total,
+    });
 }
 
 fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.Index, path: []const u8, io: Io) !void {
@@ -58,32 +90,10 @@ fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.In
         .ctime = @intCast(@divTrunc(stat.ctime.nanoseconds, std.time.ns_per_s)),
         .mode = 0o100644,
     });
-
-    try io.print("add: {s}\n", .{path});
 }
 
-fn addDirectory(
-    allocator: std.mem.Allocator,
-    git_dir: []const u8,
-    idx: *index_mod.Index,
-    dir_path: []const u8,
-    io: Io,
-    ignore: *ignore_mod.IgnoreStack,
-) !void {
-    var entries: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
-    defer {
-        for (entries.items) |e| allocator.free(e);
-        entries.deinit(allocator);
-    }
-
-    try collectFiles(allocator, dir_path, &entries, ignore);
-
-    for (entries.items) |entry| {
-        try addFile(allocator, git_dir, idx, entry, io);
-    }
-}
-
-fn collectFiles(
+/// Collect files recursively for staging
+fn collectFilesRecursive(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     entries: *std.ArrayList([]const u8),
@@ -129,11 +139,7 @@ fn collectFiles(
                     // Check .gitignore
                     const is_dir = isDirectory(full_path);
                     if (ignore.isIgnored(full_path, is_dir)) {
-                        if (is_dir) {
-                            // Skip entire ignored directory
-                            pos += direntry.reclen;
-                            continue;
-                        }
+                        allocator.free(full_path);
                         pos += direntry.reclen;
                         continue;
                     }

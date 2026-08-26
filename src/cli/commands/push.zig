@@ -91,15 +91,18 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
 
     const hex = Sha1.hex(push_sha);
-    try io.print("{s}To {s}{s}\n", .{ ui.c.dim, url.?, ui.c.reset });
-    try io.print("{s}   {s}{s}{s}  {s}{s} -> {s}{s}\n", .{
+    try io.print("\n{s}To {s}{s}{s}\n", .{ ui.c.dim, url.?, ui.c.reset, ui.c.reset });
+    try io.print("{s}   {s}{s}{s}  {s}{s}{s} -> {s}{s}{s} {s}{s}{s}\n", .{
         ui.c.bgreen,
         hex[0..7],
         ui.c.reset,
-        if (force) " (forced)" else "",
+        ui.c.dim, ui.sym.arrow, ui.c.reset,
         ref,
         ui.c.reset,
         full_ref,
+        ui.c.reset,
+        ui.c.dim,
+        if (force) " (forced)" else "",
         ui.c.reset,
     });
 }

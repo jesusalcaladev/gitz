@@ -197,7 +197,39 @@ fn remoteList(allocator: std.mem.Allocator, git_dir: []const u8, verbose: bool, 
     }
 
     if (!found) {
-        try io.print("No remotes configured.\n", .{});
+        // Fallback: scan remotes/ directory for files written by `gitz clone`
+        const remotes_dir = try std.fmt.allocPrint(allocator, "{s}/remotes", .{git_dir});
+        defer allocator.free(remotes_dir);
+        var listed = false;
+
+        // Scan the directory for any remote files
+        var dir = std.Io.Dir.cwd().openDir(io.io, remotes_dir, .{ .iterate = true }) catch {
+            try io.print("No remotes configured.\n", .{});
+            return;
+        };
+        defer dir.close(io.io);
+
+        var iter = dir.iterate();
+        while (iter.next(io.io) catch null) |entry| {
+            if (entry.kind == .file) {
+                const candidate = entry.name;
+                if (verbose) {
+                    const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ remotes_dir, candidate });
+                    defer allocator.free(p);
+                    const raw = io.readFileAlloc(p) catch continue;
+                    defer allocator.free(raw);
+                    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+                    try io.print("{s}\t{s}\n", .{ candidate, trimmed });
+                } else {
+                    try io.print("{s}\n", .{candidate});
+                }
+                listed = true;
+            }
+        }
+
+        if (!listed) {
+            try io.print("No remotes configured.\n", .{});
+        }
     }
 }
 

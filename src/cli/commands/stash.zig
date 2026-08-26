@@ -93,7 +93,7 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
         }
     }
 
-    // Collect only tracked files that have been modified
+    // Collect only tracked files that have been MODIFIED or DELETED
     var tree_entries = std.ArrayList(object.TreeEntry){ .items = &.{}, .capacity = 0 };
     defer tree_entries.deinit(allocator);
 
@@ -106,15 +106,25 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
         const rel_path = entry.key_ptr.*;
         const old_sha = entry.value_ptr.sha;
 
-        // Read current working file
-        const file_content = std.Io.Dir.cwd().readFileAlloc(io.io, rel_path, allocator, .unlimited) catch continue;
+        // Check if file exists in working tree
+        const file_content = std.Io.Dir.cwd().readFileAlloc(io.io, rel_path, allocator, .unlimited) catch {
+            // File was deleted — include with zero SHA as deletion marker
+            const owned_name = allocator.dupe(u8, rel_path) catch continue;
+            const zero_sha: [20]u8 = @splat(0);
+            try tree_entries.append(allocator, .{
+                .mode = 0o100644,
+                .name = owned_name,
+                .sha = zero_sha,
+            });
+            continue;
+        };
         defer allocator.free(file_content);
 
         // Write blob to loose store and get its SHA
         const blob = object.GitObject{ .blob = .{ .content = file_content } };
         const new_sha = store.write(allocator, io.io, blob) catch continue;
 
-        // Only include if changed
+        // Only include if the content actually changed
         if (!std.mem.eql(u8, &old_sha, &new_sha)) {
             const owned_name = allocator.dupe(u8, rel_path) catch continue;
             try tree_entries.append(allocator, .{
@@ -196,7 +206,6 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
     }
 
     // Now restore working tree to HEAD state (like git stash does)
-    // Use HEAD tree SHA (not blob SHAs) to restore
     if (head_sha) |hsa| {
         const head_obj2 = store.read(allocator, io.io, hsa) catch null;
         if (head_obj2) |obj2| {
@@ -205,7 +214,6 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
                 else => null,
             };
             if (head_commit2) |hc2| {
-                // Restore all tracked files from HEAD tree
                 restoreTreeToWorking(allocator, io.io, store, hc2.tree, "");
             }
         }
@@ -214,6 +222,20 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
     // Delete untracked files that were stashed
     for (untracked_entries.items) |entry| {
         std.Io.Dir.cwd().deleteFile(io.io, entry.name) catch {};
+    }
+
+    // Delete tracked files that were deleted in working tree (zero SHA = deletion marker)
+    for (tree_entries.items) |entry| {
+        var is_zero = true;
+        for (entry.sha) |b| {
+            if (b != 0) {
+                is_zero = false;
+                break;
+            }
+        }
+        if (is_zero) {
+            std.Io.Dir.cwd().deleteFile(io.io, entry.name) catch {};
+        }
     }
 
     if (parents.len > 0) allocator.free(parents);
@@ -245,6 +267,7 @@ fn collectTrackedFiles(
         if (entry.mode == 0o040000) {
             // Directory — recurse
             collectTrackedFiles(allocator, io, store, entry.sha, full_path, tracked);
+            allocator.free(full_path);
         } else {
             // File — add to tracked map
             tracked.put(full_path, .{
@@ -432,11 +455,12 @@ fn stashApply(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, rem
 
     // Recursively write each file from the stash tree to working directory
     restoreTreeToWorking(allocator, io.io, store, commit.tree, "");
-    try io.print("Stash restored.\n", .{});
 
     // Remove from stash if pop
     if (remove_after) {
         try stashDrop(allocator, git_dir, index, io);
+    } else {
+        try io.print("Stash applied.\n", .{});
     }
 }
 
@@ -534,6 +558,20 @@ fn restoreTreeToWorking(
             std.Io.Dir.cwd().createDirPath(io, full_path) catch {};
             restoreTreeToWorking(allocator, io, store, entry.sha, full_path);
         } else {
+            // Check for deletion marker (zero SHA = file was deleted)
+            var is_zero = true;
+            for (entry.sha) |b| {
+                if (b != 0) {
+                    is_zero = false;
+                    break;
+                }
+            }
+            if (is_zero) {
+                // Delete the file from working tree
+                std.Io.Dir.cwd().deleteFile(io, full_path) catch {};
+                continue;
+            }
+
             // File — write blob content to working dir
             const blob_obj = store.read(allocator, io, entry.sha) catch continue;
             const blob_content = switch (blob_obj) {

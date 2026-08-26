@@ -6,6 +6,7 @@ const storage_mod = @import("../../core/storage.zig");
 const refs_mod = @import("../../core/refs.zig");
 const index_mod = @import("../../core/index.zig");
 const config_cmd = @import("config.zig");
+const ui = @import("../../util/ui.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var message: ?[]const u8 = null;
@@ -126,9 +127,22 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     const hex = Sha1.hex(commit_sha);
     if (amend) {
-        try io.print("[{s}] {s} (amend)\n", .{ hex[0..7], message.? });
+        try io.print("{s}{s}{s} {s}{s}{s} (amend)\n", .{ ui.c.bgreen, hex[0..7], ui.c.reset, ui.c.bold, message.?, ui.c.reset });
     } else {
-        try io.print("[{s}] {s}\n", .{ hex[0..7], message.? });
+        // Determine branch name for context
+        const branch_ctx: []const u8 = blk: {
+            var hi = refs_manager.head(allocator, io.io) catch break :blk "HEAD";
+            defer hi.deinit(allocator);
+            break :blk switch (hi) {
+                .branch => |b| b.name.items,
+                .detached => "HEAD",
+            };
+        };
+        try io.print("{s}{s}{s} {s}{s}{s} {s}on {s}{s}{s}\n", .{
+            ui.c.bgreen, hex[0..7], ui.c.reset,
+            ui.c.bold, message.?, ui.c.reset,
+            ui.c.dim, ui.c.bcyan, branch_ctx, ui.c.reset,
+        });
     }
 
     for (parents) |_| {}
@@ -188,6 +202,13 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
         else
             entry.name;
 
+        // Quick check: stat the file first to skip if mtime unchanged
+        const stat = std.Io.Dir.cwd().statFile(io.io, clean_name, .{}) catch continue;
+        const current_mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
+        if (current_mtime == entry.mtime and @as(u64, @intCast(stat.size)) == entry.size) {
+            continue; // File hasn't changed — skip expensive SHA computation
+        }
+
         const content = std.Io.Dir.cwd().readFileAlloc(io.io, clean_name, allocator, .unlimited) catch continue;
         defer allocator.free(content);
 
@@ -196,7 +217,6 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
             const blob = object.GitObject{ .blob = .{ .content = content } };
             const new_sha = try store.write(allocator, io.io, blob);
 
-            const stat = std.Io.Dir.cwd().statFile(io.io, clean_name, .{}) catch continue;
             entry.sha = new_sha;
             entry.size = @intCast(stat.size);
             entry.mtime = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));

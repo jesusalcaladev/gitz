@@ -106,8 +106,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         defer allocator.free(cur);
         defer allocator.free(par);
 
-        // Copy author name before it might get freed
-        const author_name = try allocator.dupe(u8, commit.author.name);
+        // Copy author metadata before it might get freed
         const author_ts = commit.author.timestamp;
 
         // Compare line by line
@@ -119,23 +118,22 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             const par_line = par_lines.next() orelse "";
             if (line_idx < blame_result.len) {
                 if (!std.mem.eql(u8, cur_line, par_line)) {
-                    // This line was changed in this commit
+                    // This line was changed in this commit.
+                    // NOTE: each entry owns its own author copy — sharing one
+                    // slice here caused double-frees and garbled blame output
+                    // for commits touching several lines.
                     if (blame_result[line_idx].owned) {
                         allocator.free(blame_result[line_idx].author);
                         allocator.free(blame_result[line_idx].content);
                     }
                     blame_result[line_idx] = .{
                         .sha = current_sha,
-                        .author = author_name,
+                        .author = try allocator.dupe(u8, commit.author.name),
                         .timestamp = author_ts,
                         .content = try allocator.dupe(u8, cur_line),
                         .owned = true,
                     };
-                } else {
-                    allocator.free(author_name);
                 }
-            } else {
-                allocator.free(author_name);
             }
             line_idx += 1;
         }
@@ -147,14 +145,35 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     for (blame_result) |blame| {
         const hex = Sha1.hex(blame.sha);
         const ts = blame.timestamp;
-        const year = @divFloor(ts + 946684800, 31557600) + 1970;
+        const year = yearOf(ts);
+        // Sanitize author name — strip non-printable chars that can appear
+        // in commits imported from git repos with unusual encodings.
+        var sane_author_buf: [128]u8 = undefined;
+        var sane_len: usize = 0;
+        for (blame.author) |ch| {
+            if (ch >= 0x20 and ch < 0x7f and sane_len < sane_author_buf.len) {
+                sane_author_buf[sane_len] = ch;
+                sane_len += 1;
+            }
+        }
+        const sane_author: []const u8 = if (sane_len > 0) sane_author_buf[0..sane_len] else "unknown";
         try io.print("{s} ({s} {d:4}) {s}\n", .{
             hex[0..7],
-            blame.author,
+            sane_author,
             year,
             blame.content,
         });
     }
+}
+
+// Convert a Unix timestamp to a calendar year (Howard Hinnant's civil_from_days).
+fn yearOf(ts: i64) i64 {
+    const days_i64 = @divFloor(ts, 86400);
+    const z = days_i64 + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+    return yoe + era * 400;
 }
 
 /// Read a file's content from a tree object
