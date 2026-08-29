@@ -3,14 +3,19 @@ const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs_mod = @import("../../core/refs.zig");
 const http = @import("../../transport/http.zig");
+const ssh_cmd = @import("../../transport/ssh_cmd.zig");
+const ssh_mod = @import("../../transport/ssh.zig");
 const remote_cmd = @import("remote.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var remote_name: ?[]const u8 = null;
     var refspec: ?[]const u8 = null;
+    var use_git = false;
 
     for (args) |arg| {
-        if (!std.mem.startsWith(u8, arg, "-")) {
+        if (std.mem.eql(u8, arg, "--git") or std.mem.eql(u8, arg, "-g")) {
+            use_git = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
             if (remote_name == null) {
                 remote_name = arg;
             } else {
@@ -20,6 +25,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     const name = remote_name orelse "origin";
+
+    // Force git fallback if requested
+    if (use_git) {
+        try fetchViaGit(allocator, git_dir, name, io);
+        return;
+    }
 
     // Get remote URL from config
     const url = remote_cmd.getRemoteUrl(allocator, git_dir, name, io);
@@ -35,77 +46,167 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     try io.print("Fetching {s}\n", .{name});
 
-    var transport = try http.HttpTransport.init(allocator, io.io, url.?);
-    defer transport.deinit();
+    // Try appropriate transport based on URL
+    const is_ssh = ssh_mod.isSshUrl(url.?);
 
-    // Discover remote refs
-    const refs = try transport.discoverRefs();
-    defer {
-        for (refs) |r| allocator.free(r.name);
-        allocator.free(refs);
-    }
+    if (is_ssh) {
+        // Use SSH transport
+        var ssh_transport = ssh_cmd.SshTransport.init(allocator, io.io, url.?) catch {
+            try io.print("Note: SSH transport failed, falling back to git\n", .{});
+            try fetchViaGit(allocator, git_dir, name, io);
+            return;
+        };
+        defer ssh_transport.deinit();
 
-    // Get local HEAD for have lines
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
+        // Get local HEAD for have lines
+        const refs_manager = refs_mod.Refs.init(git_dir);
+        const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
 
-    var have_list: [1][20]u8 = undefined;
-    var have_slice: []const [20]u8 = &.{};
-    if (head_sha) |sha| {
-        have_list[0] = sha;
-        have_slice = &have_list;
-    }
+        var have_list: [1][20]u8 = undefined;
+        var have_slice: []const [20]u8 = &.{};
+        if (head_sha) |sha| {
+            have_list[0] = sha;
+            have_slice = &have_list;
+        }
 
-    // Filter by refspec if provided
-    var filtered_refs = refs;
-    if (refspec) |spec| {
-        var temp = std.ArrayList(http.RemoteRef){ .items = &.{}, .capacity = 0 };
+        // Discover and fetch refs
+        const refs = ssh_transport.discoverRefs() catch {
+            try io.print("Note: SSH discover failed, falling back to git\n", .{});
+            try fetchViaGit(allocator, git_dir, name, io);
+            return;
+        };
+        defer {
+            for (refs) |r| allocator.free(r.name);
+            allocator.free(refs);
+        }
+
+        ssh_transport.fetch(git_dir, refs, have_slice) catch {
+            try io.print("Note: SSH fetch failed, falling back to git\n", .{});
+            try fetchViaGit(allocator, git_dir, name, io);
+            return;
+        };
+
+        // Update remote-tracking branches
         for (refs) |ref| {
-            if (std.mem.startsWith(u8, ref.name, spec)) {
-                try temp.append(allocator, ref);
+            if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
+                const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ name, ref.name[11..] });
+                defer allocator.free(remote_ref);
+                const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ git_dir, name });
+                defer allocator.free(dir_path);
+                std.Io.Dir.cwd().createDirPath(io.io, dir_path) catch {};
+                try refs_manager.write(allocator, io.io, remote_ref, ref.sha);
             }
         }
-        filtered_refs = try temp.toOwnedSlice(allocator);
-    }
 
-    try transport.fetch(git_dir, filtered_refs, have_slice);
+        try io.print("From {s}\n", .{url.?});
+        for (refs) |ref| {
+            if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
+                const branch_name = ref.name[11..];
+                const hex = Sha1.hex(ref.sha);
+                try io.print(" * branch              {s} -> {s}\n", .{ hex[0..7], branch_name });
+            }
+        }
+    } else {
+        // Use HTTP transport
+        var transport = http.HttpTransport.init(allocator, io.io, url.?) catch {
+            try io.print("Note: HTTP transport failed, falling back to git\n", .{});
+            try fetchViaGit(allocator, git_dir, name, io);
+            return;
+        };
+        defer transport.deinit();
 
-    // Update remote-tracking branches
-    for (refs) |ref| {
-        if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
-            const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ name, ref.name[11..] });
-            defer allocator.free(remote_ref);
+        const refs = transport.discoverRefs() catch {
+            try io.print("Note: HTTP discover failed, falling back to git\n", .{});
+            try fetchViaGit(allocator, git_dir, name, io);
+            return;
+        };
+        defer {
+            for (refs) |r| allocator.free(r.name);
+            allocator.free(refs);
+        }
 
-            // Ensure directory exists
-            const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ git_dir, name });
-            defer allocator.free(dir_path);
-            std.Io.Dir.cwd().createDirPath(io.io, dir_path) catch {};
+        const refs_manager = refs_mod.Refs.init(git_dir);
+        const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
 
-            try refs_manager.write(allocator, io.io, remote_ref, ref.sha);
+        var have_list: [1][20]u8 = undefined;
+        var have_slice: []const [20]u8 = &.{};
+        if (head_sha) |sha| {
+            have_list[0] = sha;
+            have_slice = &have_list;
+        }
+
+        var filtered_refs = refs;
+        if (refspec) |spec| {
+            var temp = std.ArrayList(http.RemoteRef){ .items = &.{}, .capacity = 0 };
+            for (refs) |ref| {
+                if (std.mem.startsWith(u8, ref.name, spec)) {
+                    try temp.append(allocator, ref);
+                }
+            }
+            filtered_refs = try temp.toOwnedSlice(allocator);
+        }
+
+        transport.fetch(git_dir, filtered_refs, have_slice) catch {
+            try io.print("Note: HTTP fetch failed, falling back to git\n", .{});
+            try fetchViaGit(allocator, git_dir, name, io);
+            return;
+        };
+
+        for (refs) |ref| {
+            if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
+                const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ name, ref.name[11..] });
+                defer allocator.free(remote_ref);
+                const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ git_dir, name });
+                defer allocator.free(dir_path);
+                std.Io.Dir.cwd().createDirPath(io.io, dir_path) catch {};
+                try refs_manager.write(allocator, io.io, remote_ref, ref.sha);
+            }
+        }
+
+        try io.print("From {s}\n", .{url.?});
+        for (refs) |ref| {
+            if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
+                const branch_name = ref.name[11..];
+                const hex = Sha1.hex(ref.sha);
+                try io.print(" * branch              {s} -> {s}\n", .{ hex[0..7], branch_name });
+            }
         }
     }
+}
 
-    // Update HEAD if fetching the current branch
-    var head_info = refs_manager.head(allocator, io.io) catch null;
-    defer if (head_info) |*h| h.deinit(allocator);
+/// Fetch using system git as fallback
+fn fetchViaGit(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    remote_name: []const u8,
+    io: Io,
+) !void {
+    var git_cmd = std.ArrayList(u8).empty;
+    defer git_cmd.deinit(allocator);
+    try git_cmd.appendSlice(allocator, "GIT_DIR=");
+    try git_cmd.appendSlice(allocator, git_dir);
+    try git_cmd.appendSlice(allocator, " GIT_INDEX_FILE=/dev/null git fetch ");
+    try git_cmd.appendSlice(allocator, remote_name);
 
-    if (head_info) |hi| {
-        switch (hi) {
-            .branch => |b| {
-                const current_branch_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
-                defer allocator.free(current_branch_ref);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "sh");
+    try argv.append(allocator, "-c");
+    try argv.append(allocator, git_cmd.items);
 
-            },
-            .detached => {},
-        }
+    const result = std.process.run(allocator, io.io, .{
+        .argv = argv.items,
+    }) catch |err| {
+        try io.eprint("error: git fetch failed: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.stdout.len > 0) {
+        try io.print("{s}", .{result.stdout});
     }
-
-    try io.print("From {s}\n", .{url.?});
-    for (refs) |ref| {
-        if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
-            const branch_name = ref.name[11..];
-            const hex = Sha1.hex(ref.sha);
-            try io.print(" * branch              {s} -> {s}\n", .{ hex[0..7], branch_name });
-        }
+    if (result.stderr.len > 0) {
+        try io.eprint("{s}", .{result.stderr});
     }
 }

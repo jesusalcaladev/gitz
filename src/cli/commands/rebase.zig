@@ -345,6 +345,11 @@ fn resolveRef(
     defer allocator.free(tag_ref);
     if (refs_manager.read(allocator, io, tag_ref)) |sha| return sha else |_| {}
 
+    // Try remote tracking branch: refs/remotes/<name>
+    const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}", .{ref});
+    defer allocator.free(remote_ref);
+    if (refs_manager.read(allocator, io, remote_ref)) |sha| return sha else |_| {}
+
     if (refs_manager.read(allocator, io, ref)) |sha| return sha else |_| {}
     if (Sha1.fromHex(ref)) |sha| return sha else |_| {}
 
