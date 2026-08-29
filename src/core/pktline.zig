@@ -94,6 +94,7 @@ pub fn extractPackData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 pub fn buildWantLine(allocator: std.mem.Allocator, sha: [20]u8) ![]u8 {
     const sha_hex = Sha1.hex(sha);
     const want_line = try std.fmt.allocPrint(allocator, "want {s}\n", .{&sha_hex});
+    defer allocator.free(want_line);
     const pkt_len: u16 = @intCast(4 + want_line.len);
     const pkt_hex = try std.fmt.allocPrint(allocator, "{x:0>4}", .{pkt_len});
     var result = std.ArrayList(u8).empty;

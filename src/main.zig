@@ -81,5 +81,7 @@ comptime {
     _ = @import("cli/commands/review.zig");
     _ = @import("cli/commands/sync.zig");
     _ = @import("cli/commands/lfs.zig");
+    _ = @import("cli/commands/completions.zig");
     _ = @import("tests/integration/compat.zig");
+    _ = @import("tests/integration/http_transport.zig");
 }

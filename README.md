@@ -338,7 +338,7 @@ their shards and packed on the fly.
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Shell completions | Medium | bash/zsh/fish |
+| Shell completions | **Done** | bash/zsh/fish via `gitz completions` |
 | Windows support | Low | Build for Windows |
 | HTTP transport tests | Low | Test suite for HTTP |
 | Release v1.0 | Low | Stable release |
