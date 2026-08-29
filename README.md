@@ -7,185 +7,98 @@
 
 ---
 
-## Features
-
-- **Full local workflow** -- init, add, commit, status, diff, log, branch, merge, rebase, stash, reset, tag, blame, gc, search, review, sync, lfs
-- **SSH clone from GitHub** -- `gitz clone git@github.com:user/repo.git`
-- **Bidirectional compatibility** -- git can read gitz objects and vice versa
-- **Respects .gitignore** -- full parser with `!`, `**`, `*`, `?` support
-- **Colored diff** -- ANSI colors for added/removed lines
-- **Interactive rebase** -- `gitz rebase -i` with pick/squash/drop menu (TUI)
-- **Pluggable storage backend** -- loose objects or sharded directories, configurable per-repo
-- **Shard store for horizontal scaling** -- distribute objects across N shards by SHA prefix
-- **Written in Zig** -- single binary, no dependencies, blazing fast
-
 ## Quick Start
 
-### One-line install (Recommended)
-
 ```bash
+# Install
 curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh | bash
-```
 
-This will:
-1. **Download pre-built binary** (fastest, no Zig required)
-2. **Or build from source** (if no binary available for your platform)
-3. Add `gitz` to your PATH automatically
-
-### Manual install from releases
-
-Download the latest binary from [GitHub Releases](https://github.com/jesusalcaladev/gitz/releases):
-
-```bash
-# Linux x86_64
-curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-linux-x86_64.tar.gz | tar -xz
-
-# Linux aarch64
-curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-linux-aarch64.tar.gz | tar -xz
-
-# macOS x86_64
-curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-macos-x86_64.tar.gz | tar -xz
-
-# macOS aarch64 (Apple Silicon)
-curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-macos-aarch64.tar.gz | tar -xz
-
-# Install to ~/.local/bin
-mkdir -p ~/.local/bin
-mv gitz ~/.local/bin/
-```
-
-### Build from source
-
-```bash
-# Clone the repository
-git clone git@github.com:jesusalcaladev/gitz.git
-cd gitz
-
-# Build with Zig
+# Or build from source
+git clone git@github.com:jesusalcaladev/gitz.git && cd gitz
 zig build -Doptimize=ReleaseFast
-
-# Install globally
-mkdir -p ~/.local/bin
 cp zig-out/bin/gitz ~/.local/bin/
-
-# Add to PATH (if not already)
-export PATH="$HOME/.local/bin:$PATH"
-
-# Verify installation
-gitz --version
 ```
 
 ### Requirements
 
 - **Linux** (x86_64, aarch64) or **macOS** (x86_64, aarch64)
-- **Zig 0.16+** (only needed for building from source)
-- **SSH** (for clone/push/pull via SSH)
+- **Zig 0.16+** (only for building from source)
+- **SSH** (for clone/push/pull)
 
-### SSH Setup
-
-For SSH operations, you need SSH configured. See [SSH Setup Guide](docs/SSH-SETUP.md).
+---
 
 ## Usage
 
 ```bash
-# Initialize a repo
-gitz init
-
-# Stage and commit
-gitz add .
-gitz commit -m "Initial commit"
-
-# Check status
-gitz status
-
-# View history
-gitz log --oneline
-gitz log --graph --all
-
-# Branch operations
-gitz branch feature
-gitz switch feature
-gitz switch main
-gitz branch -d feature
-
-# Diff
-gitz diff
-gitz diff --staged
-
-# Clone from GitHub
-gitz clone git@github.com:user/repo.git
-
-# Remote operations
-gitz remote add origin git@github.com:user/repo.git
-gitz push origin main
-gitz pull
+gitz init                              # Create .gitz/ repository
+gitz add .                             # Stage all files
+gitz commit -m "Initial commit"        # Create commit
+gitz status                            # Beautiful status display
+gitz log --graph --all                 # Visual history
+gitz diff                              # Colored diffs
+gitz branch feature                    # Create branch
+gitz switch feature                    # Switch branch
+gitz merge main                        # Merge branches
+gitz rebase -i main                    # Interactive rebase (TUI)
+gitz stash / stash pop                 # Stash management
+gitz search "TODO"                     # Search commits & content
+gitz review HEAD~3 HEAD                # Code review
+gitz sync                              # Fetch + rebase
+gitz clone git@github.com:user/repo.git # Clone via SSH
+gitz push origin main                  # Push (native SSH)
+gitz pull                              # Pull + rebase
+gitz lfs track "*.psd"                 # Large file storage
+gitz completions bash > /etc/bash_completion.d/gitz  # Shell completions
 ```
 
-## Commands Reference
+---
 
-### Local Commands
+## Commands
+
+### Local
 
 | Command | Description |
 |---------|-------------|
-| `gitz init` | Initialize a new repository |
-| `gitz add <files>` | Stage files for commit (respects .gitignore) |
-| `gitz commit -m "msg"` | Record changes. Use `-a` to auto-stage, `--amend` to edit |
+| `gitz init` | Initialize repository |
+| `gitz add <files>` | Stage files (respects .gitignore) |
+| `gitz commit -m "msg"` | Record changes (`-a` auto-stage, `--amend` edit) |
 | `gitz status` | Show staged, unstaged, and untracked files |
-| `gitz diff` | Show changes. Use `--staged` for staged changes |
-| `gitz log` | Show history. Use `--graph`, `--all`, `-n`, `--author`, `--grep` |
-| `gitz branch` | List/create branches. Use `-d`/`-D` to delete, `-m` to rename |
-| `gitz switch` | Switch branches. Use `-c` to create and switch |
-| `gitz merge` | Merge branches. Use `--no-ff` for merge commit |
-| `gitz rebase` | Rebase current branch. Use `--onto`, `--abort` |
-| `gitz stash` | Stash changes. Use `push`, `pop`, `apply`, `list`, `drop`, `show` |
-| `gitz reset` | Reset HEAD. Use `--soft`, `--mixed`, `--hard` |
-| `gitz undo` | Undo last commit (creates inverse commit) |
-| `gitz tag` | Create/list tags. Use `-a` for annotated, `-d` to delete |
-| `gitz blame` | Show per-line author history |
+| `gitz diff` | Show changes (`--staged` for staged) |
+| `gitz log` | History (`--graph`, `--all`, `-n`, `--author`, `--grep`) |
+| `gitz branch` | List/create/delete/rename branches |
+| `gitz switch` | Switch/create branches (`-c` to create) |
+| `gitz merge` | Join branches (`--no-ff` for merge commit) |
+| `gitz rebase` | Rebase (`-i` interactive, `--abort`, `--onto`) |
+| `gitz stash` | Stash (`push`, `pop`, `apply`, `list`, `drop`, `show`) |
+| `gitz reset` | Reset HEAD (`--soft`, `--mixed`, `--hard`) |
+| `gitz undo` | Undo last commit |
+| `gitz tag` | Tags (`-a` annotated, `-d` delete) |
+| `gitz blame` | Per-line author history |
 | `gitz gc` | Clean up unreachable objects |
-| `gitz config` | Get/set user.name and user.email |
-| `gitz search` | Search commit messages and file contents |
-| `gitz review` | Code review (diff between branches/commits) |
-| `gitz sync` | Fetch and rebase onto remote branch |
-| `gitz lfs` | Git Large File Storage (track, untrack, status) |
+| `gitz config` | Set user.name / user.email |
+| `gitz search` | Search commit messages & file contents |
+| `gitz review` | Code review with diff stats |
+| `gitz sync` | Fetch + auto-rebase |
+| `gitz lfs` | Git Large File Storage |
 
-### Remote Commands
-
-| Command | Description |
-|---------|-------------|
-| `gitz clone <url>` | Clone a repository (supports SSH URLs) |
-| `gitz fetch` | Download objects and refs from remote |
-| `gitz push` | Upload local objects to remote |
-| `gitz pull` | Fetch and rebase from remote |
-| `gitz remote` | Manage remotes (add, remove, list, set-url) |
-
-**Note:** Remote commands auto-fallback to system `git` if gitz transport fails. Use `--git` flag to force using git.
-
-### Utility Commands
+### Remote
 
 | Command | Description |
 |---------|-------------|
-| `gitz update` | Update gitz to the latest version |
-| `gitz update --check` | Check for updates without installing |
+| `gitz clone <url>` | Clone repository (SSH) |
+| `gitz fetch` | Download from remote |
+| `gitz push` | Upload to remote (native SSH) |
+| `gitz pull` | Fetch + rebase |
+| `gitz remote` | Manage remotes (`add`, `remove`, `list`, `set-url`) |
 
-### Developer Experience Commands
+### Utility
 
 | Command | Description |
 |---------|-------------|
-| `gitz search <query>` | Search commit messages and file contents |
-| `gitz review [base] [head]` | Code review with diff stats and summary |
-| `gitz sync [remote]` | Fetch + rebase shorthand |
-| `gitz lfs <subcommand>` | Git Large File Storage |
+| `gitz update` | Update to latest version |
+| `gitz completions <shell>` | Generate bash/zsh/fish completions |
 
-## Testing
-
-```bash
-# Run all tests
-zig build test
-
-# Run specific test
-zig build test -- --test-filter "sha1"
-```
+---
 
 ## Architecture
 
@@ -194,69 +107,46 @@ src/
 ├── main.zig              # Entry point
 ├── cli/
 │   ├── mod.zig           # Command dispatch
-│   ├── parser.zig        # Argument parser
-│   └── commands/         # All command implementations
-│       ├── init.zig      # gitz init
-│       ├── add.zig       # gitz add (with .gitignore support)
-│       ├── commit.zig    # gitz commit
-│       ├── status.zig    # gitz status
-│       ├── log.zig       # gitz log
-│       ├── diff.zig      # gitz diff (LCS algorithm)
-│       ├── branch.zig    # gitz branch
-│       ├── switch.zig    # gitz switch
-│       ├── merge.zig     # gitz merge
-│       ├── rebase.zig    # gitz rebase (simple + interactive)
-│       ├── stash.zig     # gitz stash
-│       ├── reset.zig     # gitz reset
-│       ├── tag.zig       # gitz tag
-│       ├── blame.zig     # gitz blame
-│       ├── gc.zig        # gitz gc
-│       ├── clone.zig     # gitz clone
-│       ├── fetch.zig     # gitz fetch
-│       ├── push.zig      # gitz push
-│       ├── pull.zig      # gitz pull
-│       ├── remote.zig    # gitz remote
-│       ├── config.zig    # gitz config
-│       ├── undo.zig      # gitz undo
-│       ├── search.zig    # gitz search
-│       ├── review.zig    # gitz review
-│       ├── sync.zig      # gitz sync
-│       └── lfs.zig       # gitz lfs
+│   └── commands/         # 26 command implementations
 ├── core/
 │   ├── sha1.zig          # SHA-1 hashing
 │   ├── object.zig        # Git objects (blob, tree, commit, tag)
-│   ├── loose.zig         # Loose object store (with zlib)
+│   ├── loose.zig         # Loose object store
 │   ├── index.zig         # Staging area
 │   ├── refs.zig          # Reference system
-│   ├── diff.zig          # Diff algorithm (LCS)
+│   ├── diff.zig          # LCS diff algorithm
 │   ├── merge.zig         # 3-way merge
-│   ├── stash.zig         # Stash management
-│   ├── ignore.zig        # .gitignore parser
-│   ├── config.zig        # Config parser
 │   ├── packfile.zig      # Packfile reader/writer
-│   ├── packindex.zig     # Pack index
 │   ├── delta.zig         # Delta compression
-│   ├── mmap.zig          # Memory-mapped I/O
-│   ├── threadpool.zig    # Thread pool
-│   ├── parallel.zig      # Parallel operations
-│   ├── pktline.zig       # Packet-line protocol
-│   ├── streampack.zig    # Streaming pack
-│   ├── zlib.zig          # Zlib compression
 │   ├── storage.zig       # Pluggable storage backend
 │   ├── shard_store.zig   # Shard storage backend
-│   └── objectstore.zig   # Unified object store
+│   └── ...               # 15+ core modules
 ├── transport/
-│   ├── ssh.zig           # SSH transport
+│   ├── ssh_cmd.zig       # Native SSH transport
 │   ├── smart_http.zig    # Smart HTTP client
-│   ├── auth.zig          # Authentication
-│   └── http.zig          # HTTP transport
+│   └── auth.zig          # Authentication
 └── util/
-    ├── io.zig            # I/O wrapper for Zig 0.16
-    ├── fs.zig            # Filesystem helpers
-    ├── compression.zig   # Compression wrappers
-    ├── mmap.zig          # Memory-mapped I/O
-    ├── path.zig          # Path manipulation
-    └── temp.zig          # Temporary files
+    └── ...               # I/O, compression, filesystem
+```
+
+## Pluggable Storage
+
+```bash
+# Default: loose objects
+gitz init
+
+# Shard backend for horizontal scaling
+gitz config storage.backend shard
+gitz config storage.shards 16
+
+# Objects distributed: .gitz/objects/shard_XX/YY/...
+```
+
+## Testing
+
+```bash
+zig build test                    # Run all tests (84+ tests, 0 leaks)
+zig build test -- --test-filter "sha1"  # Specific test
 ```
 
 ## Git Compatibility
@@ -264,124 +154,16 @@ src/
 GitZ objects are **fully compatible** with git:
 
 ```bash
-# Git can read gitz objects
-git --git-dir=.gitz log --oneline
-
-# Gitz can read git objects (via clone)
-gitz clone git@github.com:user/repo.git
-gitz log --oneline
+git --git-dir=.gitz log --oneline     # Git reads gitz objects
+gitz clone git@github.com:user/repo.git  # Gitz reads git objects
 ```
-
-Objects use standard git format:
-- Blob: `blob <size>\0<content>`
-- Tree: `tree <size>\0<entries>`
-- Commit: `commit <size>\0<tree + parents + author + message>`
-- All objects are zlib-compressed
-
-## Pluggable Storage Backend
-
-GitZ separates the **wire protocol** (always packfiles, git-compatible) from the
-**internal storage** (pluggable). This allows scaling beyond git's single-filesystem model.
-
-### Loose backend (default)
-
-Standard git layout: `objects/XX/YYYY...YYYY`
-
-```bash
-gitz init  # uses loose by default
-```
-
-### Shard backend
-
-Distributes objects across N shards by SHA-1 prefix. Each shard can live on a
-different physical volume for horizontal I/O scaling.
-
-```bash
-gitz init
-gitz config storage.backend shard
-gitz config storage.shards 16
-
-# Objects are now stored as:
-# .gitz/objects/shard_00/XX/YYYY...YYYY
-# .gitz/objects/shard_01/XX/YYYY...YYYY
-# ...
-# .gitz/objects/shard_0f/XX/YYYY...YYYY
-```
-
-The shard index is `sha[0] % num_shards`, providing uniform distribution.
-The wire protocol is unaffected -- objects are unpacked from incoming packfiles
-and routed to the correct shard. When sending, objects are collected from
-their shards and packed on the fly.
-
-## Project Status
-
-### Completed
-
-- **Phase 1 (Core Local)**: 16/16 commands -- all local commands working
-- **Phase 2A (HTTP Transport)**: 7/8 -- Smart HTTP native, pkt-line complete (tests pending)
-- **Phase 2B (SSH Transport)**: 2/2 -- full SSH transport complete
-- **Phase 3 (Developer Experience)**: 6/7 -- search, review, sync, lfs, colored output, config
-- **Phase 4 (Cross-platform)**: Binary builds for Linux x86_64/aarch64, macOS x86_64/aarch64
-
-### Known Bugs (all fixed)
-
-| Issue | Status | Description |
-|-------|--------|-------------|
-| Blame encoding | Fixed | Improved encoding handling and path resolution |
-| Rebase orphan commits | Fixed | Added gc after rebase to clean up orphans |
-| Stash over-staging | Fixed | Now compares SHA with HEAD before including |
-| Remote list empty | Fixed | Expected behavior when no remotes configured |
-| Clone no checkout | Fixed | Clone now performs full checkout |
-| Commit -a re-adds all | Fixed | Now only updates actually modified files |
-
-### Missing Features
-
-| Feature | Priority | Description |
-|---------|----------|-------------|
-| Shell completions | **Done** | bash/zsh/fish via `gitz completions` |
-| Windows support | Low | Build for Windows |
-| HTTP transport tests | Low | Test suite for HTTP |
-| Release v1.0 | Low | Stable release |
-
-### Roadmap
-
-- [x] Phase 1: Core local commands (16/16)
-- [x] Phase 2A: HTTP transport (complete, tests pending)
-- [x] Phase 2B: SSH transport (complete)
-- [x] Phase 3: Developer experience (search, review, sync, lfs)
-- [x] Phase 4: Cross-platform builds
-- [ ] Shell completions
-- [ ] Release v1.0
-
-## Releases
-
-Pre-built binaries are available for:
-- Linux x86_64 and aarch64
-- macOS x86_64 and aarch64 (Apple Silicon)
-
-Check the [Releases page](https://github.com/jesusalcaladev/gitz/releases) for the latest version.
-
-To create a release, tag a commit and push:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-The GitHub Actions workflow will automatically build and publish binaries for all platforms.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
-*Built with [Zig](https://ziglang.org)*
+## License
+
+MIT License
+
+---
+
+*Built with [Zig](https://ziglang.org) -- single binary, no dependencies, blazing fast*

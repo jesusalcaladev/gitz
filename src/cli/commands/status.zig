@@ -12,18 +12,19 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const refs_manager = refs.Refs.init(git_dir);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
-        try io.print("No commits yet\n", .{});
+        try io.print("\x1b[1;33m⚠\x1b[0m \x1b[1mNo commits yet\x1b[0m\n", .{});
         return;
     };
     defer head_info.deinit(allocator);
 
+    // ── Branch header ──
     switch (head_info) {
         .branch => |b| {
-            try io.print("On branch {s}\n", .{b.name.items});
+            try io.print("\x1b[1;36m●\x1b[0m On branch \x1b[1;33m{s}\x1b[0m\n", .{b.name.items});
         },
         .detached => |d| {
             const hex = Sha1.hex(d.sha);
-            try io.print("HEAD detached at {s}\n", .{hex[0..7]});
+            try io.print("\x1b[1;31m●\x1b[0m HEAD detached at \x1b[1;33m{s}\x1b[0m\n", .{hex[0..7]});
         },
     }
 
@@ -84,6 +85,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer staged_added.deinit(allocator);
     var staged_modified = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer staged_modified.deinit(allocator);
+    var staged_deleted = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    defer staged_deleted.deinit(allocator);
     var unstaged_modified = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer unstaged_modified.deinit(allocator);
     var unstaged_deleted = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
@@ -132,7 +135,6 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const in_index = findIndexEntry(&idx, clean_name) != null;
 
         if (in_head or in_index) {
-            // File is tracked — compare working tree vs HEAD tree SHA
             const base_sha = head_shas.get(clean_name) orelse continue;
 
             const header = std.fmt.allocPrint(allocator, "blob {d}\x00", .{wf.content.len}) catch continue;
@@ -143,10 +145,16 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             if (!std.mem.eql(u8, &work_sha, &base_sha)) {
                 var already_staged = false;
                 for (staged_modified.items) |s| {
-                    if (std.mem.eql(u8, s, clean_name)) { already_staged = true; break; }
+                    if (std.mem.eql(u8, s, clean_name)) {
+                        already_staged = true;
+                        break;
+                    }
                 }
                 for (staged_added.items) |s| {
-                    if (std.mem.eql(u8, s, clean_name)) { already_staged = true; break; }
+                    if (std.mem.eql(u8, s, clean_name)) {
+                        already_staged = true;
+                        break;
+                    }
                 }
                 if (!already_staged) {
                     try unstaged_modified.append(allocator, clean_name);
@@ -168,45 +176,63 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
-    const has_staged = staged_added.items.len > 0 or staged_modified.items.len > 0;
-    const has_unstaged = unstaged_modified.items.len > 0 or unstaged_deleted.items.len > 0;
+    // ── Summary line ──
+    const n_staged = staged_added.items.len + staged_modified.items.len + staged_deleted.items.len;
+    const n_unstaged = unstaged_modified.items.len + unstaged_deleted.items.len;
+    const n_untracked = untracked.items.len;
 
-    if (!has_staged and !has_unstaged and untracked.items.len == 0) {
-        try io.print("nothing to commit, working tree clean\n", .{});
+    if (n_staged == 0 and n_unstaged == 0 and n_untracked == 0) {
+        try io.print("\n  \x1b[1;32m✓\x1b[0m \x1b[2mWorking tree clean\x1b[0m\n", .{});
         return;
     }
 
-    if (has_staged) {
-        try io.print("Changes to be committed:\n", .{});
-        try io.print("  (use \"gitz restore --staged <file>...\" to unstage)\n", .{});
+    try io.print("\n", .{});
+
+    // ── Staged changes ──
+    if (n_staged > 0) {
+        try io.print("  \x1b[1;32mStaged\x1b[0m  ", .{});
+        try io.print("\x1b[2m({d} file{s})\x1b[0m\n", .{ n_staged, if (n_staged > 1) "s" else "" });
         for (staged_added.items) |name| {
-            try io.print("\tnew file:   {s}\n", .{name});
+            try io.print("    \x1b[32m+\x1b[0m \x1b[32m{s}\x1b[0m\n", .{name});
         }
         for (staged_modified.items) |name| {
-            try io.print("\tmodified:   {s}\n", .{name});
+            try io.print("    \x1b[33m~\x1b[0m \x1b[33m{s}\x1b[0m\n", .{name});
+        }
+        for (staged_deleted.items) |name| {
+            try io.print("    \x1b[31m-\x1b[0m \x1b[31m{s}\x1b[0m\n", .{name});
         }
         try io.print("\n", .{});
     }
 
-    if (has_unstaged) {
-        try io.print("Changes not staged for commit:\n", .{});
-        try io.print("  (use \"gitz add <file>...\" to update what will be committed)\n", .{});
+    // ── Unstaged changes ──
+    if (n_unstaged > 0) {
+        try io.print("  \x1b[1;33mModified\x1b[0m", .{});
+        try io.print("  \x1b[2m({d} file{s})\x1b[0m\n", .{ n_unstaged, if (n_unstaged > 1) "s" else "" });
         for (unstaged_modified.items) |name| {
-            try io.print("\tmodified:   {s}\n", .{name});
+            try io.print("    \x1b[33m~\x1b[0m {s}\n", .{name});
         }
         for (unstaged_deleted.items) |name| {
-            try io.print("\tdeleted:    {s}\n", .{name});
+            try io.print("    \x1b[31m-\x1b[0m \x1b[31m{s} (deleted)\x1b[0m\n", .{name});
         }
         try io.print("\n", .{});
     }
 
-    if (untracked.items.len > 0) {
-        try io.print("Untracked files:\n", .{});
-        try io.print("  (use \"gitz add <file>...\" to include in what will be committed)\n", .{});
+    // ── Untracked files ──
+    if (n_untracked > 0) {
+        try io.print("  \x1b[1;36mUntracked\x1b[0m", .{});
+        try io.print(" \x1b[2m({d} file{s})\x1b[0m\n", .{ n_untracked, if (n_untracked > 1) "s" else "" });
         for (untracked.items) |name| {
-            try io.print("\t{s}\n", .{name});
+            try io.print("    \x1b[2m?\x1b[0m {s}\n", .{name});
         }
         try io.print("\n", .{});
+    }
+
+    // ── Quick actions ──
+    if (n_staged > 0) {
+        try io.print("  \x1b[2mgitz commit -m \"...\"\x1b[0m\n", .{});
+    }
+    if (n_unstaged > 0 or n_untracked > 0) {
+        try io.print("  \x1b[2mgitz add .\x1b[0m\n", .{});
     }
 }
 
