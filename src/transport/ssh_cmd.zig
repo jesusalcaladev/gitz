@@ -41,7 +41,6 @@ pub const SshTransport = struct {
         try argv.append(self.allocator, "BatchMode=yes");
         try argv.append(self.allocator, self.host);
         try argv.append(self.allocator, "git-upload-pack");
-        try argv.append(self.allocator, "--hierarchical-refsets");
         try argv.append(self.allocator, self.path);
 
         const result = std.process.run(self.allocator, self.io, .{
@@ -113,13 +112,12 @@ pub const SshTransport = struct {
     pub fn push(self: *SshTransport, git_dir: []const u8, ref_name: []const u8, sha: [20]u8, old_sha: ?[20]u8) !void {
         const new_hex = Sha1.hex(sha);
         const old_hex: [40]u8 = if (old_sha) |os| Sha1.hex(os) else [_]u8{'0'} ** 40;
-        const cmd = try std.fmt.allocPrint(self.allocator, "{s} {s} refs/heads/{s}\n", .{ &old_hex, &new_hex, ref_name });
-        defer self.allocator.free(cmd);
-        _ = try self.collectPushObjects(git_dir, sha, old_sha);
 
-        const objects = try self.collectPushObjects(git_dir, sha, null);
+        // Collect only the objects needed for this push (diff between old and new)
+        const objects = try self.collectPushObjects(git_dir, sha, old_sha);
         defer self.allocator.free(objects);
 
+        // Build packfile
         var pw = packfile_mod.PackWriter.init(self.allocator);
         defer pw.deinit();
         try pw.writeHeader(2, @intCast(objects.len));
@@ -141,11 +139,23 @@ pub const SshTransport = struct {
             };
             try pw.writeObject(pot, obj_sha, content);
         }
-        try pw.finalize();
-
+        try pw.finalize();        // Build the full input for git-receive-pack over SSH
+        // SSH protocol: first line is NOT pkt-line framed
         var full_input = std.ArrayList(u8).empty;
         defer full_input.deinit(self.allocator);
-        try full_input.appendSlice(self.allocator, cmd);
+
+        // Line 1: <old> <new> <ref>\0<capabilities>\n  (raw, no pkt-line)
+        try full_input.appendSlice(self.allocator, &old_hex);
+        try full_input.appendSlice(self.allocator, " ");
+        try full_input.appendSlice(self.allocator, &new_hex);
+        try full_input.appendSlice(self.allocator, " refs/heads/");
+        try full_input.appendSlice(self.allocator, ref_name);
+        try full_input.appendSlice(self.allocator, "\x00report-status side-band-64k\n");
+
+        // Flush packet
+        try full_input.appendSlice(self.allocator, "0000");
+
+        // Pack data
         try full_input.appendSlice(self.allocator, pw.getPackData());
 
         // Use std.process.spawn to pipe stdin for push data
@@ -165,17 +175,65 @@ pub const SshTransport = struct {
             .stderr = .pipe,
         }) catch return error.SshError;
 
-        // Write the push data to stdin and close it
+        // Write the push data to stdin using raw write
         if (child.stdin) |*stdin| {
-            std.Io.File.writeStreamingAll(stdin.*, self.io, full_input.items) catch {
-                return error.SshError;
-            };
+            const fd = stdin.handle;
+            var written: usize = 0;
+            while (written < full_input.items.len) {
+                const n = std.os.linux.write(@intCast(fd), full_input.items[written..].ptr, full_input.items.len - written);
+                if (n > full_input.items.len - written) return error.SshError;
+                if (n == 0) return error.SshError;
+                written += n;
+            }
             stdin.close(self.io);
             child.stdin = null;
         }
 
-        // Wait for the child process to finish
-        _ = child.wait(self.io) catch {};
+        // Read all stdout/stderr to prevent deadlock, then wait
+        var stdout_buf: [64 * 1024]u8 = undefined;
+        var stdout_data = std.ArrayList(u8).empty;
+        defer stdout_data.deinit(self.allocator);
+        while (child.stdout) |*f| {
+            const n = std.Io.File.readStreaming(f.*, self.io, &.{&stdout_buf}) catch break;
+            if (n == 0) break;
+            stdout_data.appendSlice(self.allocator, stdout_buf[0..n]) catch break;
+        }
+
+        var stderr_buf: [64 * 1024]u8 = undefined;
+        var stderr_data = std.ArrayList(u8).empty;
+        defer stderr_data.deinit(self.allocator);
+        while (child.stderr) |*f| {
+            const n = std.Io.File.readStreaming(f.*, self.io, &.{&stderr_buf}) catch break;
+            if (n == 0) break;
+            stderr_data.appendSlice(self.allocator, stderr_buf[0..n]) catch break;
+        }
+
+        const term: std.process.Child.Term = child.wait(self.io) catch blk: {
+            break :blk std.process.Child.Term{ .exited = 127 };
+        };
+
+        // Check for errors
+        const exit_code: i32 = switch (term) {
+            .exited => |code| @intCast(code),
+            else => -1,
+        };
+        if (exit_code != 0) {
+            if (stderr_data.items.len > 0) {
+                std.Io.File.writeStreamingAll(std.Io.File.stderr(), self.io, stderr_data.items) catch {};
+            }
+            return error.PushRejected;
+        }
+
+        // Check for server-side errors in stdout (sideband format)
+        if (stdout_data.items.len > 0) {
+            // Response starts with pkt-line: hex length + payload
+            // Sideband: \x01 = pack, \x02 = stderr, \x03 = fatal
+            for (stdout_data.items) |byte| {
+                if (byte == 0x02 or byte == 0x03) {
+                    return error.PushRejected;
+                }
+            }
+        }
     }
 
     /// Collect objects reachable from sha but not from old_sha
@@ -366,11 +424,12 @@ fn parseSshUrl(allocator: Allocator, url: []const u8) !SshUrl {
     }
 
     if (std.mem.startsWith(u8, url, "git@")) {
-        const rest = url[4..];
-        if (std.mem.indexOf(u8, rest, ":")) |colon_pos| {
+        // Keep "git@" prefix so SSH resolves as git@github.com, not jesusalcala@github.com
+        if (std.mem.indexOf(u8, url[4..], ":")) |colon_pos| {
+            const abs_colon = 4 + colon_pos;
             return .{
-                .host = try allocator.dupe(u8, rest[0..colon_pos]),
-                .path = try allocator.dupe(u8, rest[colon_pos + 1 ..]),
+                .host = try allocator.dupe(u8, url[0..abs_colon]),
+                .path = try allocator.dupe(u8, url[abs_colon + 1 ..]),
             };
         }
     }
