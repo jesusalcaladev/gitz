@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("cli/mod.zig");
 const Io = @import("util/io.zig").Io;
+const update_cmd = @import("cli/commands/update.zig");
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -17,6 +18,12 @@ pub fn main(init: std.process.Init) !void {
 
     const command = args[1];
     try cli.dispatch(allocator, command, args[2..], io);
+
+    // Check for updates after command execution (non-blocking, silent failures)
+    // Skip if user is already running update command or if no internet
+    if (!std.mem.eql(u8, command, "update") and !std.mem.eql(u8, command, "--version") and !std.mem.eql(u8, command, "-v")) {
+        update_cmd.checkForUpdates(allocator, io);
+    }
 }
 
 comptime {
@@ -68,5 +75,6 @@ comptime {
     _ = @import("transport/smart_http.zig");
     _ = @import("transport/auth.zig");
     _ = @import("cli/commands/config.zig");
+    _ = @import("cli/commands/update.zig");
     _ = @import("tests/integration/compat.zig");
 }

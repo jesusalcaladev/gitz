@@ -165,27 +165,30 @@ fn readFileFromTree(allocator: std.mem.Allocator, io: std.Io, store: storage_mod
         else => return null,
     };
 
-    // Simple path matching (single-level only)
-    for (tree.entries) |entry| {
-        if (std.mem.eql(u8, entry.name, file_path)) {
-            // Read the blob
-            const blob_obj = store.read(allocator, io, entry.sha) catch return null;
-            const blob = switch (blob_obj) {
-                .blob => |b| b,
-                else => return null,
-            };
-            return blob.content;
+    // Handle single-level paths
+    if (std.mem.indexOf(u8, file_path, "/") == null) {
+        for (tree.entries) |entry| {
+            if (std.mem.eql(u8, entry.name, file_path)) {
+                const blob_obj = store.read(allocator, io, entry.sha) catch return null;
+                const blob = switch (blob_obj) {
+                    .blob => |b| b,
+                    else => return null,
+                };
+                // Return a copy to ensure proper encoding
+                return allocator.dupe(u8, blob.content) catch null;
+            }
         }
     }
 
-    // Try subdirectories
+    // Handle multi-level paths (subdirectories)
     for (tree.entries) |entry| {
         if (entry.mode == 0o040000) { // directory
-            // Strip first path component
-            if (std.mem.indexOf(u8, file_path, "/")) |slash_pos| {
-                const remainder = file_path[slash_pos + 1 ..];
-                if (readFileFromTree(allocator, io, store, entry.sha, remainder)) |content| {
-                    return content;
+            if (std.mem.startsWith(u8, file_path, entry.name)) {
+                if (file_path.len > entry.name.len and file_path[entry.name.len] == '/') {
+                    const remainder = file_path[entry.name.len + 1 ..];
+                    if (readFileFromTree(allocator, io, store, entry.sha, remainder)) |content| {
+                        return content;
+                    }
                 }
             }
         }

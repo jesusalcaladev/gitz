@@ -22,6 +22,7 @@ const fetch_cmd = @import("commands/fetch.zig");
 const push_cmd = @import("commands/push.zig");
 const pull_cmd = @import("commands/pull.zig");
 const config_cmd = @import("commands/config.zig");
+const update_cmd = @import("commands/update.zig");
 
 const VERSION = "0.3.0";
 
@@ -58,6 +59,7 @@ pub fn printHelp(io: Io) !void {
         \\      push        Update remote refs using associated local objects
         \\      pull        Fetch from and integrate with another repository
         \\      remote      Manage set of tracked repositories
+        \\      update      Update gitz to the latest version
         \\
         \\  GLOBAL OPTIONS:
         \\      -h, --help      Show this help message
@@ -85,6 +87,11 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
 
     if (std.mem.eql(u8, command, "clone")) {
         try clone_cmd.execute(allocator, args, io);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "update")) {
+        try update_cmd.execute(allocator, args, io);
         return;
     }
 

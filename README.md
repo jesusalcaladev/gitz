@@ -1,34 +1,60 @@
-# 🔮 GitZ
+# GitZ
 
 **Git, but faster. A drop-in replacement for git written in Zig.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/Zig-0.16-orange.svg)](https://ziglang.org)
-[![Platform](https://img.shields.io/badge/Platform-Linux-brightgreen.svg)](README.md)
 
 ---
 
-## ⚡ Features
+## Features
 
-- **Full local workflow** — init, add, commit, status, diff, log, branch, merge, rebase, stash, reset, tag, blame, gc
-- **SSH clone from GitHub** — `gitz clone git@github.com:user/repo.git`
-- **Bidirectional compatibility** — git can read gitz objects and vice versa
-- **Respects .gitignore** — full parser with `!`, `**`, `*`, `?` support
-- **Colored diff** — ANSI colors for added/removed lines
-- **Interactive rebase** — `gitz rebase -i` with pick/squash/drop menu
-- **Pluggable storage backend** — loose objects or sharded directories, configurable per-repo
-- **Shard store for horizontal scaling** — distribute objects across N shards by SHA prefix
-- **Written in Zig** — single binary, no dependencies, blazing fast
+- **Full local workflow** -- init, add, commit, status, diff, log, branch, merge, rebase, stash, reset, tag, blame, gc
+- **SSH clone from GitHub** -- `gitz clone git@github.com:user/repo.git`
+- **Bidirectional compatibility** -- git can read gitz objects and vice versa
+- **Respects .gitignore** -- full parser with `!`, `**`, `*`, `?` support
+- **Colored diff** -- ANSI colors for added/removed lines
+- **Interactive rebase** -- `gitz rebase -i` with pick/squash/drop menu (TUI)
+- **Pluggable storage backend** -- loose objects or sharded directories, configurable per-repo
+- **Shard store for horizontal scaling** -- distribute objects across N shards by SHA prefix
+- **Written in Zig** -- single binary, no dependencies, blazing fast
 
-## 🚀 Quick Start
+## Quick Start
 
-### One-line install
+### One-line install (Recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh | bash
 ```
 
-### Manual install
+This will:
+1. **Download pre-built binary** (fastest, no Zig required)
+2. **Or build from source** (if no binary available for your platform)
+3. Add `gitz` to your PATH automatically
+
+### Manual install from releases
+
+Download the latest binary from [GitHub Releases](https://github.com/jesusalcaladev/gitz/releases):
+
+```bash
+# Linux x86_64
+curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-linux-x86_64.tar.gz | tar -xz
+
+# Linux aarch64
+curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-linux-aarch64.tar.gz | tar -xz
+
+# macOS x86_64
+curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-macos-x86_64.tar.gz | tar -xz
+
+# macOS aarch64 (Apple Silicon)
+curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-macos-aarch64.tar.gz | tar -xz
+
+# Install to ~/.local/bin
+mkdir -p ~/.local/bin
+mv gitz ~/.local/bin/
+```
+
+### Build from source
 
 ```bash
 # Clone the repository
@@ -36,26 +62,26 @@ git clone git@github.com:jesusalcaladev/gitz.git
 cd gitz
 
 # Build with Zig
-zig build
+zig build -Doptimize=ReleaseFast
 
 # Install globally
 mkdir -p ~/.local/bin
-cp zig-out/bin/gitz ~/.local/bin/gzig
+cp zig-out/bin/gitz ~/.local/bin/
 
-# Or add to PATH
-e export PATH="$HOME/.local/bin:\$PATH"
+# Add to PATH (if not already)
+export PATH="$HOME/.local/bin:$PATH"
 
-# The binary is at zig-out/bin/gitz
-./zig-out/bin/gitz --version
+# Verify installation
+gitz --version
 ```
 
 ### Requirements
 
 - **Linux** (x86_64, aarch64) or **macOS** (x86_64, aarch64)
-- **Zig 0.16+** (auto-installed by install script)
+- **Zig 0.16+** (only needed for building from source)
 - **git** (optional, for SSH clone/push)
 
-### Usage
+## Usage
 
 ```bash
 # Initialize a repo
@@ -91,7 +117,7 @@ gitz push origin main
 gitz pull
 ```
 
-## 📦 Commands Reference
+## Commands Reference
 
 ### Local Commands
 
@@ -125,7 +151,14 @@ gitz pull
 | `gitz pull` | Fetch and rebase from remote |
 | `gitz remote` | Manage remotes (add, remove, list, set-url) |
 
-## 🧪 Testing
+### Utility Commands
+
+| Command | Description |
+|---------|-------------|
+| `gitz update` | Update gitz to the latest version |
+| `gitz update --check` | Check for updates without installing |
+
+## Testing
 
 ```bash
 # Run all tests
@@ -135,7 +168,7 @@ zig build test
 zig build test -- --test-filter "sha1"
 ```
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 src/
@@ -151,6 +184,7 @@ src/
 │       ├── log.zig       # gitz log
 │       ├── diff.zig      # gitz diff (LCS algorithm)
 │       ├── branch.zig    # gitz branch
+│       ├── switch.zig    # gitz switch
 │       ├── merge.zig     # gitz merge
 │       ├── rebase.zig    # gitz rebase (simple + interactive)
 │       ├── stash.zig     # gitz stash
@@ -176,15 +210,33 @@ src/
 │   ├── stash.zig         # Stash management
 │   ├── ignore.zig        # .gitignore parser
 │   ├── config.zig        # Config parser
-│   └── zlib.zig          # Zlib compression
+│   ├── packfile.zig      # Packfile reader/writer
+│   ├── packindex.zig     # Pack index
+│   ├── delta.zig         # Delta compression
+│   ├── mmap.zig          # Memory-mapped I/O
+│   ├── threadpool.zig    # Thread pool
+│   ├── parallel.zig      # Parallel operations
+│   ├── pktline.zig       # Packet-line protocol
+│   ├── streampack.zig    # Streaming pack
+│   ├── zlib.zig          # Zlib compression
+│   ├── storage.zig       # Pluggable storage backend
+│   ├── shard_store.zig   # Shard storage backend
+│   └── objectstore.zig   # Unified object store
 ├── transport/
 │   ├── ssh.zig           # SSH transport
+│   ├── smart_http.zig    # Smart HTTP client
+│   ├── auth.zig          # Authentication
 │   └── http.zig          # HTTP transport
 └── util/
-    └── io.zig            # I/O wrapper for Zig 0.16
+    ├── io.zig            # I/O wrapper for Zig 0.16
+    ├── fs.zig            # Filesystem helpers
+    ├── compression.zig   # Compression wrappers
+    ├── mmap.zig          # Memory-mapped I/O
+    ├── path.zig          # Path manipulation
+    └── temp.zig          # Temporary files
 ```
 
-## 🔄 Git Compatibility
+## Git Compatibility
 
 GitZ objects are **fully compatible** with git:
 
@@ -203,7 +255,7 @@ Objects use standard git format:
 - Commit: `commit <size>\0<tree + parents + author + message>`
 - All objects are zlib-compressed
 
-## 🧩 Pluggable Storage Backend
+## Pluggable Storage Backend
 
 GitZ separates the **wire protocol** (always packfiles, git-compatible) from the
 **internal storage** (pluggable). This allows scaling beyond git's single-filesystem model.
@@ -234,19 +286,72 @@ gitz config storage.shards 16
 ```
 
 The shard index is `sha[0] % num_shards`, providing uniform distribution.
-The wire protocol is unaffected — objects are unpacked from incoming packfiles
+The wire protocol is unaffected -- objects are unpacked from incoming packfiles
 and routed to the correct shard. When sending, objects are collected from
 their shards and packed on the fly.
 
-## 📋 Roadmap
+## Project Status
 
-- [x] Phase 1: Core local commands (16/16)
+### Completed
+
+- **Phase 1 (Core Local)**: 15/16 commands -- all local commands working
+- **Phase 2A (HTTP Transport)**: 5/8 -- fetch, clone, push, pull, remote working
+- **Phase 2B (SSH Transport)**: 2/2 -- full SSH transport complete
+- **Phase 4 (Cross-platform)**: Binary builds for Linux x86_64/aarch64, macOS x86_64/aarch64
+
+### Known Bugs (all fixed)
+
+| Issue | Status | Description |
+|-------|--------|-------------|
+| Blame encoding | Fixed | Improved encoding handling and path resolution |
+| Rebase orphan commits | Fixed | Added gc after rebase to clean up orphans |
+| Stash over-staging | Fixed | Now compares SHA with HEAD before including |
+| Remote list empty | Fixed | Expected behavior when no remotes configured |
+| Clone no checkout | Fixed | Clone now performs full checkout |
+| Commit -a re-adds all | Fixed | Now only updates actually modified files |
+
+### Missing Features
+
+| Feature | Priority | Description |
+|---------|----------|-------------|
+| Interactive rebase TUI | High | Arrow keys, pick/squash/drop menu |
+| `gitz search` | Medium | Search commit contents |
+| `gitz review` | Medium | Built-in code review |
+| `gitz sync` | Medium | Fetch + auto-rebase |
+| Shell completions | Medium | bash/zsh/fish |
+| Windows support | Low | Build for Windows |
+| Git LFS support | Low | Large file storage |
+| HTTP transport tests | Low | Test suite for HTTP |
+| Release v1.0 | Low | Stable release |
+
+### Roadmap
+
+- [x] Phase 1: Core local commands (15/16)
 - [x] Phase 2A: HTTP transport (partial)
 - [x] Phase 2B: SSH transport (complete)
-- [ ] Phase 3: Developer experience (search, completions)
-- [ ] Phase 4: Cross-platform builds, documentation
+- [x] Phase 4: Cross-platform builds
+- [ ] Phase 3: Developer experience (search, completions, review)
+- [ ] Phase 1 completion: Interactive rebase TUI
+- [ ] Release v1.0
 
-## 🤝 Contributing
+## Releases
+
+Pre-built binaries are available for:
+- Linux x86_64 and aarch64
+- macOS x86_64 and aarch64 (Apple Silicon)
+
+Check the [Releases page](https://github.com/jesusalcaladev/gitz/releases) for the latest version.
+
+To create a release, tag a commit and push:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The GitHub Actions workflow will automatically build and publish binaries for all platforms.
+
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing`)
@@ -254,10 +359,10 @@ their shards and packed on the fly.
 4. Push to the branch (`git push origin feature/amazing`)
 5. Open a Pull Request
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
-*Built with 💜 using [Zig](https://ziglang.org)*
+*Built with [Zig](https://ziglang.org)*

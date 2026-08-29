@@ -181,7 +181,9 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
     defer idx.deinit(allocator);
 
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    var modified = false;
 
+    // Only update entries that have actually changed
     for (idx.entries.items) |*entry| {
         const clean_name = if (std.mem.startsWith(u8, entry.name, "./"))
             entry.name[2..]
@@ -201,8 +203,12 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
             entry.size = @intCast(stat.size);
             entry.mtime = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
             entry.ctime = @intCast(@divTrunc(stat.ctime.nanoseconds, std.time.ns_per_s));
+            modified = true;
         }
     }
 
-    try idx.writeToFile(git_dir, allocator, io.io);
+    // Only write if something actually changed
+    if (modified) {
+        try idx.writeToFile(git_dir, allocator, io.io);
+    }
 }

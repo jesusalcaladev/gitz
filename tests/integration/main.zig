@@ -29,28 +29,26 @@ const GitzTest = struct {
 
     fn removeTree(self: *GitzTest, path: []const u8) !void {
         // Use system rm -rf for simplicity
-        const result = try std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = try std.process.run(self.allocator, .{}, .{
             .argv = &.{ "rm", "-rf", path },
-            .cwd = "/",
+            .cwd = .{ .path = "/" },
         });
         self.allocator.free(result.stdout);
         self.allocator.free(result.stderr);
     }
 
     fn run(self: *GitzTest, args: []const []const u8) !struct { stdout: []const u8, stderr: []const u8, term: std.process.Child.Term } {
-        var argv = std.ArrayList([]const u8).init(self.allocator);
-        defer argv.deinit();
+        var argv = std.ArrayList([]const u8).empty;
+        defer argv.deinit(self.allocator);
 
-        try argv.append(self.gitz_bin);
+        try argv.append(self.allocator, self.gitz_bin);
         for (args) |arg| {
-            try argv.append(arg);
+            try argv.append(self.allocator, arg);
         }
 
-        const result = try std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = try std.process.run(self.allocator, .{}, .{
             .argv = argv.items,
-            .cwd = self.dir_path,
+            .cwd = .{ .path = self.dir_path },
         });
 
         return result;
@@ -81,7 +79,7 @@ test "init creates .gitz directory" {
     var t = try GitzTest.init(testing.allocator, "init");
     defer t.deinit();
 
-    const result = try t.run(&.{"init"});
+    const result = try t.run(&.{ "init" });
     defer {
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
@@ -103,7 +101,7 @@ test "add and commit" {
     defer t.deinit();
 
     // Init
-    var result = try t.run(&.{"init"});
+    var result = try t.run(&.{ "init" });
     defer {
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
@@ -134,7 +132,7 @@ test "log shows commits" {
     defer t.deinit();
 
     // Init, add, commit
-    _ = try t.run(&.{"init"});
+    _ = try t.run(&.{ "init" });
     try t.writeFile("test.txt", "hello");
     _ = try t.run(&.{ "add", "test.txt" });
     _ = try t.run(&.{ "commit", "-m", "first commit" });
@@ -154,7 +152,7 @@ test "branch create and list" {
     defer t.deinit();
 
     // Init, add, commit
-    _ = try t.run(&.{"init"});
+    _ = try t.run(&.{ "init" });
     try t.writeFile("test.txt", "hello");
     _ = try t.run(&.{ "add", "test.txt" });
     _ = try t.run(&.{ "commit", "-m", "initial" });
@@ -168,7 +166,7 @@ test "branch create and list" {
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Created branch 'feature'"));
 
     // List branches
-    result = try t.run(&.{"branch"});
+    result = try t.run(&.{ "branch" });
     defer {
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
@@ -183,7 +181,7 @@ test "switch creates and switches branch" {
     defer t.deinit();
 
     // Init, add, commit
-    _ = try t.run(&.{"init"});
+    _ = try t.run(&.{ "init" });
     try t.writeFile("test.txt", "hello");
     _ = try t.run(&.{ "add", "test.txt" });
     _ = try t.run(&.{ "commit", "-m", "initial" });
@@ -197,7 +195,7 @@ test "switch creates and switches branch" {
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Switched to a new branch 'my-branch'"));
 
     // Verify current branch
-    const status = try t.run(&.{"status"});
+    const status = try t.run(&.{ "status" });
     defer {
         testing.allocator.free(status.stdout);
         testing.allocator.free(status.stderr);
@@ -210,7 +208,7 @@ test "diff shows unstaged changes" {
     defer t.deinit();
 
     // Init, add, commit
-    _ = try t.run(&.{"init"});
+    _ = try t.run(&.{ "init" });
     try t.writeFile("test.txt", "original content");
     _ = try t.run(&.{ "add", "test.txt" });
     _ = try t.run(&.{ "commit", "-m", "initial" });
@@ -219,7 +217,7 @@ test "diff shows unstaged changes" {
     try t.writeFile("test.txt", "modified content");
 
     // Diff
-    const result = try t.run(&.{"diff"});
+    const result = try t.run(&.{ "diff" });
     defer {
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
@@ -235,7 +233,7 @@ test "tag create and list" {
     defer t.deinit();
 
     // Init, add, commit
-    _ = try t.run(&.{"init"});
+    _ = try t.run(&.{ "init" });
     try t.writeFile("test.txt", "hello");
     _ = try t.run(&.{ "add", "test.txt" });
     _ = try t.run(&.{ "commit", "-m", "initial" });
@@ -249,7 +247,7 @@ test "tag create and list" {
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Created tag 'v1.0'"));
 
     // List tags
-    result = try t.run(&.{"tag"});
+    result = try t.run(&.{ "tag" });
     defer {
         testing.allocator.free(result.stdout);
         testing.allocator.free(result.stderr);
@@ -262,7 +260,7 @@ test "full workflow" {
     defer t.deinit();
 
     // Init
-    _ = try t.run(&.{"init"});
+    _ = try t.run(&.{ "init" });
 
     // Create files
     try t.writeFile("hello.txt", "hello world");
@@ -294,7 +292,7 @@ test "full workflow" {
     try t.writeFile("hello.txt", "hello modified");
 
     // Diff
-    const diff_result = try t.run(&.{"diff"});
+    const diff_result = try t.run(&.{ "diff" });
     defer {
         testing.allocator.free(diff_result.stdout);
         testing.allocator.free(diff_result.stderr);
@@ -317,7 +315,7 @@ test "full workflow" {
     try testing.expect(std.mem.containsAtLeast(u8, final_log.stdout, 1, "feature commit"));
     try testing.expect(std.mem.containsAtLeast(u8, final_log.stdout, 1, "initial commit"));
 
-    const tag_result = try t.run(&.{"tag"});
+    const tag_result = try t.run(&.{ "tag" });
     defer {
         testing.allocator.free(tag_result.stdout);
         testing.allocator.free(tag_result.stderr);

@@ -164,6 +164,11 @@ fn replayCommits(
             try std.Io.File.writeStreamingAll(hf, io.io, wline);
         },
     }
+
+    // Run gc to clean up orphan commits from the rebase
+    // This prevents them from showing in log --all
+    const gc_args = &[_][]const u8{"gc"};
+    @import("gc.zig").execute(allocator, git_dir, gc_args, io) catch {};
 }
 
 /// Interactive rebase TUI with arrow key navigation

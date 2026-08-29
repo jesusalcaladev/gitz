@@ -110,12 +110,14 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
         const file_content = std.Io.Dir.cwd().readFileAlloc(io.io, rel_path, allocator, .unlimited) catch continue;
         defer allocator.free(file_content);
 
-        // Write blob to loose store and get its SHA
-        const blob = object.GitObject{ .blob = .{ .content = file_content } };
-        const new_sha = store.write(allocator, io.io, blob) catch continue;
+        // Compute SHA of current working file content
+        const work_sha = Sha1.hash(file_content);
 
-        // Only include if changed
-        if (!std.mem.eql(u8, &old_sha, &new_sha)) {
+        // Only include if the working file differs from what's in HEAD
+        if (!std.mem.eql(u8, &old_sha, &work_sha)) {
+            // Write blob to loose store and get its SHA
+            const blob = object.GitObject{ .blob = .{ .content = file_content } };
+            const new_sha = store.write(allocator, io.io, blob) catch continue;
             const owned_name = allocator.dupe(u8, rel_path) catch continue;
             try tree_entries.append(allocator, .{
                 .mode = 0o100644,

@@ -17,6 +17,7 @@ set -e
 GITHUB_REPO="jesusalcaladev/gitz"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="gitz"
+ZIG_VERSION="0.16.0"
 
 # Colors
 RED='\033[0;31m'
@@ -64,6 +65,53 @@ check_existing() {
     fi
 }
 
+# Download pre-built binary if available
+download_binary() {
+    info "Attempting to download pre-built binary..."
+
+    local platform
+    platform=$(detect_platform)
+
+    # Check for GitHub release
+    local latest_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local download_url
+
+    if command -v curl &>/dev/null; then
+        download_url=$(curl -fsSL "$latest_url" 2>/dev/null | grep -o "\"browser_download_url\":\"[^\"]*${platform}[^\"]*\"" | cut -d'"' -f4)
+    elif command -v wget &>/dev/null; then
+        download_url=$(wget -qO- "$latest_url" 2>/dev/null | grep -o "\"browser_download_url\":\"[^\"]*${platform}[^\"]*\"" | cut -d'"' -f4)
+    fi
+
+    if [ -z "$download_url" ]; then
+        warn "No pre-built binary found for $platform"
+        return 1
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp)
+
+    info "Downloading from $download_url..."
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$download_url" -o "$tmp_file"
+    elif command -v wget &>/dev/null; then
+        wget -q "$download_url" -O "$tmp_file"
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+
+    # Check if it's a tar.gz or raw binary
+    if file "$tmp_file" | grep -q "gzip\|tar"; then
+        tar -xzf "$tmp_file" -C "$INSTALL_DIR"
+    else
+        mv "$tmp_file" "$INSTALL_DIR/$BINARY_NAME"
+    fi
+
+    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    rm -f "$tmp_file"
+
+    ok "gitz downloaded and installed successfully"
+}
+
 # Install Zig if not present
 ensure_zig() {
     if command -v zig &>/dev/null; then
@@ -73,7 +121,7 @@ ensure_zig() {
         return 0
     fi
 
-    info "Zig not found. Installing Zig 0.16.0..."
+    info "Zig not found. Installing Zig ${ZIG_VERSION}..."
 
     local platform
     platform=$(detect_platform)
@@ -94,7 +142,7 @@ ensure_zig() {
         macos) zig_os="macos" ;;
     esac
 
-    local zig_url="https://ziglang.org/download/0.16.0/zig-${zig_os}-${zig_arch}-0.16.0.tar.xz"
+    local zig_url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_os}-${zig_arch}-${ZIG_VERSION}.tar.xz"
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
@@ -151,53 +199,6 @@ build_from_source() {
     rm -rf "$tmp_dir"
 
     ok "gitz built and installed successfully"
-}
-
-# Download pre-built binary if available
-download_binary() {
-    info "Attempting to download pre-built binary..."
-
-    local platform
-    platform=$(detect_platform)
-
-    # Check for GitHub release
-    local latest_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local download_url
-
-    if command -v curl &>/dev/null; then
-        download_url=$(curl -fsSL "$latest_url" 2>/dev/null | grep -o "\"browser_download_url\":\"[^\"]*${platform}[^\"]*\"" | cut -d'"' -f4)
-    elif command -v wget &>/dev/null; then
-        download_url=$(wget -qO- "$latest_url" 2>/dev/null | grep -o "\"browser_download_url\":\"[^\"]*${platform}[^\"]*\"" | cut -d'"' -f4)
-    fi
-
-    if [ -z "$download_url" ]; then
-        warn "No pre-built binary found for $platform"
-        return 1
-    fi
-
-    local tmp_file
-    tmp_file=$(mktemp)
-
-    info "Downloading from $download_url..."
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$download_url" -o "$tmp_file"
-    elif command -v wget &>/dev/null; then
-        wget -q "$download_url" -O "$tmp_file"
-    fi
-
-    mkdir -p "$INSTALL_DIR"
-
-    # Check if it's a tar.gz or raw binary
-    if file "$tmp_file" | grep -q "gzip\|tar"; then
-        tar -xzf "$tmp_file" -C "$INSTALL_DIR"
-    else
-        mv "$tmp_file" "$INSTALL_DIR/$BINARY_NAME"
-    fi
-
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
-    rm -f "$tmp_file"
-
-    ok "gitz downloaded and installed successfully"
 }
 
 # Add to PATH
@@ -266,10 +267,11 @@ main() {
     echo ""
 
     check_existing
-    ensure_zig
 
     # Try pre-built binary first, fall back to source build
     if ! download_binary; then
+        info "Falling back to source build..."
+        ensure_zig
         build_from_source
     fi
 

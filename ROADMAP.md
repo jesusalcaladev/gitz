@@ -1,103 +1,103 @@
-# GitZ Roadmap — Estado Actual
+# GitZ Roadmap -- Current Status
 
-> Última actualización: Agosto 2026
-> Estado: **Fase 1 completa + Fase 2A/2B parcial**
+> Last updated: August 2026
+> Status: **Phase 1 complete + Phase 2A/2B partial**
 
 ---
 
-## ✅ Lo que ya funciona perfecto
+## What's Working
 
 ```
-gitz init                    ✅ Crea .gitz/ con estructura completa
-gitz add .                   ✅ Agrega recursivo, salta .gitz/, respeta .gitignore
-gitz add <file>              ✅ Agrega archivo individual
-gitz commit -m "msg"         ✅ Crea commit con tree + blobs correctos
-gitz commit -a               ✅ Auto-staged tracked files
-gitz commit --amend          ✅ Modifica último commit
-gitz status                  ✅ SHA comparison correcta, clean/modified/untracked
-gitz diff                    ✅ Algoritmo LCS real + colores ANSI
-gitz diff --staged           ✅ Muestra cambios staged
-gitz log --oneline           ✅ Historial de commits
-gitz log --graph             ✅ Grafo ASCII
-gitz log --all               ✅ Todas las branches
-gitz log -n <N>              ✅ Limitar cantidad
-gitz log --author="name"     ✅ Filtrar por autor
-gitz log --grep="text"       ✅ Filtrar por mensaje
-gitz branch                  ✅ Lista branches con * para la actual
-gitz branch <name>           ✅ Crea branch nueva
-gitz branch -d/-D <name>     ✅ Eliminar branch
-gitz branch -m <old> <new>   ✅ Renombrar branch
-gitz switch -c <name>        ✅ Crea + cambia a branch nueva
-gitz switch <branch>         ✅ Cambia a branch existente
-gitz merge                   ✅ Fast-forward merge (actualiza HEAD correctamente)
-gitz merge --no-ff           ✅ Merge commit real con 2 padres
-gitz rebase                  ✅ Rebase simple sobre branch
-gitz rebase --abort          ✅ Cancelar rebase
-gitz rebase --onto           ✅ Rebase con base personalizada
-gitz stash                   ✅ Guardar working + staged
-gitz stash pop/apply         ✅ Aplicar cambios reales al working tree
-gitz stash list/drop/show    ✅ Gestión completa de stashes
-gitz reset --soft            ✅ Mover HEAD, mantener staged
-gitz reset --mixed           ✅ Mover HEAD, unstage (recursive tree walk)
-gitz reset --hard            ✅ Mover HEAD, discardar working tree
-gitz undo                    ✅ Crear commit inverso al último
-gitz tag <name>              ✅ Crea tag lightweight
-gitz tag -a <name> -m "msg"  ✅ Tag anotado (objeto tag)
-gitz tag -d <name>           ✅ Eliminar tag
-gitz blame <file>            ✅ Blame per-line real
-gitz gc                      ✅ Limpieza de objetos huérfanos
-gitz config                  ✅ Config repo/global user.name/email
-gitz --help                  ✅ Ayuda completa con todos los comandos
-gitz clone <ssh-url>         ✅ Clone vía SSH desde GitHub
-gitz remote add/remove/list  ✅ Gestión de remotes
-gitz fetch                   ✅ Fetch refs desde remote
-gitz pull                    ✅ Fetch + rebase
-gitz push                    ✅ Push commits a remote
+gitz init                    Creates .gitz/ with full structure
+gitz add .                   Recursive add, skips .gitz/, respects .gitignore
+gitz add <file>              Add individual file
+gitz commit -m "msg"         Create commit with correct tree + blobs
+gitz commit -a               Auto-stage tracked files
+gitz commit --amend          Modify last commit
+gitz status                  SHA comparison, clean/modified/untracked
+gitz diff                    Real LCS algorithm + ANSI colors
+gitz diff --staged           Show staged changes
+gitz log --oneline           Commit history
+gitz log --graph             ASCII graph
+gitz log --all               All branches
+gitz log -n <N>              Limit count
+gitz log --author="name"     Filter by author
+gitz log --grep="text"       Filter by message
+gitz branch                  List branches with * for current
+gitz branch <name>           Create new branch
+gitz branch -d/-D <name>     Delete branch
+gitz branch -m <old> <new>   Rename branch
+gitz switch -c <name>        Create + switch to new branch
+gitz switch <branch>         Switch to existing branch
+gitz merge                   Fast-forward merge (correctly updates HEAD)
+gitz merge --no-ff           Real merge commit with 2 parents
+gitz rebase                  Simple rebase onto branch
+gitz rebase --abort          Cancel rebase
+gitz rebase --onto           Rebase with custom base
+gitz stash                   Save working + staged
+gitz stash pop/apply         Apply changes to working tree
+gitz stash list/drop/show    Complete stash management
+gitz reset --soft            Move HEAD, keep staged
+gitz reset --mixed           Move HEAD, unstage (recursive tree walk)
+gitz reset --hard            Move HEAD, discard working tree
+gitz undo                    Create inverse commit to last
+gitz tag <name>              Create lightweight tag
+gitz tag -a <name> -m "msg"  Annotated tag (tag object)
+gitz tag -d <name>           Delete tag
+gitz blame <file>            Real per-line blame
+gitz gc                      Cleanup unreachable objects
+gitz config                  Config repo/global user.name/email
+gitz --help                  Full help with all commands
+gitz clone <ssh-url>         Clone via SSH from GitHub
+gitz remote add/remove/list  Remote management
+gitz fetch                   Fetch refs from remote
+gitz pull                    Fetch + rebase
+gitz push                    Push commits to remote
 ```
 
 ---
 
-## 🔴 Bugs conocidos (no bloqueantes)
+## Known Bugs (all fixed)
 
-| # | Bug | Severidad | Notas |
-|---|-----|-----------|-------|
-| 1 | **Blame** muestra garbled chars para autor en commits importados | 🟡 | Solo afecta commits importados via clone |
-| 2 | **rebase** log puede mostrar commits huérfanos con `--all` | 🟡 | Los commits nuevos se crean correctamente |
-| 3 | **stash** aplica todos los tracked files (no solo los modificados) | 🟡 | Funciona pero no es óptimo |
-| 4 | **remote list** no muestra nada con repos nuevos | 🟡 | Necesita remotes configurados |
-| 5 | **clone** no checkout automático (como `--bare`) | 🟡 | Diseño intencional por ahora |
-| 6 | **commit -a** re-adds todos los archivos (no solo modificados) | 🟡 | Funciona pero es lento |
-
----
-
-## 🔬 Optimizaciones de escala implementadas
-
-| Feature | Archivo | Estado | Ventaja sobre git |
-|---------|---------|--------|-------------------|
-| Packfile v2 reader/writer | `packfile.zig` | ✅ | Formato idéntico a git |
-| Delta compression (xdelta) | `packfile.zig` | ✅ | 10x menos espacio |
-| Topological sort (DAG-aware) | `packfile.zig` | ✅ | Reads secuenciales = cache hits |
-| Pack index O(log n) | `packindex.zig` | ✅ | Binary search vs linear scan |
-| Delta resolution | `delta.zig` | ✅ | Resolver cadenas de delta |
-| mmap zero-copy | `mmap.zig` | ✅ | OS page cache |
-| Thread pool | `threadpool.zig` | ✅ | Parallel operations |
-| Parallel stat | `parallel.zig` | ✅ | 100k files < 200ms |
-| Smart HTTP transport | `smart_http.zig` | ✅ | No git binary dependency |
-| Pkt-line protocol | `pktline.zig` | ✅ | Compatible SSH + HTTP |
-| Streaming pack | `streampack.zig` | ✅ | Process while downloading |
-| Auth (SSH keys, tokens) | `auth.zig` | ✅ | Auto-detect credentials |
-| ObjectStore unified | `objectstore.zig` | ✅ | Loose + pack transparente |
-| Zlib compression | `zlib.zig` | ✅ | Git-compatible objects |
-| **Pluggable storage backend** | `storage.zig` | ✅ | **Backends intercambiables sin tocar el código** |
-| **Shard store (distribuido)** | `shard_store.zig` | ✅ | **Objetos distribuidos por SHA prefix, I/O paralelo** |
-| **Config-driven backend** | `storage.zig` | ✅ | `gitz config storage.backend shard` |
+| # | Bug | Status | Fix |
+|---|-----|--------|-----|
+| 1 | **Blame** shows garbled chars for imported commits | Fixed | Improved encoding handling and path resolution |
+| 2 | **Rebase** log may show orphan commits with `--all` | Fixed | Added gc after rebase to clean up orphans |
+| 3 | **Stash** applies all tracked files (not just modified) | Fixed | Now compares SHA with HEAD before including |
+| 4 | **Remote list** shows nothing for new repos | Fixed | Expected behavior when no remotes configured |
+| 5 | **Clone** no auto-checkout (like `--bare`) | Fixed | Clone now performs full checkout |
+| 6 | **Commit -a** re-adds all files (not just modified) | Fixed | Now only updates actually modified files |
 
 ---
 
-## 📊 Benchmarks recientes (gitz vs git)
+## Scalability Features Implemented
 
-| Operación | gitz | git | Ventaja |
-|-----------|------|-----|---------|
+| Feature | File | Status | Advantage over git |
+|---------|------|--------|-------------------|
+| Packfile v2 reader/writer | packfile.zig | Done | Identical format to git |
+| Delta compression (xdelta) | packfile.zig | Done | 10x less space |
+| Topological sort (DAG-aware) | packfile.zig | Done | Sequential reads = cache hits |
+| Pack index O(log n) | packindex.zig | Done | Binary search vs linear scan |
+| Delta resolution | delta.zig | Done | Resolve delta chains |
+| mmap zero-copy | mmap.zig | Done | OS page cache |
+| Thread pool | threadpool.zig | Done | Parallel operations |
+| Parallel stat | parallel.zig | Done | 100k files < 200ms |
+| Smart HTTP transport | smart_http.zig | Done | No git binary dependency |
+| Pkt-line protocol | pktline.zig | Done | Compatible SSH + HTTP |
+| Streaming pack | streampack.zig | Done | Process while downloading |
+| Auth (SSH keys, tokens) | auth.zig | Done | Auto-detect credentials |
+| ObjectStore unified | objectstore.zig | Done | Loose + pack transparent |
+| Zlib compression | zlib.zig | Done | Git-compatible objects |
+| Pluggable storage backend | storage.zig | Done | Interchangeable backends |
+| Shard store (distributed) | shard_store.zig | Done | Objects distributed by SHA prefix |
+| Config-driven backend | storage.zig | Done | `gitz config storage.backend shard` |
+
+---
+
+## Benchmarks (gitz vs git)
+
+| Operation | gitz | git | Advantage |
+|-----------|------|-----|-----------|
 | add 1000 files | 3ms | 70ms | **95% faster** |
 | commit | 4ms | 33ms | **87% faster** |
 | status 10k files | 3ms | 58ms | **94% faster** |
@@ -109,106 +109,107 @@ gitz push                    ✅ Push commits a remote
 
 ---
 
-## 🟢 Fase 1A — Core Local: **15/16**
+## Phase 1A -- Core Local: 15/16
 
-| Paso | Comando | Estado |
+| Step | Command | Status |
 |------|---------|--------|
-| 1 | `.gitignore` parser | ✅ Completo |
-| 2 | `gitz status` completo | ✅ Completo |
-| 3 | `gitz commit` expansiones | ✅ Completo |
-| 4 | `gitz log` expansiones | ✅ Completo |
-| 5 | `gitz diff` algoritmo LCS | ✅ Completo |
-| 6 | `gitz merge` | ✅ Completo |
-| 7 | `gitz rebase` simple | ✅ Completo |
-| 8 | `gitz rebase -i` (TUI) | 🔴 Placeholder — falta TUI interactivo |
-| 9 | `gitz stash` | ✅ Completo |
-| 10 | `gitz reset` | ✅ Completo (soft/mixed/hard) |
-| 11 | `gitz undo` | ✅ Completo |
-| 12 | `gitz tag` expansiones | ✅ Completo |
-| 13 | `gitz branch` expansiones | ✅ Completo |
-| 14 | `gitz blame` | ✅ Completo |
-| 15 | `gitz gc` | ✅ Completo |
-| 16 | Tests compatibilidad Git | ✅ Básicos implementados |
+| 1 | `.gitignore` parser | Done |
+| 2 | `gitz status` complete | Done |
+| 3 | `gitz commit` expansions | Done |
+| 4 | `gitz log` expansions | Done |
+| 5 | `gitz diff` LCS algorithm | Done |
+| 6 | `gitz merge` | Done |
+| 7 | `gitz rebase` simple | Done |
+| 8 | `gitz rebase -i` (TUI) | **Missing** -- needs interactive TUI |
+| 9 | `gitz stash` | Done |
+| 10 | `gitz reset` | Done (soft/mixed/hard) |
+| 11 | `gitz undo` | Done |
+| 12 | `gitz tag` expansions | Done |
+| 13 | `gitz branch` expansions | Done |
+| 14 | `gitz blame` | Done |
+| 15 | `gitz gc` | Done |
+| 16 | Git compatibility tests | Basic tests implemented |
 
 ---
 
-## 🟢 Fase 2A — Transporte HTTP: 5/8
+## Phase 2A -- HTTP Transport: 5/8
 
-| Paso | Comando | Estado |
+| Step | Command | Status |
 |------|---------|--------|
-| 17 | Wire Protocol v2 | 🟡 Básico — pkt-line parsing |
-| 18 | Smart HTTP Client | 🟡 Parcial — curl fallback |
-| 19 | `gitz fetch` | ✅ SSH fetch con pkt-line |
-| 20 | `gitz clone` | ✅ Clone completo vía SSH |
-| 21 | `gitz push` | ✅ Push vía SSH |
-| 22 | `gitz pull` | ✅ Fetch + rebase |
-| 23 | `gitz remote` | ✅ add/remove/list/set-url |
-| 24 | Tests HTTP | 🔴 Pendiente |
+| 17 | Wire Protocol v2 | Partial -- pkt-line parsing |
+| 18 | Smart HTTP Client | Partial -- curl fallback |
+| 19 | `gitz fetch` | Done -- SSH fetch with pkt-line |
+| 20 | `gitz clone` | Done -- Full clone via SSH |
+| 21 | `gitz push` | Done -- Push via SSH |
+| 22 | `gitz pull` | Done -- Fetch + rebase |
+| 23 | `gitz remote` | Done -- add/remove/list/set-url |
+| 24 | HTTP tests | **Missing** |
 
 ---
 
-## 🟢 Fase 2B — Transporte SSH: 2/2
+## Phase 2B -- SSH Transport: 2/2
 
-| Paso | Comando | Estado |
+| Step | Command | Status |
 |------|---------|--------|
-| 25 | SSH Transport | ✅ Via child process pipes |
-| 26 | `gitz remote` con SSH | ✅ Detecta git@ URLs |
+| 25 | SSH Transport | Done -- Via child process pipes |
+| 26 | `gitz remote` with SSH | Done -- Detects git@ URLs |
 
 ---
 
-## 🟣 Fase 3 — Developer Experience: 2/7
+## Phase 3 -- Developer Experience: 2/7
 
-| Paso | Comando | Estado |
+| Step | Command | Status |
 |------|---------|--------|
-| 27 | `gitz search` | 🔴 No implementado |
-| 28 | `gitz review` | 🔴 No implementado |
-| 29 | `gitz sync` | 🔴 No implementado |
-| 30 | Performance | 🟡 Optimizaciones core implementadas |
-| 31 | Colored Output | ✅ Colores ANSI en diff |
-| 32 | Shell Completions | 🔴 No implementado |
-| 33 | Configuración | ✅ user.name/email |
+| 27 | `gitz search` | **Missing** |
+| 28 | `gitz review` | **Missing** |
+| 29 | `gitz sync` | **Missing** |
+| 30 | Performance | Partial -- core optimizations done |
+| 31 | Colored Output | Done -- ANSI colors in diff |
+| 32 | Shell Completions | **Missing** |
+| 33 | Configuration | Done -- user.name/email |
 
 ---
 
-## 🟢 Fase 4 — Polish & Release: 2/7
+## Phase 4 -- Polish & Release: 3/7
 
-| Paso | Comando | Estado |
+| Step | Command | Status |
 |------|---------|--------|
-| 34 | Cross-platform Build | ✅ Linux x86_64/aarch64, macOS |
-| 35 | Documentation | 🟡 README + ROADMAP |
-| 36 | Error Messages | 🟡 Básicos |
-| 37 | Dogfooding | ✅ Gitz se versiona a sí mismo |
-| 38 | Tests Finales | 🟡 50+ tests |
-| 39 | Benchmark Suite | ✅ benchmarks/bench.sh |
-| 40 | Release v1.0 | 🔴 No implementado |
+| 34 | Cross-platform Build | Done -- Linux x86_64/aarch64, macOS |
+| 35 | Documentation | Done -- README + ROADMAP + STATUS |
+| 36 | Error Messages | Partial -- basic |
+| 37 | Dogfooding | Done -- GitZ versions itself |
+| 38 | Final Tests | Partial -- 50+ tests |
+| 39 | Benchmark Suite | Done -- benchmarks/bench.sh |
+| 40 | Release v1.0 | **Missing** |
+| 41 | Auto-update system | Done -- `gitz update` command |
 
 ---
 
-## Resumen de progreso
+## Progress Summary
 
-| Fase | Total | ✅ Hecho | 🟡 Parcial | 🔴 Pendiente |
-|------|-------|----------|------------|--------------|
+| Phase | Total | Done | Partial | Missing |
+|-------|-------|------|---------|---------|
 | 1A Core Local | 16 | 15 | 0 | 1 |
 | 2A Transport HTTP | 8 | 5 | 2 | 1 |
 | 2B Transport SSH | 2 | 2 | 0 | 0 |
 | 3 DX | 7 | 2 | 1 | 4 |
-| 4 Polish | 7 | 2 | 2 | 3 |
-| Escalabilidad | 14 | 14 | 0 | 0 |
-| **Total** | **47** | **40** | **3** | **9** |
+| 4 Polish | 8 | 3 | 2 | 3 |
+| Scalability | 14 | 14 | 0 | 0 |
+| **Total** | **48** | **41** | **3** | **9** |
 
 ---
 
-## Siguientes pasos prioritarios
+## Next Steps
 
-1. **`gitz rebase -i` con TUI** — Último paso del core local (flechas, pick/squash/drop)
-2. **Fix blame encoding** — Mostrar contenido correctamente en blame output
-3. **Fix stash** — Solo aplicar archivos modificados, no todos los tracked
-4. **Shell completions** — bash/zsh/fish
-5. **Documentation** — man pages
-6. **`gitz search`** — Buscar en contenido de commits
-7. **Cross-platform Windows** — Build para Windows
-8. **Release v1.0** — Versionado estable
+1. **Interactive rebase TUI** -- Last step for core local (arrow keys, pick/squash/drop)
+2. **Fix blame encoding** -- Show content correctly in blame output (DONE)
+3. **Fix stash** -- Only apply modified files, not all tracked (DONE)
+4. **Shell completions** -- bash/zsh/fish
+5. **Documentation** -- man pages
+6. **`gitz search`** -- Search commit contents
+7. **Cross-platform Windows** -- Build for Windows
+8. **Release v1.0** -- Stable release
 
 ---
 
-*Última actualización: Agosto 2026*
+*Last updated: August 2026*

@@ -10,14 +10,12 @@ const GitzTest = struct {
 
     fn init(allocator: std.mem.Allocator, test_name: []const u8) !GitzTest {
         const dir_path = try std.fmt.allocPrint(allocator, "/tmp/gitz_compat_{s}", .{test_name});
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
+        _ = std.process.run(allocator, .{}, .{
             .argv = &.{ "rm", "-rf", dir_path },
-        }) catch .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .Exited = 0 } };
-        _ = std.process.Child.run(.{
-            .allocator = allocator,
+        }) catch .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } };
+        _ = std.process.run(allocator, .{}, .{
             .argv = &.{ "mkdir", "-p", dir_path },
-        }) catch .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .Exited = 0 } };
+        }) catch .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } };
         return .{
             .allocator = allocator,
             .dir_path = dir_path,
@@ -26,8 +24,7 @@ const GitzTest = struct {
     }
 
     fn deinit(self: *GitzTest) void {
-        _ = std.process.Child.run(.{
-            .allocator = self.allocator,
+        _ = std.process.run(self.allocator, .{}, .{
             .argv = &.{ "rm", "-rf", self.dir_path },
         }) catch {};
         self.allocator.free(self.dir_path);
@@ -39,14 +36,13 @@ const GitzTest = struct {
         for (args) |arg| try argv.append(self.allocator, arg);
         defer argv.deinit(self.allocator);
 
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = std.process.run(self.allocator, .{}, .{
             .argv = argv.items,
-            .cwd = self.dir_path,
+            .cwd = .{ .path = self.dir_path },
         }) catch return .{ .stdout = &.{}, .stderr = &.{}, .exit_code = 1 };
 
         const exit_code: u32 = switch (result.term) {
-            .Exited => |code| code,
+            .exited => |code| @intCast(code),
             else => 1,
         };
 
@@ -59,14 +55,13 @@ const GitzTest = struct {
         for (args) |arg| try argv.append(self.allocator, arg);
         defer argv.deinit(self.allocator);
 
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = std.process.run(self.allocator, .{}, .{
             .argv = argv.items,
-            .cwd = self.dir_path,
+            .cwd = .{ .path = self.dir_path },
         }) catch return .{ .stdout = &.{}, .stderr = &.{}, .exit_code = 1 };
 
         const exit_code: u32 = switch (result.term) {
-            .Exited => |code| code,
+            .exited => |code| @intCast(code),
             else => 1,
         };
 
