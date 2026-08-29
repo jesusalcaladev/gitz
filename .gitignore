@@ -7,3 +7,6 @@ zig-out/
 .DS_Store
 main
 gitz
+.gitz/
+*.bak
+# test push sáb 29 ago 2026 12:45:53 -04
