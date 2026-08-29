@@ -72,9 +72,14 @@ comptime {
     _ = @import("cli/commands/pull.zig");
     _ = @import("transport/http.zig");
     _ = @import("transport/ssh.zig");
+    _ = @import("transport/ssh_cmd.zig");
     _ = @import("transport/smart_http.zig");
     _ = @import("transport/auth.zig");
     _ = @import("cli/commands/config.zig");
     _ = @import("cli/commands/update.zig");
+    _ = @import("cli/commands/search.zig");
+    _ = @import("cli/commands/review.zig");
+    _ = @import("cli/commands/sync.zig");
+    _ = @import("cli/commands/lfs.zig");
     _ = @import("tests/integration/compat.zig");
 }

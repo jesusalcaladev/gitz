@@ -14,7 +14,7 @@ GitZ is a drop-in replacement for Git written in Zig. It provides the same objec
 
 ### What Works
 
-**Core Local Commands (15/16)**
+**Core Local Commands (16/16)**
 
 All local Git operations are implemented and working:
 - Repository initialization and configuration
@@ -22,21 +22,26 @@ All local Git operations are implemented and working:
 - Status, diff, log with all standard options
 - Branch management (create, delete, rename, switch)
 - Merge (fast-forward and merge commits)
-- Rebase (simple and abort)
+- Rebase (simple, abort, and interactive TUI with pick/squash/reword/edit/drop)
 - Stash management
 - Reset (soft, mixed, hard)
 - Undo (creates inverse commits)
 - Tag management (lightweight and annotated)
 - Blame (per-line author history)
 - Garbage collection
+- Search commit messages and file contents (`gitz search`)
+- Code review with diff stats (`gitz review`)
+- Fetch + auto-rebase shorthand (`gitz sync`)
+- Git Large File Storage (`gitz lfs`)
 
-**Transport (7/10)**
+**Transport (9/10)**
 
-Remote operations via SSH:
-- Clone from GitHub/GitLab
-- Fetch, push, pull
+Remote operations via SSH and HTTP:
+- Clone from GitHub/GitLab (SSH)
+- Fetch, push, pull (SSH)
 - Remote management (add, remove, list, set-url)
-- Basic HTTP transport (partial)
+- Smart HTTP transport (native std.http.Client)
+- HTTP transport tests (pending)
 
 **Infrastructure**
 
@@ -66,13 +71,8 @@ Remote operations via SSH:
 
 | Feature | Priority | Effort | Notes |
 |---------|----------|--------|-------|
-| Interactive rebase TUI | High | Medium | Arrow keys, pick/squash/drop |
-| `gitz search` | Medium | Medium | Search commit contents |
-| `gitz review` | Medium | High | Built-in code review |
-| `gitz sync` | Medium | Low | Fetch + auto-rebase |
 | Shell completions | Medium | Low | bash/zsh/fish |
 | Windows support | Low | Medium | Build for Windows |
-| Git LFS support | Low | High | Large file storage |
 | HTTP transport tests | Low | Low | Test suite for HTTP |
 | Release v1.0 | Low | Low | Stable release |
 
@@ -204,25 +204,16 @@ zig build -Doptimize=ReleaseFast
 ## Roadmap
 
 ### Completed
-
-- [x] Phase 1: Core local commands (15/16)
-- [x] Phase 2A: HTTP transport (partial)
+- [x] Phase 1: Core local commands (16/16)
+- [x] Phase 2A: HTTP transport (complete, tests pending)
 - [x] Phase 2B: SSH transport (complete)
+- [x] Phase 3: Developer experience (search, review, sync, lfs)
 - [x] Phase 4: Cross-platform builds
-
-### In Progress
-
-- [ ] Phase 1 completion: Interactive rebase TUI
-- [ ] Phase 3: Developer experience
 
 ### Planned
 
-- [ ] `gitz search`
-- [ ] `gitz review`
-- [ ] `gitz sync`
 - [ ] Shell completions
 - [ ] Windows support
-- [ ] Git LFS support
 - [ ] Release v1.0
 
 ---

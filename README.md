@@ -9,7 +9,7 @@
 
 ## Features
 
-- **Full local workflow** -- init, add, commit, status, diff, log, branch, merge, rebase, stash, reset, tag, blame, gc
+- **Full local workflow** -- init, add, commit, status, diff, log, branch, merge, rebase, stash, reset, tag, blame, gc, search, review, sync, lfs
 - **SSH clone from GitHub** -- `gitz clone git@github.com:user/repo.git`
 - **Bidirectional compatibility** -- git can read gitz objects and vice versa
 - **Respects .gitignore** -- full parser with `!`, `**`, `*`, `?` support
@@ -79,7 +79,11 @@ gitz --version
 
 - **Linux** (x86_64, aarch64) or **macOS** (x86_64, aarch64)
 - **Zig 0.16+** (only needed for building from source)
-- **git** (optional, for SSH clone/push)
+- **SSH** (for clone/push/pull via SSH)
+
+### SSH Setup
+
+For SSH operations, you need SSH configured. See [SSH Setup Guide](docs/SSH-SETUP.md).
 
 ## Usage
 
@@ -140,6 +144,10 @@ gitz pull
 | `gitz blame` | Show per-line author history |
 | `gitz gc` | Clean up unreachable objects |
 | `gitz config` | Get/set user.name and user.email |
+| `gitz search` | Search commit messages and file contents |
+| `gitz review` | Code review (diff between branches/commits) |
+| `gitz sync` | Fetch and rebase onto remote branch |
+| `gitz lfs` | Git Large File Storage (track, untrack, status) |
 
 ### Remote Commands
 
@@ -151,12 +159,23 @@ gitz pull
 | `gitz pull` | Fetch and rebase from remote |
 | `gitz remote` | Manage remotes (add, remove, list, set-url) |
 
+**Note:** Remote commands auto-fallback to system `git` if gitz transport fails. Use `--git` flag to force using git.
+
 ### Utility Commands
 
 | Command | Description |
 |---------|-------------|
 | `gitz update` | Update gitz to the latest version |
 | `gitz update --check` | Check for updates without installing |
+
+### Developer Experience Commands
+
+| Command | Description |
+|---------|-------------|
+| `gitz search <query>` | Search commit messages and file contents |
+| `gitz review [base] [head]` | Code review with diff stats and summary |
+| `gitz sync [remote]` | Fetch + rebase shorthand |
+| `gitz lfs <subcommand>` | Git Large File Storage |
 
 ## Testing
 
@@ -198,7 +217,11 @@ src/
 │       ├── pull.zig      # gitz pull
 │       ├── remote.zig    # gitz remote
 │       ├── config.zig    # gitz config
-│       └── undo.zig      # gitz undo
+│       ├── undo.zig      # gitz undo
+│       ├── search.zig    # gitz search
+│       ├── review.zig    # gitz review
+│       ├── sync.zig      # gitz sync
+│       └── lfs.zig       # gitz lfs
 ├── core/
 │   ├── sha1.zig          # SHA-1 hashing
 │   ├── object.zig        # Git objects (blob, tree, commit, tag)
@@ -294,9 +317,10 @@ their shards and packed on the fly.
 
 ### Completed
 
-- **Phase 1 (Core Local)**: 15/16 commands -- all local commands working
-- **Phase 2A (HTTP Transport)**: 5/8 -- fetch, clone, push, pull, remote working
+- **Phase 1 (Core Local)**: 16/16 commands -- all local commands working
+- **Phase 2A (HTTP Transport)**: 7/8 -- Smart HTTP native, pkt-line complete (tests pending)
 - **Phase 2B (SSH Transport)**: 2/2 -- full SSH transport complete
+- **Phase 3 (Developer Experience)**: 6/7 -- search, review, sync, lfs, colored output, config
 - **Phase 4 (Cross-platform)**: Binary builds for Linux x86_64/aarch64, macOS x86_64/aarch64
 
 ### Known Bugs (all fixed)
@@ -314,24 +338,19 @@ their shards and packed on the fly.
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Interactive rebase TUI | High | Arrow keys, pick/squash/drop menu |
-| `gitz search` | Medium | Search commit contents |
-| `gitz review` | Medium | Built-in code review |
-| `gitz sync` | Medium | Fetch + auto-rebase |
 | Shell completions | Medium | bash/zsh/fish |
 | Windows support | Low | Build for Windows |
-| Git LFS support | Low | Large file storage |
 | HTTP transport tests | Low | Test suite for HTTP |
 | Release v1.0 | Low | Stable release |
 
 ### Roadmap
 
-- [x] Phase 1: Core local commands (15/16)
-- [x] Phase 2A: HTTP transport (partial)
+- [x] Phase 1: Core local commands (16/16)
+- [x] Phase 2A: HTTP transport (complete, tests pending)
 - [x] Phase 2B: SSH transport (complete)
+- [x] Phase 3: Developer experience (search, review, sync, lfs)
 - [x] Phase 4: Cross-platform builds
-- [ ] Phase 3: Developer experience (search, completions, review)
-- [ ] Phase 1 completion: Interactive rebase TUI
+- [ ] Shell completions
 - [ ] Release v1.0
 
 ## Releases

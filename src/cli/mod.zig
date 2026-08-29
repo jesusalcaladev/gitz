@@ -23,6 +23,10 @@ const push_cmd = @import("commands/push.zig");
 const pull_cmd = @import("commands/pull.zig");
 const config_cmd = @import("commands/config.zig");
 const update_cmd = @import("commands/update.zig");
+const search_cmd = @import("commands/search.zig");
+const review_cmd = @import("commands/review.zig");
+const sync_cmd = @import("commands/sync.zig");
+const lfs_cmd = @import("commands/lfs.zig");
 
 const VERSION = "0.3.0";
 
@@ -52,6 +56,10 @@ pub fn printHelp(io: Io) !void {
         \\      blame       Show what revision and author last modified each line
         \\      gc          Clean up unreachable objects
         \\      config      Get and set repository options
+        \\      search      Search commit messages and file contents
+        \\      review      Code review (diff between branches/commits)
+        \\      sync        Fetch and rebase onto remote branch
+        \\      lfs         Git Large File Storage
         \\
         \\  REMOTE COMMANDS:
         \\      clone       Clone a repository from a URL
@@ -60,6 +68,9 @@ pub fn printHelp(io: Io) !void {
         \\      pull        Fetch from and integrate with another repository
         \\      remote      Manage set of tracked repositories
         \\      update      Update gitz to the latest version
+        \\
+        \\  REMOTE OPTIONS:
+        \\      --git, -g       Use system git for push/pull/fetch
         \\
         \\  GLOBAL OPTIONS:
         \\      -h, --help      Show this help message
@@ -143,6 +154,14 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         try pull_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "config")) {
         try config_cmd.execute(allocator, git_dir, args, io);
+    } else if (std.mem.eql(u8, command, "search")) {
+        try search_cmd.execute(allocator, git_dir, args, io);
+    } else if (std.mem.eql(u8, command, "review")) {
+        try review_cmd.execute(allocator, git_dir, args, io);
+    } else if (std.mem.eql(u8, command, "sync")) {
+        try sync_cmd.execute(allocator, git_dir, args, io);
+    } else if (std.mem.eql(u8, command, "lfs")) {
+        try lfs_cmd.execute(allocator, git_dir, args, io);
     } else {
         try io.print("gitz: '{s}' is not a gitz command.\n\n", .{command});
         try printHelp(io);

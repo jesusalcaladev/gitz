@@ -1,7 +1,7 @@
 # GitZ Roadmap -- Current Status
 
 > Last updated: August 2026
-> Status: **Phase 1 complete + Phase 2A/2B partial**
+> Status: **Phase 1 complete + Phase 2A/2B complete (tests pending)**
 
 ---
 
@@ -53,6 +53,11 @@ gitz remote add/remove/list  Remote management
 gitz fetch                   Fetch refs from remote
 gitz pull                    Fetch + rebase
 gitz push                    Push commits to remote
+gitz search "query"          Search commit messages and file contents
+gitz review [base] [head]    Code review (diff + stats + summary)
+gitz sync                    Fetch + rebase shorthand
+gitz lfs install             Set up Git LFS
+gitz lfs track "*.psd"       Track large files by pattern
 ```
 
 ---
@@ -120,7 +125,7 @@ gitz push                    Push commits to remote
 | 5 | `gitz diff` LCS algorithm | Done |
 | 6 | `gitz merge` | Done |
 | 7 | `gitz rebase` simple | Done |
-| 8 | `gitz rebase -i` (TUI) | **Missing** -- needs interactive TUI |
+| 8 | `gitz rebase -i` (TUI) | Done -- Arrow keys, pick/squash/reword/edit/drop |
 | 9 | `gitz stash` | Done |
 | 10 | `gitz reset` | Done (soft/mixed/hard) |
 | 11 | `gitz undo` | Done |
@@ -136,8 +141,8 @@ gitz push                    Push commits to remote
 
 | Step | Command | Status |
 |------|---------|--------|
-| 17 | Wire Protocol v2 | Partial -- pkt-line parsing |
-| 18 | Smart HTTP Client | Partial -- curl fallback |
+| 17 | Wire Protocol v2 | Done -- pkt-line parsing complete |
+| 18 | Smart HTTP Client | Done -- Native std.http.Client |
 | 19 | `gitz fetch` | Done -- SSH fetch with pkt-line |
 | 20 | `gitz clone` | Done -- Full clone via SSH |
 | 21 | `gitz push` | Done -- Push via SSH |
@@ -156,32 +161,33 @@ gitz push                    Push commits to remote
 
 ---
 
-## Phase 3 -- Developer Experience: 2/7
+## Phase 3 -- Developer Experience: 6/7
 
 | Step | Command | Status |
 |------|---------|--------|
-| 27 | `gitz search` | **Missing** |
-| 28 | `gitz review` | **Missing** |
-| 29 | `gitz sync` | **Missing** |
+| 27 | `gitz search` | Done -- search messages + file content |
+| 28 | `gitz review` | Done -- diff stats, file summary, full diff |
+| 29 | `gitz sync` | Done -- fetch + auto-rebase |
 | 30 | Performance | Partial -- core optimizations done |
 | 31 | Colored Output | Done -- ANSI colors in diff |
 | 32 | Shell Completions | **Missing** |
 | 33 | Configuration | Done -- user.name/email |
+| 34 | `gitz lfs` | Done -- install, track, untrack, status, ls, pointer, env |
 
 ---
 
-## Phase 4 -- Polish & Release: 3/7
+## Phase 4 -- Polish & Release: 4/7
 
 | Step | Command | Status |
 |------|---------|--------|
-| 34 | Cross-platform Build | Done -- Linux x86_64/aarch64, macOS |
-| 35 | Documentation | Done -- README + ROADMAP + STATUS |
-| 36 | Error Messages | Partial -- basic |
-| 37 | Dogfooding | Done -- GitZ versions itself |
-| 38 | Final Tests | Partial -- 50+ tests |
-| 39 | Benchmark Suite | Done -- benchmarks/bench.sh |
-| 40 | Release v1.0 | **Missing** |
-| 41 | Auto-update system | Done -- `gitz update` command |
+| 35 | Cross-platform Build | Done -- Linux x86_64/aarch64, macOS |
+| 36 | Documentation | Done -- README + ROADMAP + STATUS |
+| 37 | Error Messages | Partial -- basic |
+| 38 | Dogfooding | Done -- GitZ versions itself |
+| 39 | Final Tests | Partial -- 50+ tests |
+| 40 | Benchmark Suite | Done -- benchmarks/bench.sh |
+| 41 | Release v1.0 | **Missing** |
+| 42 | Auto-update system | Done -- `gitz update` command |
 
 ---
 
@@ -189,26 +195,21 @@ gitz push                    Push commits to remote
 
 | Phase | Total | Done | Partial | Missing |
 |-------|-------|------|---------|---------|
-| 1A Core Local | 16 | 15 | 0 | 1 |
-| 2A Transport HTTP | 8 | 5 | 2 | 1 |
+| 1A Core Local | 16 | 16 | 0 | 0 |
+| 2A Transport HTTP | 8 | 7 | 0 | 1 |
 | 2B Transport SSH | 2 | 2 | 0 | 0 |
-| 3 DX | 7 | 2 | 1 | 4 |
-| 4 Polish | 8 | 3 | 2 | 3 |
+| 3 DX | 8 | 7 | 0 | 1 |
+| 4 Polish | 7 | 4 | 1 | 2 |
 | Scalability | 14 | 14 | 0 | 0 |
-| **Total** | **48** | **41** | **3** | **9** |
+| **Total** | **55** | **50** | **1** | **4** |
 
 ---
 
 ## Next Steps
 
-1. **Interactive rebase TUI** -- Last step for core local (arrow keys, pick/squash/drop)
-2. **Fix blame encoding** -- Show content correctly in blame output (DONE)
-3. **Fix stash** -- Only apply modified files, not all tracked (DONE)
-4. **Shell completions** -- bash/zsh/fish
-5. **Documentation** -- man pages
-6. **`gitz search`** -- Search commit contents
-7. **Cross-platform Windows** -- Build for Windows
-8. **Release v1.0** -- Stable release
+1. **Shell completions** -- bash/zsh/fish
+2. **HTTP transport tests** -- Test suite for HTTP
+3. **Release v1.0** -- Stable release
 
 ---
 
