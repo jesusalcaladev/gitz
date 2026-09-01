@@ -53,11 +53,18 @@ pub const IgnoreRuleSet = struct {
                 pattern = pattern[0 .. pattern.len - 1];
             }
 
+            // After stripping directory slash, pattern may be empty (e.g. "/").
+            // An empty pattern must not match anything.
+            if (pattern.len == 0) continue;
+
             const anchored = pattern[0] == '/' or std.mem.indexOf(u8, pattern, "/") != null;
 
             if (anchored and pattern.len > 0 and pattern[0] == '/') {
                 pattern = pattern[1..];
             }
+
+            // After all stripping, pattern may be empty. Skip it.
+            if (pattern.len == 0) continue;
 
             ruleset.rules.append(ruleset.allocator, .{
                 .pattern = allocator.dupe(u8, pattern) catch continue,
@@ -294,4 +301,68 @@ test "ignore complex pattern" {
     try testing.expect(ruleset.isIgnored(".DS_Store", false));
     try testing.expect(ruleset.isIgnored("node_modules", true));
     try testing.expect(!ruleset.isIgnored("node_modules/file.js", false));
+}
+
+// =============================================================================
+// TDD Bug-Hunt Tests
+// =============================================================================
+
+test "BUG: empty pattern '/' should NOT match all files" {
+    // A .gitignore with just "/" should be empty after parsing.
+    // The pattern "/" strips to "" which matchGlobSimple("", anything) = true.
+    // This is wrong — an empty pattern must never match anything.
+    var ruleset = IgnoreRuleSet.parse(testing.allocator, "/\n");
+    defer ruleset.deinit();
+
+    try testing.expect(!ruleset.isIgnored("foo.txt", false));
+    try testing.expect(!ruleset.isIgnored("bar/baz.c", false));
+    try testing.expect(!ruleset.isIgnored("", false));
+}
+
+test "BUG: directory-only rule should not affect files" {
+    // "build/" means ignore the directory "build" but NOT files named "build"
+    // and NOT files inside build (only the directory itself).
+    var ruleset = IgnoreRuleSet.parse(testing.allocator, "build/\n");
+    defer ruleset.deinit();
+
+    // build as a directory → ignored
+    try testing.expect(ruleset.isIgnored("build", true));
+    // build as a file → NOT ignored
+    try testing.expect(!ruleset.isIgnored("build", false));
+    // build.txt → NOT ignored (different name)
+    try testing.expect(!ruleset.isIgnored("build.txt", false));
+    // build/debug.o → NOT ignored (directory rule doesn't apply to children)
+    try testing.expect(!ruleset.isIgnored("build/debug.o", false));
+}
+
+test "BUG: directory-only rule combined with wildcard should work" {
+    // "node_modules/" should ignore node_modules dir but not files inside it
+    var ruleset = IgnoreRuleSet.parse(testing.allocator, "node_modules/\n");
+    defer ruleset.deinit();
+
+    try testing.expect(ruleset.isIgnored("node_modules", true));
+    try testing.expect(!ruleset.isIgnored("node_modules", false));
+    try testing.expect(!ruleset.isIgnored("node_modules/file.js", false));
+    try testing.expect(!ruleset.isIgnored("node_modules/deep/nested/file.js", false));
+}
+
+test "BUG: anchored directory-only should only match exact dir" {
+    // "/build/" should only ignore a top-level "build" directory
+    var ruleset = IgnoreRuleSet.parse(testing.allocator, "/build/\n");
+    defer ruleset.deinit();
+
+    try testing.expect(ruleset.isIgnored("build", true));
+    try testing.expect(!ruleset.isIgnored("build", false));
+    try testing.expect(!ruleset.isIgnored("other/build", true));
+}
+
+test "BUG: multiple rules should not leak between directory_only" {
+    // Mix of directory-only and normal rules
+    var ruleset = IgnoreRuleSet.parse(testing.allocator, "build/\n*.o\n");
+    defer ruleset.deinit();
+
+    try testing.expect(ruleset.isIgnored("build", true));
+    try testing.expect(!ruleset.isIgnored("build", false));
+    try testing.expect(ruleset.isIgnored("foo.o", false));
+    try testing.expect(!ruleset.isIgnored("foo.c", false));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing = std.testing;
 const Sha1 = @import("sha1.zig").Sha1;
 
 pub const ObjectType = enum {
@@ -317,4 +318,196 @@ fn parseTag(allocator: std.mem.Allocator, data: []const u8) !TagObject {
         .tagger = tagger.?,
         .message = if (message_start < data.len) try allocator.dupe(u8, data[message_start..]) else "",
     };
+}
+
+// =============================================================================
+// TDD Bug-Hunt Tests — Object Serialization Roundtrip
+// =============================================================================
+
+test "BUG: blob serialize/deserialize roundtrip" {
+    const allocator = testing.allocator;
+    const original = GitObject{ .blob = .{ .content = "Hello, world!" } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+    const deserialized = try deserialize(allocator, .blob, serialized[serialized.len - 13 ..]);
+    try testing.expectEqualStrings("Hello, world!", deserialized.blob.content);
+}
+
+test "BUG: blob empty content roundtrip" {
+    const allocator = testing.allocator;
+    const original = GitObject{ .blob = .{ .content = "" } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+    // Serialized: "blob 0\x00" (7 bytes = "blob " + "0" + "\x00")
+    try testing.expectEqual(@as(usize, 7), serialized.len);
+    try testing.expect(std.mem.startsWith(u8, serialized, "blob 0\x00"));
+}
+
+test "BUG: tree serialize/deserialize roundtrip" {
+    const allocator = testing.allocator;
+    const sha_a = Sha1.hash("file_a");
+    const sha_b = Sha1.hash("file_b");
+    var tree_entries = [_]TreeEntry{
+        .{ .mode = 0o100644, .name = "file_a.txt", .sha = sha_a },
+        .{ .mode = 0o100644, .name = "file_b.txt", .sha = sha_b },
+    };
+    const original = GitObject{ .tree = .{ .entries = &tree_entries } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    // Extract content after "tree NNN\x00"
+    const null_pos = std.mem.indexOfScalar(u8, serialized, 0).?;
+    const content = serialized[null_pos + 1 ..];
+    const deserialized = try deserialize(allocator, .tree, content);
+    defer {
+        for (deserialized.tree.entries) |e| allocator.free(e.name);
+        allocator.free(deserialized.tree.entries);
+    }
+    try testing.expectEqual(@as(usize, 2), deserialized.tree.entries.len);
+    // Tree entries are sorted by name during serialization
+    try testing.expectEqualStrings("file_a.txt", deserialized.tree.entries[0].name);
+    try testing.expectEqualStrings("file_b.txt", deserialized.tree.entries[1].name);
+    try testing.expectEqual(sha_a, deserialized.tree.entries[0].sha);
+    try testing.expectEqual(sha_b, deserialized.tree.entries[1].sha);
+}
+
+test "BUG: tree empty roundtrip" {
+    const allocator = testing.allocator;
+    const original = GitObject{ .tree = .{ .entries = &.{} } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+    const null_pos = std.mem.indexOfScalar(u8, serialized, 0).?;
+    const content = serialized[null_pos + 1 ..];
+    const deserialized = try deserialize(allocator, .tree, content);
+    defer allocator.free(deserialized.tree.entries);
+    try testing.expectEqual(@as(usize, 0), deserialized.tree.entries.len);
+}
+
+test "BUG: commit roundtrip with parents" {
+    const allocator = testing.allocator;
+    const tree_sha = Sha1.hash("tree_data");
+    const parent_sha = Sha1.hash("parent_commit");
+    const original = GitObject{ .commit = .{
+        .tree = tree_sha,
+        .parents = &.{parent_sha},
+        .author = .{ .name = "Test User", .email = "test@example.com", .timestamp = 1234567890, .timezone = "+0000" },
+        .committer = .{ .name = "Test User", .email = "test@example.com", .timestamp = 1234567891, .timezone = "+0000" },
+        .message = "Initial commit\n",
+    } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    const null_pos = std.mem.indexOfScalar(u8, serialized, 0).?;
+    const content = serialized[null_pos + 1 ..];
+    const deserialized = try deserialize(allocator, .commit, content);
+    defer {
+        for (deserialized.commit.parents) |_| {}
+        allocator.free(deserialized.commit.parents);
+        allocator.free(deserialized.commit.author.name);
+        allocator.free(deserialized.commit.author.email);
+        allocator.free(deserialized.commit.author.timezone);
+        allocator.free(deserialized.commit.committer.name);
+        allocator.free(deserialized.commit.committer.email);
+        allocator.free(deserialized.commit.committer.timezone);
+        allocator.free(deserialized.commit.message);
+    }
+    try testing.expectEqual(tree_sha, deserialized.commit.tree);
+    try testing.expectEqual(@as(usize, 1), deserialized.commit.parents.len);
+    try testing.expectEqual(parent_sha, deserialized.commit.parents[0]);
+    try testing.expectEqualStrings("Test User", deserialized.commit.author.name);
+    try testing.expectEqualStrings("test@example.com", deserialized.commit.author.email);
+    try testing.expectEqual(@as(i64, 1234567890), deserialized.commit.author.timestamp);
+    try testing.expectEqualStrings("+0000", deserialized.commit.author.timezone);
+    try testing.expectEqualStrings("Initial commit\n", deserialized.commit.message);
+}
+
+test "BUG: commit no parents roundtrip" {
+    const allocator = testing.allocator;
+    const tree_sha = Sha1.hash("root_tree");
+    const original = GitObject{ .commit = .{
+        .tree = tree_sha,
+        .parents = &.{},
+        .author = .{ .name = "A", .email = "a@b", .timestamp = 0, .timezone = "+0000" },
+        .committer = .{ .name = "A", .email = "a@b", .timestamp = 0, .timezone = "+0000" },
+        .message = "",
+    } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    const null_pos = std.mem.indexOfScalar(u8, serialized, 0).?;
+    const content = serialized[null_pos + 1 ..];
+    const deserialized = try deserialize(allocator, .commit, content);
+    defer {
+        for (deserialized.commit.parents) |_| {}
+        allocator.free(deserialized.commit.parents);
+        allocator.free(deserialized.commit.author.name);
+        allocator.free(deserialized.commit.author.email);
+        allocator.free(deserialized.commit.author.timezone);
+        allocator.free(deserialized.commit.committer.name);
+        allocator.free(deserialized.commit.committer.email);
+        allocator.free(deserialized.commit.committer.timezone);
+        allocator.free(deserialized.commit.message);
+    }
+    try testing.expectEqual(tree_sha, deserialized.commit.tree);
+    try testing.expectEqual(@as(usize, 0), deserialized.commit.parents.len);
+    try testing.expectEqualStrings("", deserialized.commit.message);
+}
+
+test "BUG: commit two parents roundtrip" {
+    const allocator = testing.allocator;
+    const tree_sha = Sha1.hash("merge_tree");
+    const parent1 = Sha1.hash("p1");
+    const parent2 = Sha1.hash("p2");
+    const original = GitObject{ .commit = .{
+        .tree = tree_sha,
+        .parents = &.{ parent1, parent2 },
+        .author = .{ .name = "A", .email = "a@b", .timestamp = 100, .timezone = "+0100" },
+        .committer = .{ .name = "A", .email = "a@b", .timestamp = 100, .timezone = "+0100" },
+        .message = "Merge\n",
+    } };
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    const null_pos = std.mem.indexOfScalar(u8, serialized, 0).?;
+    const content = serialized[null_pos + 1 ..];
+    const deserialized = try deserialize(allocator, .commit, content);
+    defer {
+        for (deserialized.commit.parents) |_| {}
+        allocator.free(deserialized.commit.parents);
+        allocator.free(deserialized.commit.author.name);
+        allocator.free(deserialized.commit.author.email);
+        allocator.free(deserialized.commit.author.timezone);
+        allocator.free(deserialized.commit.committer.name);
+        allocator.free(deserialized.commit.committer.email);
+        allocator.free(deserialized.commit.committer.timezone);
+        allocator.free(deserialized.commit.message);
+    }
+    try testing.expectEqual(@as(usize, 2), deserialized.commit.parents.len);
+    try testing.expectEqual(parent1, deserialized.commit.parents[0]);
+    try testing.expectEqual(parent2, deserialized.commit.parents[1]);
+}
+
+test "BUG: ObjectType.fromString invalid" {
+    try testing.expectError(error.InvalidObjectType, ObjectType.fromString("blobb"));
+    try testing.expectError(error.InvalidObjectType, ObjectType.fromString(""));
+    try testing.expectError(error.InvalidObjectType, ObjectType.fromString("BLOB"));
+}
+
+test "BUG: ObjectType roundtrip toString/fromString" {
+    try testing.expectEqual(ObjectType.blob, try ObjectType.fromString("blob"));
+    try testing.expectEqual(ObjectType.tree, try ObjectType.fromString("tree"));
+    try testing.expectEqual(ObjectType.commit, try ObjectType.fromString("commit"));
+    try testing.expectEqual(ObjectType.tag, try ObjectType.fromString("tag"));
+    try testing.expectEqualStrings("blob", ObjectType.blob.toString());
+    try testing.expectEqualStrings("tree", ObjectType.tree.toString());
+    try testing.expectEqualStrings("commit", ObjectType.commit.toString());
+    try testing.expectEqualStrings("tag", ObjectType.tag.toString());
+}
+
+test "BUG: SHA hash is deterministic" {
+    const sha1 = Sha1.hash("test data");
+    const sha2 = Sha1.hash("test data");
+    try testing.expectEqual(sha1, sha2);
+    const sha3 = Sha1.hash("different data");
+    try testing.expect(!std.mem.eql(u8, &sha1, &sha3));
 }

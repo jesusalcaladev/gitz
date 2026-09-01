@@ -41,10 +41,15 @@ pub const Config = struct {
             // Section header: [section "subsection"]
             if (trimmed[0] == '[') {
                 const end = std.mem.indexOf(u8, trimmed, "]") orelse continue;
-                current_section = try self.allocator.dupe(u8, trimmed[1..end]);
-                if (!self.sections.contains(current_section.?)) {
-                    try self.sections.put(current_section.?, std.StringHashMap([]const u8).init(self.allocator));
+                const section_name = try self.allocator.dupe(u8, trimmed[1..end]);
+                const gop = try self.sections.getOrPut(section_name);
+                if (gop.found_existing) {
+                    // Section already exists — free the duplicate we just made
+                    self.allocator.free(section_name);
+                } else {
+                    gop.value_ptr.* = std.StringHashMap([]const u8).init(self.allocator);
                 }
+                current_section = gop.key_ptr.*;
                 continue;
             }
 
@@ -55,10 +60,16 @@ pub const Config = struct {
 
                 if (current_section) |section| {
                     if (self.sections.getPtr(section)) |section_map| {
-                        try section_map.put(
-                            try self.allocator.dupe(u8, key),
-                            try self.allocator.dupe(u8, value),
-                        );
+                        const owned_key = try self.allocator.dupe(u8, key);
+                        const owned_val = try self.allocator.dupe(u8, value);
+                        const gop = try section_map.getOrPut(owned_key);
+                        if (gop.found_existing) {
+                            self.allocator.free(owned_key);
+                            self.allocator.free(gop.value_ptr.*);
+                            gop.value_ptr.* = owned_val;
+                        } else {
+                            gop.value_ptr.* = owned_val;
+                        }
                     }
                 }
             }
@@ -77,13 +88,24 @@ pub const Config = struct {
     pub fn set(self: *Config, section: []const u8, key: []const u8, value: []const u8) !void {
         const owned_section = try self.allocator.dupe(u8, section);
         const entry = try self.sections.getOrPut(owned_section);
-        if (!entry.found_existing) {
+        if (entry.found_existing) {
+            // Section already exists — free the duplicate we just made
+            self.allocator.free(owned_section);
+        } else {
             entry.value_ptr.* = std.StringHashMap([]const u8).init(self.allocator);
         }
-        try entry.value_ptr.put(
-            try self.allocator.dupe(u8, key),
-            try self.allocator.dupe(u8, value),
-        );
+        // Check if key already exists — if so, free old value before overwriting
+        const new_key = try self.allocator.dupe(u8, key);
+        const gop = try entry.value_ptr.getOrPut(new_key);
+        if (gop.found_existing) {
+            // Old key stays, new_key is lost — free it
+            self.allocator.free(new_key);
+            // Free old value
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = try self.allocator.dupe(u8, value);
+        } else {
+            gop.value_ptr.* = try self.allocator.dupe(u8, value);
+        }
     }
 
     /// Serialize config to string
@@ -179,4 +201,68 @@ test "config parse empty" {
 
     try config.parse("");
     try testing.expectEqual(@as(?[]const u8, null), config.get("user", "name"));
+}
+
+// =============================================================================
+// TDD Bug-Hunt Tests — Config Edge Cases
+// =============================================================================
+
+test "BUG: config serialize roundtrip" {
+    var config = Config.init(testing.allocator);
+    defer config.deinit();
+
+    try config.set("user", "name", "Test User");
+    try config.set("user", "email", "test@example.com");
+
+    const serialized = try config.serialize(testing.allocator);
+    defer testing.allocator.free(serialized);
+
+    // Re-parse the serialized output
+    var config2 = Config.init(testing.allocator);
+    defer config2.deinit();
+    try config2.parse(serialized);
+
+    try testing.expectEqualStrings("Test User", config2.get("user", "name").?);
+    try testing.expectEqualStrings("test@example.com", config2.get("user", "email").?);
+}
+
+test "BUG: config set overwrites existing" {
+    var config = Config.init(testing.allocator);
+    defer config.deinit();
+
+    try config.set("user", "name", "Old Name");
+    try testing.expectEqualStrings("Old Name", config.get("user", "name").?);
+
+    try config.set("user", "name", "New Name");
+    try testing.expectEqualStrings("New Name", config.get("user", "name").?);
+}
+
+test "BUG: config multiple sections" {
+    var config = Config.init(testing.allocator);
+    defer config.deinit();
+
+    try config.set("user", "name", "Alice");
+    try config.set("storage", "backend", "shard");
+    try config.set("storage", "shards", "8");
+
+    try testing.expectEqualStrings("Alice", config.get("user", "name").?);
+    try testing.expectEqualStrings("shard", config.get("storage", "backend").?);
+    try testing.expectEqualStrings("8", config.get("storage", "shards").?);
+    try testing.expectEqual(@as(?[]const u8, null), config.get("user", "backend"));
+}
+
+test "BUG: config parse with equals in value" {
+    var config = Config.init(testing.allocator);
+    defer config.deinit();
+
+    try config.parse("[test]\nkey = value=with=equals\n");
+    try testing.expectEqualStrings("value=with=equals", config.get("test", "key").?);
+}
+
+test "BUG: config parse with quotes in value" {
+    var config = Config.init(testing.allocator);
+    defer config.deinit();
+
+    try config.parse("[test]\nkey = \"quoted value\"\n");
+    try testing.expectEqualStrings("quoted value", config.get("test", "key").?);
 }

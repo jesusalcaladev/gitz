@@ -132,3 +132,56 @@ test "parse refs" {
     try std.testing.expectEqualStrings("HEAD", refs[0].name);
     try std.testing.expectEqualStrings("refs/heads/main", refs[1].name);
 }
+
+// =============================================================================
+// TDD Bug-Hunt Tests — pktline Edge Cases
+// =============================================================================
+
+test "BUG: extractPackData with empty packets" {
+    const allocator = std.testing.allocator;
+    // Multiple flush packets followed by data
+    const data = "0000" ++ "0000" ++ "000c" ++ "PACKDATA" ++ "0000";
+    const pack = try extractPackData(allocator, data);
+    defer allocator.free(pack);
+    try std.testing.expectEqualStrings("PACKDATA", pack);
+}
+
+test "BUG: buildWantLine packet length" {
+    const allocator = std.testing.allocator;
+    const sha = Sha1.fromHex("aabbccdd11223344aabbccdd11223344aabbccdd") catch unreachable;
+    const want = try buildWantLine(allocator, sha);
+    defer allocator.free(want);
+    // want line: "want <40hex>\n" = 5 + 40 + 1 = 46 bytes
+    // pkt_len = 4 + 46 = 50 = 0x0032
+    try std.testing.expectEqualStrings("0032", want[0..4]);
+    try std.testing.expectEqualStrings("want aabbccdd11223344aabbccdd11223344aabbccdd\n", want[4..]);
+}
+
+test "BUG: parseRefs handles response end packet" {
+    const allocator = std.testing.allocator;
+    // Response end (0001) should stop parsing
+    const data = "003d" ++ "0123456789abcdef0123456789abcdef01234567 refs/heads/main\n" ++ "0001";
+    const refs = try parseRefs(allocator, data);
+    defer {
+        for (refs) |r| allocator.free(r.name);
+        allocator.free(refs);
+    }
+    // Should parse the ref before the response end
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("refs/heads/main", refs[0].name);
+}
+
+test "BUG: doneMessage format" {
+    const allocator = std.testing.allocator;
+    const done = try doneMessage(allocator);
+    defer allocator.free(done);
+    // done message: "done\n" = 5 bytes, pkt_len = 4 + 5 = 9
+    try std.testing.expectEqualStrings("0009done\n", done);
+}
+
+test "BUG: flushPacket is constant" {
+    const f1 = flushPacket();
+    const f2 = flushPacket();
+    try std.testing.expectEqualStrings("0000", f1);
+    try std.testing.expectEqualStrings("0000", f2);
+}

@@ -247,7 +247,7 @@ pub const Index = struct {
                 _ = try f.readStreaming(io, &.{pad_buf[0..pad]});
             }
 
-            try idx.add(allocator, try allocator.dupe(u8, name_buf[0..name_len]), sha, .{
+            try idx.add(allocator, name_buf[0..name_len], sha, .{
                 .mode = mode,
                 .size = size,
                 .mtime = mtime,

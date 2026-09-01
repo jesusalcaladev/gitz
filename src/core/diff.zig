@@ -331,3 +331,85 @@ test "diff two separate hunks" {
     // With 3 context lines, changes at line 1 and line 15 are >6 lines apart
     try testing.expect(result.hunks.len >= 2);
 }
+
+// =============================================================================
+// TDD Bug-Hunt Tests — Diff Edge Cases
+// =============================================================================
+
+test "BUG: diff single line changed" {
+    const old = [_][]const u8{"only"};
+    const new = [_][]const u8{"changed"};
+    const result = try myersDiff(testing.allocator, &old, &new);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.hunks.len == 1);
+    const h = result.hunks[0];
+    // Should have 1 deleted + 1 added (no context since single line)
+    var del_count: u32 = 0;
+    var add_count: u32 = 0;
+    for (h.lines) |line| {
+        switch (line.type) {
+            .deleted => del_count += 1,
+            .added => add_count += 1,
+            .context => {},
+        }
+    }
+    try testing.expectEqual(@as(u32, 1), del_count);
+    try testing.expectEqual(@as(u32, 1), add_count);
+}
+
+test "BUG: diff all lines replaced" {
+    const old = [_][]const u8{ "a", "b", "c" };
+    const new = [_][]const u8{ "x", "y", "z" };
+    const result = try myersDiff(testing.allocator, &old, &new);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.hunks.len == 1);
+    // All lines should be deleted or added, no context
+    var has_del = false;
+    var has_add = false;
+    for (result.hunks[0].lines) |line| {
+        if (line.type == .deleted) has_del = true;
+        if (line.type == .added) has_add = true;
+    }
+    try testing.expect(has_del);
+    try testing.expect(has_add);
+}
+
+test "BUG: diff identical content produces no hunks" {
+    const content = [_][]const u8{ "line1", "line2", "line3", "line4", "line5" };
+    const result = try myersDiff(testing.allocator, &content, &content);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.isEmpty());
+}
+
+test "BUG: diff hunk counts are correct" {
+    const old = [_][]const u8{ "a", "b", "c", "d", "e" };
+    const new = [_][]const u8{ "a", "X", "c", "d", "e" };
+    const result = try myersDiff(testing.allocator, &old, &new);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.hunks.len == 1);
+    const h = result.hunks[0];
+    // old has: context + deleted + context → old_count >= 3
+    // new has: context + added + context → new_count >= 3
+    try testing.expect(h.old_count >= 1);
+    try testing.expect(h.new_count >= 1);
+    // old_count = context + deleted, new_count = context + added
+    // So old_count + new_count >= total lines (context counted twice)
+    try testing.expect(h.old_count + h.new_count >= @as(u32, @intCast(h.lines.len)));
+}
+
+test "BUG: diff preserves line content" {
+    const old = [_][]const u8{ "hello", "world" };
+    const new = [_][]const u8{ "hello", "universe" };
+    const result = try myersDiff(testing.allocator, &old, &new);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.hunks.len == 1);
+    for (result.hunks[0].lines) |line| {
+        if (line.type == .context) {
+            try testing.expectEqualStrings("hello", line.content);
+        } else if (line.type == .deleted) {
+            try testing.expectEqualStrings("world", line.content);
+        } else if (line.type == .added) {
+            try testing.expectEqualStrings("universe", line.content);
+        }
+    }
+}
