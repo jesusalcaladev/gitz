@@ -33,12 +33,11 @@ pub const LooseStore = struct {
         const full_path = try std.fmt.allocPrint(allocator, "{s}/objects/{s}", .{ self.git_dir, path_buf[0..path_len] });
         defer allocator.free(full_path);
 
-        var f = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch return error.ObjectNotFound;
-        defer f.close(io);
-
-        var buf: [100 * 1024]u8 = undefined;
-        const n = try f.readStreaming(io, &.{&buf});
-        const raw = buf[0..n];
+        // Read the entire (zlib-compressed) object file. Using a dynamic read
+        // (instead of a fixed stack buffer) means arbitrarily large objects —
+        // blobs are NOT capped at a few hundred KB in git — are supported.
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited) catch return error.ObjectNotFound;
+        defer allocator.free(raw);
 
         // Try to decompress (git objects are zlib-compressed)
         const decompressed = zlib_mod.zlib.decompress(allocator, raw) catch raw;
@@ -121,3 +120,38 @@ pub const LooseStore = struct {
         std.Io.Dir.cwd().deleteFile(io, full_path) catch {};
     }
 };
+
+// ============================================================================
+// SDD/TDD — large object support (blobs > 100KB must not be truncated)
+// ============================================================================
+
+test "loose store reads a large blob (> 100KB) without truncation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const tmp_dir = "/tmp/gitz-test-loose-large";
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+
+    var store = LooseStore.init(tmp_dir);
+
+    // 300KB of incompressible (PRNG) content keeps the zlib file > 100KB so
+    // the old fixed-buffer reader would have truncated it.
+    var rng: u64 = 0x853c49e6748fea9b;
+    const large = try allocator.alloc(u8, 300 * 1024);
+    defer allocator.free(large);
+    for (large) |*b| {
+        rng ^= rng >> 13;
+        rng ^= rng << 7;
+        rng ^= rng >> 17;
+        b.* = @truncate(rng *% 0x2545F4914F6CDD1D);
+    }
+
+    const obj = GitObject{ .blob = .{ .content = large } };
+    const sha = try store.write(allocator, io, obj);
+
+    const read_obj = try store.read(allocator, io, sha);
+    defer allocator.free(read_obj.blob.content);
+    try std.testing.expectEqual(@as(usize, 300 * 1024), read_obj.blob.content.len);
+    try std.testing.expectEqualSlices(u8, large, read_obj.blob.content);
+}

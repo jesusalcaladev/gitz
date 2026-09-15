@@ -5,15 +5,38 @@ const http = @import("../../transport/http.zig");
 const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
+const alternates_mod = @import("../../core/alternates.zig");
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 
 pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
-    if (args.len == 0) {
-        try io.eprint("usage: gitz clone <url> [directory]\n", .{});
+    // Detect the --local / --shared flag (share objects with an existing repo).
+    var shared = false;
+    var url_index: usize = 0;
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--local") or std.mem.eql(u8, arg, "--shared")) {
+            shared = true;
+        } else if (url_index == 0) {
+            url_index = i;
+        }
+    }
+
+    if (args.len == 0 or url_index >= args.len) {
+        try io.eprint("usage: gitz clone <url> [directory] [--local]\n", .{});
         std.process.exit(1);
     }
 
-    const url = args[0];
+    const url = args[url_index];
+
+    // For a shared clone the source must be a local repository directory.
+    // We route it early so no network transport is set up at all — objects are
+    // shared via the alternates file instead of being copied/transferred.
+    if (shared) {
+        cloneShared(allocator, args[url_index..], io, url) catch {
+            try io.eprint("fatal: shared clone of '{s}' failed\n", .{url});
+            return;
+        };
+        return;
+    }
 
     const dest = if (args.len > 1) args[1] else dest: {
         const last_slash = std.mem.lastIndexOf(u8, url, "/") orelse url.len;
@@ -173,36 +196,181 @@ fn countObjects(allocator: std.mem.Allocator, io: Io, dir_path: []const u8, coun
     }
 }
 
-/// Checkout files from a commit into a directory
+/// Checkout files from a commit into a directory.
+/// Threads a single StorageBackend through the whole traversal (rather than
+/// re-parsing repo config for every entry) and resolves objects through
+/// alternates when they are not stored locally (shared clones).
+/// Shared (aka --local / --shared) clone: create a new working copy that
+/// references the source repository's object store via `objects/info/alternates`
+/// instead of copying or re-downloading the objects.
+///
+/// This is GitZ's answer to "clone that scales": the source acts as a single
+/// canonical object store that many cheap clones share. Cloning is instant and
+/// uses ~zero extra disk for the shared history.
+fn cloneShared(allocator: std.mem.Allocator, args: []const []const u8, io: Io, source: []const u8) !void {
+    // Strip a trailing "/.gitz" from the source if given a git dir.
+    var source_repo = source;
+    if (std.mem.endsWith(u8, source_repo, "/.gitz")) {
+        source_repo = source_repo[0 .. source_repo.len - 6];
+    } else if (std.mem.endsWith(u8, source_repo, ".gitz")) {
+        source_repo = source_repo[0 .. source_repo.len - 5];
+    }
+
+    const source_git = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{source_repo});
+    defer allocator.free(source_git);
+
+    // Validate the source is a gitz repository.
+    const source_head = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{source_git});
+    defer allocator.free(source_head);
+    if (!io.fileExists(source_head)) {
+        try io.eprint("fatal: not a gitz repository: '{s}'\n", .{source_repo});
+        return error.NotARepository;
+    }
+
+    // Destination name: last path component of the source.
+    const dest = if (args.len > 1) args[1] else dest: {
+        const trimmed = std.mem.trimEnd(u8, source_repo, "/");
+        const last_slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse 0;
+        var name = if (last_slash == 0) trimmed else trimmed[last_slash + 1 ..];
+        if (name.len == 0) name = "repo";
+        if (std.mem.endsWith(u8, name, ".gitz")) {
+            name = name[0 .. name.len - 5];
+        }
+        break :dest name;
+    };
+
+    try io.print("Cloning (shared objects) into '{s}'...\n", .{dest});
+
+    // Create destination .gitz structure
+    std.Io.Dir.cwd().createDirPath(io.io, dest) catch {};
+    const gitz_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dest});
+    defer allocator.free(gitz_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, gitz_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io.io, try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/heads", .{dest})) catch {};
+    std.Io.Dir.cwd().createDirPath(io.io, try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/tags", .{dest})) catch {};
+    std.Io.Dir.cwd().createDirPath(io.io, try std.fmt.allocPrint(allocator, "{s}/.gitz/objects", .{dest})) catch {};
+
+    // Write HEAD (symbolic, points at the source default branch if we can tell)
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/HEAD", .{dest});
+    defer allocator.free(head_path);
+    var hf = try std.Io.Dir.cwd().createFile(io.io, head_path, .{});
+    defer hf.close(io.io);
+    const source_head_content = std.Io.Dir.cwd().readFileAlloc(io.io, source_head, allocator, .unlimited) catch "ref: refs/heads/main\n";
+    defer allocator.free(source_head_content);
+    try std.Io.File.writeStreamingAll(hf, io.io, source_head_content);
+
+    // Write remote config pointing at the source
+    const remotes_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes", .{dest});
+    defer allocator.free(remotes_dir);
+    std.Io.Dir.cwd().createDirPath(io.io, remotes_dir) catch {};
+    const remote_path = try std.fmt.allocPrint(allocator, "{s}/.gitz/remotes/origin", .{dest});
+    defer allocator.free(remote_path);
+    io.writeFile(remote_path, source_repo) catch {};
+
+    // Point alternates at the source object store — the key sharing step.
+    const source_objects = try std.fmt.allocPrint(allocator, "{s}/objects", .{source_git});
+    defer allocator.free(source_objects);
+    const alts = alternates_mod.Alternates.init(gitz_dir);
+    try alts.write(allocator, io.io, &.{source_objects});
+
+    // Copy refs from the source repo (heads and tags).
+    const src_refs = refs_mod.Refs.init(source_git);
+    const dst_refs = refs_mod.Refs.init(gitz_dir);
+    var ref_count: u32 = 0;
+
+    const heads = try src_refs.list(allocator, io.io, "heads");
+    defer {
+        for (heads) |r| allocator.free(r);
+        allocator.free(heads);
+    }
+    for (heads) |ref| {
+        const sha = src_refs.read(allocator, io.io, ref) catch continue;
+        dst_refs.write(allocator, io.io, ref, sha) catch continue;
+        ref_count += 1;
+    }
+
+    const tags = try src_refs.list(allocator, io.io, "tags");
+    defer {
+        for (tags) |r| allocator.free(r);
+        allocator.free(tags);
+    }
+    for (tags) |ref| {
+        const sha = src_refs.read(allocator, io.io, ref) catch continue;
+        dst_refs.write(allocator, io.io, ref, sha) catch continue;
+        ref_count += 1;
+    }
+
+    // Checkout from the shared (alternate) objects.
+    if (src_refs.read(allocator, io.io, "HEAD")) |head_sha| {
+        checkoutFiles(allocator, io, gitz_dir, head_sha, dest) catch {
+            try io.eprint("warning: checkout incomplete\n", .{});
+        };
+    } else |_| {}
+
+    try io.print("Shared clone complete: '{s}' ({d} refs, objects shared with '{s}')\n", .{ dest, ref_count, source_repo });
+}
 fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const alts = alternates_mod.Alternates.init(git_dir);
 
     // Read commit
-    const obj = store.read(allocator, io.io, commit_sha) catch return;
+    const obj = readWithAlternates(allocator, io, &store, &alts, commit_sha) catch return;
     const commit = switch (obj) {
         .commit => |c| c,
         else => return,
     };
+    defer freeGitObject(allocator, obj);
 
     // Read tree
-    const tree_obj = store.read(allocator, io.io, commit.tree) catch return;
+    const tree_obj = readWithAlternates(allocator, io, &store, &alts, commit.tree) catch return;
     const tree = switch (tree_obj) {
         .tree => |t| t,
         else => return,
     };
 
     for (tree.entries) |entry| {
-        checkoutTreeEntry(allocator, io, git_dir, entry, dest) catch continue;
+        checkoutTreeEntry(allocator, io, git_dir, &store, &alts, entry, dest) catch continue;
     }
 }
 
-fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, entry: object.TreeEntry, dest: []const u8) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const blob_obj = store.read(allocator, io.io, entry.sha) catch return;
+/// Read an object from the local store, falling back to the alternates object
+/// directories when the object is not present locally (i.e. shared clones).
+fn readWithAlternates(
+    allocator: std.mem.Allocator,
+    io: Io,
+    store: *const storage_mod.StorageBackend,
+    alts: *const alternates_mod.Alternates,
+    sha: [20]u8,
+) !object.GitObject {
+    return store.read(allocator, io.io, sha) catch {
+        return alts.readObject(allocator, io.io, sha);
+    };
+}
 
-    switch (blob_obj) {
+/// Free the non-blob object allocations returned by object.deserialize.
+fn freeGitObject(allocator: std.mem.Allocator, obj: object.GitObject) void {
+    switch (obj) {
+        .blob => allocator.free(obj.blob.content),
+        else => {},
+    }
+}
+
+/// Recursively write a tree entry. `base` is the physical directory that this
+/// entry belongs to (it grows as we descend into subdirectories).
+fn checkoutTreeEntry(
+    allocator: std.mem.Allocator,
+    io: Io,
+    git_dir: []const u8,
+    store: *const storage_mod.StorageBackend,
+    alts: *const alternates_mod.Alternates,
+    entry: object.TreeEntry,
+    base: []const u8,
+) !void {
+    const obj = readWithAlternates(allocator, io, store, alts, entry.sha) catch return;
+
+    switch (obj) {
         .blob => |b| {
-            const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest, entry.name });
+            const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, entry.name });
             defer allocator.free(file_path);
 
             // Ensure parent directory exists
@@ -215,12 +383,12 @@ fn checkoutTreeEntry(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, 
             try std.Io.File.writeStreamingAll(file, io.io, b.content);
         },
         .tree => |t| {
-            // Recurse into subdirectory
-            const sub_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest, entry.name });
+            // Recurse into subdirectory — descend with the subdir as the base.
+            const sub_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, entry.name });
             defer allocator.free(sub_dir);
             std.Io.Dir.cwd().createDirPath(io.io, sub_dir) catch {};
             for (t.entries) |sub_entry| {
-                checkoutTreeEntry(allocator, io, git_dir, sub_entry, dest) catch continue;
+                checkoutTreeEntry(allocator, io, git_dir, store, alts, sub_entry, sub_dir) catch continue;
             }
         },
         else => {},

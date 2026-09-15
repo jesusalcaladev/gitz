@@ -48,6 +48,7 @@ comptime {
     _ = @import("core/objectstore.zig");
     _ = @import("core/storage.zig");
     _ = @import("core/shard_store.zig");
+    _ = @import("core/alternates.zig");
     _ = @import("core/zlib.zig");
     _ = @import("cli/commands/init.zig");
     _ = @import("cli/commands/add.zig");
@@ -84,4 +85,5 @@ comptime {
     _ = @import("cli/commands/completions.zig");
     _ = @import("tests/integration/compat.zig");
     _ = @import("tests/integration/http_transport.zig");
+    _ = @import("tests/integration/shared_clone.zig");
 }
