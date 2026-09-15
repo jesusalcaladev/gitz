@@ -27,6 +27,7 @@ const search_cmd = @import("commands/search.zig");
 const review_cmd = @import("commands/review.zig");
 const sync_cmd = @import("commands/sync.zig");
 const lfs_cmd = @import("commands/lfs.zig");
+const completions_cmd = @import("commands/completions.zig");
 
 const VERSION = "0.3.0";
 
@@ -60,6 +61,7 @@ pub fn printHelp(io: Io) !void {
         \\      review      Code review (diff between branches/commits)
         \\      sync        Fetch and rebase onto remote branch
         \\      lfs         Git Large File Storage
+        \\      completions Generate shell completions
         \\
         \\  REMOTE COMMANDS:
         \\      clone       Clone a repository from a URL
@@ -162,6 +164,8 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         try sync_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "lfs")) {
         try lfs_cmd.execute(allocator, git_dir, args, io);
+    } else if (std.mem.eql(u8, command, "completions")) {
+        try completions_cmd.execute(allocator, args, io);
     } else {
         try io.print("gitz: '{s}' is not a gitz command.\n\n", .{command});
         try printHelp(io);

@@ -184,7 +184,7 @@ gitz lfs track "*.psd"       Track large files by pattern
 | 36 | Documentation | Done -- README + ROADMAP + STATUS |
 | 37 | Error Messages | Partial -- basic |
 | 38 | Dogfooding | Done -- GitZ versions itself |
-| 39 | Final Tests | Partial -- 50+ tests |
+| 39 | Final Tests | Partial -- 124 tests, 0 leaks |
 | 40 | Benchmark Suite | Done -- benchmarks/bench.sh |
 | 41 | Release v1.0 | **Missing** |
 | 42 | Auto-update system | Done -- `gitz update` command |
@@ -213,4 +213,18 @@ gitz lfs track "*.psd"       Track large files by pattern
 
 ---
 
-*Last updated: August 2026*
+## Scalability — Shared-Object Clone (done)
+
+`gitz clone --shared <repo>` is GitZ's scaling answer to "clone copies
+everything": instead of copying objects, the clone records the source object
+store path in `objects/info/alternates` and resolves objects on demand.
+
+- **Instant, near-zero-disk clones** -- clone `.gitz/objects/` stays empty
+  (verified by `src/tests/integration/shared_clone.zig`).
+- **Backend-agnostic** -- alternates resolve through a loose `XX/YYYY` layout
+  *and* a sharded `shard_NN/XX/YYYY` layout, so a large canonical shard-backed
+  repo can back thousands of clones.
+- **Large objects** -- object readers now use dynamic buffers (no more 100KB
+  truncation), so shared blobs of any size checkout byte-for-byte identical.
+
+*Last updated: September 2026*

@@ -145,9 +145,17 @@ gitz config storage.shards 16
 ## Testing
 
 ```bash
-zig build test                    # Run all tests (84+ tests, 0 leaks)
+zig build test                    # Run all tests (124 tests, 0 leaks)
 zig build test -- --test-filter "sha1"  # Specific test
+zig build test -- --test-filter "shared"  # Shared-object clone simulation
 ```
+
+> **Shared-object clone (scaling):** `gitz clone --shared <repo>` builds a working
+> copy whose `.gitz/objects/` stays empty. Objects are resolved on demand from
+> the source repository's object store through `objects/info/alternates`. This
+> is GitZ's alternative to "clone copies everything": a canonical repo can back
+> thousands of instant, near-zero-disk clones, and it works regardless of
+> whether the source uses the loose or the shard storage backend.
 
 ## Git Compatibility
 

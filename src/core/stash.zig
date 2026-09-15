@@ -1,8 +1,9 @@
 const std = @import("std");
-const testing = std.testing;
 const Sha1 = @import("sha1.zig").Sha1;
 
 const Allocator = std.mem.Allocator;
+
+const testing = std.testing;
 
 pub const StashEntry = struct {
     sha: [20]u8,

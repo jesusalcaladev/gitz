@@ -1,7 +1,8 @@
 const std = @import("std");
-const testing = std.testing;
 
 const Allocator = std.mem.Allocator;
+
+const testing = std.testing;
 
 /// Simple INI-style config parser for Git config files
 pub const Config = struct {

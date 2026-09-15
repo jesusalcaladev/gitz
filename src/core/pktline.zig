@@ -1,6 +1,8 @@
 const std = @import("std");
 const Sha1 = @import("sha1.zig").Sha1;
 
+const testing = std.testing;
+
 /// Git packet-line protocol parser.
 ///
 /// Format:

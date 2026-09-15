@@ -323,6 +323,7 @@ fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, comm
 
     // Read tree
     const tree_obj = readWithAlternates(allocator, io, &store, &alts, commit.tree) catch return;
+    defer freeGitObject(allocator, tree_obj);
     const tree = switch (tree_obj) {
         .tree => |t| t,
         else => return,
@@ -347,11 +348,33 @@ fn readWithAlternates(
     };
 }
 
-/// Free the non-blob object allocations returned by object.deserialize.
+/// Free every allocation made by `object.deserialize` for the given object.
+/// Tree/commit/tag payloads allocate strings/slices that must be released
+/// explicitly (blob content is the raw reader buffer).
 fn freeGitObject(allocator: std.mem.Allocator, obj: object.GitObject) void {
     switch (obj) {
-        .blob => allocator.free(obj.blob.content),
-        else => {},
+        .blob => |b| allocator.free(b.content),
+        .tree => |t| {
+            for (t.entries) |e| allocator.free(e.name);
+            allocator.free(t.entries);
+        },
+        .commit => |c| {
+            allocator.free(c.parents);
+            allocator.free(c.author.name);
+            allocator.free(c.author.email);
+            allocator.free(c.author.timezone);
+            allocator.free(c.committer.name);
+            allocator.free(c.committer.email);
+            allocator.free(c.committer.timezone);
+            allocator.free(c.message);
+        },
+        .tag => |t| {
+            allocator.free(t.tag_name);
+            allocator.free(t.tagger.name);
+            allocator.free(t.tagger.email);
+            allocator.free(t.tagger.timezone);
+            allocator.free(t.message);
+        },
     }
 }
 
@@ -367,6 +390,7 @@ fn checkoutTreeEntry(
     base: []const u8,
 ) !void {
     const obj = readWithAlternates(allocator, io, store, alts, entry.sha) catch return;
+    defer freeGitObject(allocator, obj);
 
     switch (obj) {
         .blob => |b| {
@@ -393,4 +417,56 @@ fn checkoutTreeEntry(
         },
         else => {},
     }
+}
+
+// ============================================================================
+// TDD — freeGitObject must release every allocation made by object.deserialize
+// (regression: tree/commit/tag payloads leaked because only blob content was
+// freed). std.testing.allocator fails the test if anything leaks.
+// ============================================================================
+
+test "freeGitObject releases all tree allocations" {
+    const allocator = std.testing.allocator;
+
+    var entries: std.ArrayList(object.TreeEntry) = .empty;
+    defer entries.deinit(allocator);
+    try entries.append(allocator, .{ .mode = 0o100644, .name = try allocator.dupe(u8, "hello.txt"), .sha = Sha1.hash("a") });
+    try entries.append(allocator, .{ .mode = 0o40000, .name = try allocator.dupe(u8, "subdir"), .sha = Sha1.hash("b") });
+
+    const tree_obj = object.GitObject{ .tree = .{ .entries = try entries.toOwnedSlice(allocator) } };
+    freeGitObject(allocator, tree_obj);
+}
+
+test "freeGitObject releases all commit allocations" {
+    const allocator = std.testing.allocator;
+
+    const parents = try allocator.alloc([20]u8, 1);
+    parents[0] = Sha1.hash("parent");
+    const commit_obj = object.GitObject{ .commit = .{
+        .tree = Sha1.hash("tree"),
+        .parents = parents,
+        .author = .{ .name = try allocator.dupe(u8, "A"), .email = try allocator.dupe(u8, "a@b.c"), .timestamp = 1, .timezone = try allocator.dupe(u8, "+0000") },
+        .committer = .{ .name = try allocator.dupe(u8, "B"), .email = try allocator.dupe(u8, "b@c.d"), .timestamp = 2, .timezone = try allocator.dupe(u8, "+0100") },
+        .message = try allocator.dupe(u8, "msg\n"),
+    } };
+    freeGitObject(allocator, commit_obj);
+}
+
+test "freeGitObject releases all tag allocations" {
+    const allocator = std.testing.allocator;
+
+    const tag_obj = object.GitObject{ .tag = .{
+        .object = Sha1.hash("target"),
+        .object_type = .commit,
+        .tag_name = try allocator.dupe(u8, "v1.0"),
+        .tagger = .{ .name = try allocator.dupe(u8, "T"), .email = try allocator.dupe(u8, "t@t.t"), .timestamp = 3, .timezone = try allocator.dupe(u8, "+0200") },
+        .message = try allocator.dupe(u8, "release\n"),
+    } };
+    freeGitObject(allocator, tag_obj);
+}
+
+test "freeGitObject releases blob content" {
+    const allocator = std.testing.allocator;
+    const blob_obj = object.GitObject{ .blob = .{ .content = try allocator.dupe(u8, "content") } };
+    freeGitObject(allocator, blob_obj);
 }

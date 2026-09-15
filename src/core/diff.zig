@@ -247,10 +247,6 @@ pub fn buildHunksWithContext(allocator: Allocator, lines: []DiffLine) !Diff {
     return result;
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 test "diff no changes" {
     const old = [_][]const u8{ "line1", "line2", "line3" };
     const new = [_][]const u8{ "line1", "line2", "line3" };

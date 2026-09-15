@@ -66,6 +66,15 @@ Remote operations via SSH and HTTP:
 | Remote list empty | Fixed | Expected behavior when no remotes configured |
 | Clone no checkout | Fixed | Clone now performs full checkout |
 | Commit -a re-adds all | Fixed | Now only updates actually modified files |
+| Clone.zig null bytes | **Fixed** | Removed trailing `\0` garbage at the end of `src/cli/commands/clone.zig` that broke compilation at line 396 |
+| Large object truncation | **Fixed** | Loose/shard/alternates readers used a fixed **100KB** stack buffer, truncating any object/blob larger than 100KB. Now reads whole files via `readFileAlloc` (dynamic size). Affected `loose.zig`, `shard_store.zig`, `alternates.zig`. |
+
+### New Feature (SDD/TDD)
+
+| Feature | Priority | Description |
+|---------|----------|-------------|
+| Shard-aware alternates | High | `Alternates.resolve()` now falls back to a **sharded** object layout (`shard_NN/XX/YYYY`) when the loose path is missing. Shared-object clones (`gitz clone --shared`) now work regardless of whether the source uses the loose or shard storage backend. |
+| Shared-clone simulation tests | High | `src/tests/integration/shared_clone.zig` simulates the full `--shared` clone with both loose and shard sources, verifies dedup (clone object store stays empty), and byte-for-byte checkout — including large >100KB blobs. |
 
 ### Missing Features
 
@@ -165,8 +174,8 @@ src/
 
 ### Test Coverage
 
-- 50+ unit tests
-- Integration tests for core workflows
+- 124 unit + integration tests (0 leaks)
+- Shared-object clone simulation (`--test-filter "shared"`)
 - Basic Git compatibility tests
 
 ### Running Tests
@@ -174,6 +183,7 @@ src/
 ```bash
 zig build test              # All tests
 zig build test -- --test-filter "sha1"  # Specific test
+zig build test -- --test-filter "shared"  # Shared-object clone simulation
 ```
 
 ---

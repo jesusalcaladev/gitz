@@ -1,7 +1,8 @@
 const std = @import("std");
-const testing = std.testing;
 
 const Allocator = std.mem.Allocator;
+
+const testing = std.testing;
 
 /// Result of a merge operation
 pub const MergeResult = struct {

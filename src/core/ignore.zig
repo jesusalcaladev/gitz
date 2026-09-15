@@ -1,7 +1,8 @@
 const std = @import("std");
-const testing = std.testing;
 
 const Allocator = std.mem.Allocator;
+
+const testing = std.testing;
 
 /// A single ignore rule parsed from .gitignore
 pub const IgnoreRule = struct {
