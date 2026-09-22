@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 
 const GITHUB_REPO = "jesusalcaladev/gitz";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 /// Execute the update command
 pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {

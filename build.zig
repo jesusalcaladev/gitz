@@ -11,6 +11,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Strip symbols outside Debug: smaller binary, faster download
+            // and load. Debug builds keep symbols for debugging.
+            .strip = if (optimize == .Debug) null else true,
         }),
     });
     b.installArtifact(exe);

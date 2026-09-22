@@ -22,8 +22,18 @@ cp zig-out/bin/gitz ~/.local/bin/
 ### Requirements
 
 - **Linux** (x86_64, aarch64) or **macOS** (x86_64, aarch64)
+- **curl or wget**, **tar** and **gzip** (only for the install script)
 - **Zig 0.16+** (only for building from source)
 - **SSH** (for clone/push/pull)
+
+### Installer Options
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh | bash                    # latest
+curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh | bash -s -- --help       # all options
+curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh | GITZ_VERSION=0.4.0 bash # pin a release
+./install.sh --uninstall -y                                                                               # remove gitz
+```
 
 ---
 

@@ -50,6 +50,8 @@ comptime {
     _ = @import("core/shard_store.zig");
     _ = @import("core/alternates.zig");
     _ = @import("core/zlib.zig");
+    _ = @import("core/checkout.zig");
+    _ = @import("core/tree_merge.zig");
     _ = @import("cli/commands/init.zig");
     _ = @import("cli/commands/add.zig");
     _ = @import("cli/commands/commit.zig");

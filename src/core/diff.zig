@@ -39,37 +39,18 @@ pub const Diff = struct {
     }
 };
 
-/// Myers diff algorithm - simplified LCS-based implementation
-pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines: []const []const u8) !Diff {
+/// Line-level edit script between `old_lines` and `new_lines`, in forward
+/// order. Each line of the output describes one step:
+///   - `.context`: line present in both (old_line/new_line set)
+///   - `.deleted`: line only in old (old_line set)
+///   - `.added`:   line only in new (new_line set)
+/// The caller owns the returned slice (contents borrow from the inputs).
+pub fn lineEdits(allocator: Allocator, old_lines: []const []const u8, new_lines: []const []const u8) ![]DiffLine {
     const n = old_lines.len;
     const m = new_lines.len;
 
     if (n == 0 and m == 0) {
-        return Diff{ .hunks = &.{} };
-    }
-
-    if (n == 0) {
-        var lines = try allocator.alloc(DiffLine, m);
-        for (new_lines, 0..) |line, i| {
-            lines[i] = .{
-                .content = line,
-                .new_line = @intCast(i + 1),
-                .type = .added,
-            };
-        }
-        return try buildHunksWithContext(allocator, lines);
-    }
-
-    if (m == 0) {
-        var lines = try allocator.alloc(DiffLine, n);
-        for (old_lines, 0..) |line, i| {
-            lines[i] = .{
-                .content = line,
-                .old_line = @intCast(i + 1),
-                .type = .deleted,
-            };
-        }
-        return try buildHunksWithContext(allocator, lines);
+        return try allocator.alloc(DiffLine, 0);
     }
 
     // Compute LCS using DP table
@@ -92,11 +73,6 @@ pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines:
                 dp[i][j] = @max(dp[i - 1][j], dp[i][j - 1]);
             }
         }
-    }
-
-    // If all lines match, no diff needed
-    if (dp[n][m] == n and n == m) {
-        return Diff{ .hunks = &.{} };
     }
 
     // Backtrack to build edit script
@@ -137,11 +113,18 @@ pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines:
     // Reverse (we built it backwards)
     std.mem.reverse(DiffLine, result_lines.items);
 
-    if (result_lines.items.len == 0) {
+    return result_lines.toOwnedSlice(allocator);
+}
+
+/// Myers diff algorithm - simplified LCS-based implementation
+pub fn myersDiff(allocator: Allocator, old_lines: []const []const u8, new_lines: []const []const u8) !Diff {
+    const lines = try lineEdits(allocator, old_lines, new_lines);
+    if (lines.len == 0) {
+        allocator.free(lines);
         return Diff{ .hunks = &.{} };
     }
-
-    return try buildHunksWithContext(allocator, try result_lines.toOwnedSlice(allocator));
+    // buildHunksWithContext takes ownership of `lines` (and frees it).
+    return try buildHunksWithContext(allocator, lines);
 }
 
 /// Split a flat list of DiffLines into hunks with surrounding context lines,

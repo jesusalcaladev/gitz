@@ -45,6 +45,36 @@ pub const GitObject = union(ObjectType) {
         return self;
     }
 
+    /// Free every allocation owned by a deserialized object.
+    /// Do not call this on objects whose inner buffers were handed to someone
+    /// else (e.g. blob content returned by `readBlob`).
+    pub fn deinit(self: GitObject, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .blob => |b| allocator.free(b.content),
+            .tree => |t| {
+                for (t.entries) |e| allocator.free(e.name);
+                allocator.free(t.entries);
+            },
+            .commit => |c| {
+                allocator.free(c.parents);
+                freePerson(allocator, c.author);
+                freePerson(allocator, c.committer);
+                allocator.free(c.message);
+            },
+            .tag => |t| {
+                allocator.free(t.tag_name);
+                freePerson(allocator, t.tagger);
+                allocator.free(t.message);
+            },
+        }
+    }
+
+    fn freePerson(allocator: std.mem.Allocator, p: anytype) void {
+        allocator.free(p.name);
+        allocator.free(p.email);
+        allocator.free(p.timezone);
+    }
+
     pub fn hash(self: GitObject, allocator: std.mem.Allocator) ![20]u8 {
         const content = try self.serialize(allocator);
         defer allocator.free(content);

@@ -10,9 +10,40 @@ curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh
 
 This script will:
 1. Detect your platform (OS and architecture)
-2. Download the appropriate pre-built binary
-3. Install it to `~/.local/bin`
-4. Add it to your PATH
+2. Download the latest pre-built binary (a single request — no GitHub API, no rate limits)
+3. Verify its SHA-256 checksum when the release publishes `SHA256SUMS`
+4. Install it atomically to `~/.local/bin` and check that it runs
+5. Add it to your PATH and configure git (`gitz.defaultGitDir`)
+
+A fresh install takes well under a second on a normal connection, and existing
+installs are detected and upgraded automatically (no prompts when piped).
+
+### Installer Options
+
+Run the script directly to pass options:
+
+```bash
+./install.sh --help              # Show all options
+./install.sh --dir "$HOME/bin"   # Custom install directory
+./install.sh --force             # Reinstall even if up to date
+./install.sh --source            # Build from source instead of downloading
+./install.sh --no-path           # Do not touch shell configuration
+./install.sh --uninstall -y      # Remove gitz non-interactively
+```
+
+### Pinned Versions
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh | GITZ_VERSION=0.4.0 bash
+```
+
+### Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `INSTALL_DIR` | Same as `--dir` (default: `~/.local/bin`) |
+| `GITZ_VERSION` | Install a specific release instead of the latest |
+| `NO_COLOR` | Disable colored output |
 
 ## Pre-built Binaries
 
@@ -27,11 +58,16 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 | macOS | x86_64 (Intel) | `gitz-macos-x86_64.tar.gz` |
 | macOS | aarch64 (Apple Silicon) | `gitz-macos-aarch64.tar.gz` |
 
+Every release also publishes a `SHA256SUMS` file; the install script verifies
+the download against it automatically.
+
 ### Manual Download
 
 ```bash
 # Example for Linux x86_64
 curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/gitz-linux-x86_64.tar.gz -o gitz.tar.gz
+curl -fsSL https://github.com/jesusalcaladev/gitz/releases/latest/download/SHA256SUMS -o SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS   # shasum -a 256 -c on macOS
 tar -xzf gitz.tar.gz
 mkdir -p ~/.local/bin
 mv gitz ~/.local/bin/

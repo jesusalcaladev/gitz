@@ -29,7 +29,7 @@ const sync_cmd = @import("commands/sync.zig");
 const lfs_cmd = @import("commands/lfs.zig");
 const completions_cmd = @import("commands/completions.zig");
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 pub fn printHelp(io: Io) !void {
     try io.print(
