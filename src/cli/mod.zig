@@ -31,6 +31,11 @@ const completions_cmd = @import("commands/completions.zig");
 
 const VERSION = "0.4.0";
 
+pub const Exit = struct {
+    pub const usage: u8 = 1;
+    pub const fatal: u8 = 128;
+};
+
 pub fn printHelp(io: Io) !void {
     try io.print(
         \\
@@ -92,6 +97,13 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         return;
     }
 
+    // Validate the command before looking for a repository. This keeps usage
+    // errors independent of the current directory and leaves machine-readable
+    // stdout untouched.
+    if (!isKnownCommand(command)) {
+        try unknownCommand(command, io);
+    }
+
     // Commands that don't need .gitz
     if (std.mem.eql(u8, command, "init")) {
         try init_cmd.execute(allocator, args, io);
@@ -105,6 +117,11 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
 
     if (std.mem.eql(u8, command, "update")) {
         try update_cmd.execute(allocator, args, io);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "completions")) {
+        try completions_cmd.execute(allocator, args, io);
         return;
     }
 
@@ -164,13 +181,28 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         try sync_cmd.execute(allocator, git_dir, args, io);
     } else if (std.mem.eql(u8, command, "lfs")) {
         try lfs_cmd.execute(allocator, git_dir, args, io);
-    } else if (std.mem.eql(u8, command, "completions")) {
-        try completions_cmd.execute(allocator, args, io);
     } else {
-        try io.print("gitz: '{s}' is not a gitz command.\n\n", .{command});
-        try printHelp(io);
-        std.process.exit(1);
+        unknownCommand(command, io);
     }
+}
+
+pub fn isKnownCommand(command: []const u8) bool {
+    const commands = [_][]const u8{
+        "init",   "add",    "commit", "status",      "diff",   "log",
+        "branch", "switch", "merge",  "rebase",      "stash",  "tag",
+        "reset",  "undo",   "blame",  "gc",          "config", "search",
+        "review", "sync",   "lfs",    "clone",       "fetch",  "push",
+        "pull",   "remote", "update", "completions",
+    };
+    for (commands) |known| {
+        if (std.mem.eql(u8, command, known)) return true;
+    }
+    return false;
+}
+
+fn unknownCommand(command: []const u8, io: Io) noreturn {
+    io.eprint("gitz: '{s}' is not a gitz command. See 'gitz --help'.\n", .{command}) catch {};
+    std.process.exit(Exit.usage);
 }
 
 fn findGitDir(allocator: std.mem.Allocator, io: Io) ![]const u8 {

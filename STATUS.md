@@ -68,6 +68,12 @@ Remote operations via SSH and HTTP:
 | Commit -a re-adds all | Fixed | Now only updates actually modified files |
 | Clone.zig null bytes | **Fixed** | Removed trailing `\0` garbage at the end of `src/cli/commands/clone.zig` that broke compilation at line 396 |
 | Large object truncation | **Fixed** | Loose/shard/alternates readers used a fixed **100KB** stack buffer, truncating any object/blob larger than 100KB. Now reads whole files via `readFileAlloc` (dynamic size). Affected `loose.zig`, `shard_store.zig`, `alternates.zig`. |
+| Merge conflict use-after-return | **Fixed** | Conflict results pointed at stack temporaries and failed or segfaulted in `ReleaseFast`. `MergeFileResult` now owns conflicts and frees them explicitly. |
+| Clone path traversal / overwrite | **Fixed** | Tree entries must be single safe path components; non-empty destinations and symlinks are rejected before any write, and checkout never overwrites an existing file. |
+| Shared clone unusable after checkout | **Fixed** | Checkout now rebuilds `.gitz/index`, while `log` and `status` resolve objects through alternates. Shared clones report a clean tree and visible history without copying objects. |
+| Large CLI output silently dropped | **Fixed** | `Io` output over 8 KiB now falls back to a dynamic buffer instead of discarding the message and exiting successfully. |
+| Fatal errors exited 0 | **Fixed** | Unknown commands exit 1 on stderr, bare invocation exits 1, and failed pathspec/clone operations exit 128. |
+| Update check blocked every command | **Fixed** | The per-command network probe is opt-in via `GITZ_CHECK_FOR_UPDATES`, TTY-gated, and writes only to stderr. |
 
 ### New Feature (SDD/TDD)
 
@@ -75,6 +81,8 @@ Remote operations via SSH and HTTP:
 |---------|----------|-------------|
 | Shard-aware alternates | High | `Alternates.resolve()` now falls back to a **sharded** object layout (`shard_NN/XX/YYYY`) when the loose path is missing. Shared-object clones (`gitz clone --shared`) now work regardless of whether the source uses the loose or shard storage backend. |
 | Shared-clone simulation tests | High | `src/tests/integration/shared_clone.zig` simulates the full `--shared` clone with both loose and shard sources, verifies dedup (clone object store stays empty), and byte-for-byte checkout — including large >100KB blobs. |
+| Cached alternates reader | High | `Alternates.Reader` parses alternate paths and shard names once per checkout, then resolves `sha[0] % shard_count` directly. This removes repeated file/directory scans for every object. |
+| Shard-count reconfiguration | High | Existing objects remain readable after `storage.shards` changes via a fallback scan of historical `shard_NN` directories. |
 
 ### Missing Features
 
@@ -174,7 +182,7 @@ src/
 
 ### Test Coverage
 
-- 124 unit + integration tests (0 leaks)
+- 147 unit + integration tests (0 leaks)
 - Shared-object clone simulation (`--test-filter "shared"`)
 - Basic Git compatibility tests
 

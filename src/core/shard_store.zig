@@ -68,12 +68,46 @@ pub const ShardStore = struct {
         });
     }
 
+    /// Find an object in any historical shard directory. This is a fallback
+    /// for repositories whose `storage.shards` setting changed after objects
+    /// were written; the fast path above still handles the current layout.
+    fn findInAnyShard(self: ShardStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !?[]u8 {
+        const objects_dir = try std.fmt.allocPrint(allocator, "{s}/objects", .{self.git_dir});
+        defer allocator.free(objects_dir);
+
+        var dir = std.Io.Dir.cwd().openDir(io, objects_dir, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
+        const hex = Sha1.hex(sha);
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "shard_")) continue;
+            const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}", .{
+                objects_dir,
+                entry.name,
+                hex[0..2],
+                hex[2..40],
+            });
+            if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| {
+                return candidate;
+            } else |_| {
+                allocator.free(candidate);
+            }
+        }
+        return null;
+    }
+
     pub fn read(self: ShardStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !GitObject {
         const full_path = try self.allocObjectPath(allocator, sha);
         defer allocator.free(full_path);
 
-        // Read the whole file with a dynamic buffer so large objects are supported.
-        const raw = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited) catch return error.ObjectNotFound;
+        // Read the whole file with a dynamic buffer so large objects are
+        // supported. If the configured shard count changed, transparently
+        // fall back to the historical shard directory.
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited) catch blk: {
+            const legacy_path = (try self.findInAnyShard(allocator, io, sha)) orelse return error.ObjectNotFound;
+            defer allocator.free(legacy_path);
+            break :blk std.Io.Dir.cwd().readFileAlloc(io, legacy_path, allocator, .unlimited) catch return error.ObjectNotFound;
+        };
         defer allocator.free(raw);
 
         // Try to decompress (git objects are zlib-compressed)
@@ -100,18 +134,20 @@ pub const ShardStore = struct {
     }
 
     pub fn write(self: ShardStore, allocator: std.mem.Allocator, io: std.Io, obj: GitObject) ![20]u8 {
-        const sha = try obj.hash(allocator);
+        // Serialize once and reuse the buffer for hashing and persistence.
         const serialized = try obj.serialize(allocator);
         defer allocator.free(serialized);
-
-        try self.writeRaw(allocator, io, obj.typeEnum(), serialized);
+        const sha = Sha1.hash(serialized);
+        try self.writeSerialized(allocator, io, sha, serialized);
         return sha;
     }
 
     pub fn writeRaw(self: ShardStore, allocator: std.mem.Allocator, io: std.Io, obj_type: ObjectType, data: []const u8) !void {
         _ = obj_type;
+        try self.writeSerialized(allocator, io, Sha1.hash(data), data);
+    }
 
-        const sha = Sha1.hash(data);
+    fn writeSerialized(self: ShardStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8, data: []const u8) !void {
         const hex = Sha1.hex(sha);
         const shard_idx = self.shardIndex(sha);
 
@@ -144,14 +180,42 @@ pub const ShardStore = struct {
     pub fn exists(self: ShardStore, io: std.Io, sha: [20]u8) bool {
         var path_buf: [128]u8 = undefined;
         const full_path = self.objectPath(sha, &path_buf) catch return false;
-        std.Io.Dir.cwd().access(io, full_path, .{}) catch return false;
-        return true;
+        if (std.Io.Dir.cwd().access(io, full_path, .{})) |_| {
+            return true;
+        } else |_| {}
+        return self.existsInAnyShard(io, sha);
+    }
+
+    fn existsInAnyShard(self: ShardStore, io: std.Io, sha: [20]u8) bool {
+        var objects_buf: [512]u8 = undefined;
+        const objects_dir = std.fmt.bufPrint(&objects_buf, "{s}/objects", .{self.git_dir}) catch return false;
+        var dir = std.Io.Dir.cwd().openDir(io, objects_dir, .{ .iterate = true }) catch return false;
+        defer dir.close(io);
+        const hex = Sha1.hex(sha);
+        var candidate_buf: [640]u8 = undefined;
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "shard_")) continue;
+            const candidate = std.fmt.bufPrint(&candidate_buf, "{s}/{s}/{s}/{s}", .{
+                objects_dir,
+                entry.name,
+                hex[0..2],
+                hex[2..40],
+            }) catch continue;
+            if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| return true else |_| {}
+        }
+        return false;
     }
 
     pub fn delete(self: ShardStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !void {
         const full_path = try self.allocObjectPath(allocator, sha);
         defer allocator.free(full_path);
-        std.Io.Dir.cwd().deleteFile(io, full_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, full_path) catch {
+            if (try self.findInAnyShard(allocator, io, sha)) |legacy_path| {
+                defer allocator.free(legacy_path);
+                std.Io.Dir.cwd().deleteFile(io, legacy_path) catch {};
+            }
+        };
     }
 };
 
@@ -184,6 +248,26 @@ test "shard store write/read blob roundtrip" {
     // Delete it
     try store.delete(allocator, io, sha);
     try std.testing.expect(!store.exists(io, sha));
+}
+
+test "shard store reads objects after shard count changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp_dir = "/tmp/gitz-test-shard-reconfig";
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+
+    const old_store = ShardStore.init(tmp_dir, 4);
+    const payload = "object with a legacy shard location";
+    const obj = GitObject{ .blob = .{ .content = payload } };
+    const sha = try old_store.write(allocator, io, obj);
+    try std.testing.expect(sha[0] % 4 != sha[0] % 8);
+
+    const new_store = ShardStore.init(tmp_dir, 8);
+    try std.testing.expect(new_store.exists(io, sha));
+    const read_obj = try new_store.read(allocator, io, sha);
+    defer allocator.free(read_obj.blob.content);
+    try std.testing.expectEqualStrings(payload, read_obj.blob.content);
 }
 
 test "shard store distribution — objects go to different shards" {

@@ -155,7 +155,7 @@ gitz config storage.shards 16
 ## Testing
 
 ```bash
-zig build test                    # Run all tests (124 tests, 0 leaks)
+zig build test                    # Run all tests (147 tests, 0 leaks)
 zig build test -- --test-filter "sha1"  # Specific test
 zig build test -- --test-filter "shared"  # Shared-object clone simulation
 ```

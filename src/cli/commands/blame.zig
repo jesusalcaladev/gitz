@@ -146,8 +146,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // Print blame output
     for (blame_result) |blame| {
         const hex = Sha1.hex(blame.sha);
-        const ts = blame.timestamp;
-        const year = @divFloor(ts + 946684800, 31557600) + 1970;
+        const year = calendarYear(blame.timestamp);
         try io.print("{s} ({s} {d:4}) {s}\n", .{
             hex[0..7],
             blame.author,
@@ -155,6 +154,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             blame.content,
         });
     }
+}
+
+fn calendarYear(timestamp: i64) i32 {
+    if (timestamp <= 0) return 1970;
+    const seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    return @intCast(seconds.getEpochDay().calculateYearDay().year);
 }
 
 /// Read a file's content from a tree object
@@ -195,4 +200,9 @@ fn readFileFromTree(allocator: std.mem.Allocator, io: std.Io, store: storage_mod
     }
 
     return null;
+}
+
+test "blame calendar year uses the Unix epoch" {
+    try std.testing.expectEqual(@as(i32, 1970), calendarYear(0));
+    try std.testing.expectEqual(@as(i32, 2021), calendarYear(1_622_924_906));
 }

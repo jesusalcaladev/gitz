@@ -13,6 +13,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
+    defer idx.deinit(allocator);
+
+    var pathspec_failed = false;
 
     // Load .gitignore rules
     var ignore_stack = ignore_mod.IgnoreStack.init(allocator);
@@ -29,12 +32,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             }
             addFile(allocator, git_dir, &idx, path, io) catch {
                 try io.eprint("fatal: pathspec '{s}' did not match any files\n", .{path});
+                pathspec_failed = true;
             };
         }
     }
 
     try idx.writeToFile(git_dir, allocator, io.io);
-    idx.deinit(allocator);
+    if (pathspec_failed) std.process.exit(128);
 }
 
 fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.Index, path: []const u8, io: Io) !void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const safety = @import("../util/clone_safety.zig");
 const Sha1 = @import("../core/sha1.zig").Sha1;
 const object = @import("../core/object.zig");
 const refs_mod = @import("../core/refs.zig");
@@ -102,7 +103,7 @@ pub const HttpTransport = struct {
             var pkt_buf: [132]u8 = undefined;
             const pkt_len = 4 + line.len;
             const pkt_hex = std.fmt.bytesToHex([2]u8{ @intCast(pkt_len >> 8), @intCast(pkt_len & 0xff) }, .lower);
-            const pkt = try std.fmt.bufPrint(&pkt_buf, "{s}{s}", .{&pkt_hex, line});
+            const pkt = try std.fmt.bufPrint(&pkt_buf, "{s}{s}", .{ &pkt_hex, line });
             try body.appendSlice(self.allocator, pkt);
         }
 
@@ -501,22 +502,24 @@ pub const HttpTransport = struct {
 
 /// Clone a repository via HTTP
 pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8) !void {
+    try safety.ensureEmptyDestination(io, dest);
+
     // Create destination directory structure
-    std.Io.Dir.cwd().createDirPath(io, dest) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dest);
 
     // Create .gitz structure
     var buf: [512]u8 = undefined;
     const gitz_dir = try std.fmt.bufPrint(&buf, "{s}/.gitz", .{dest});
-    std.Io.Dir.cwd().createDirPath(io, gitz_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, gitz_dir);
 
     const refs_dir = try std.fmt.bufPrint(&buf, "{s}/.gitz/refs/heads", .{dest});
-    std.Io.Dir.cwd().createDirPath(io, refs_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, refs_dir);
 
     const tags_dir = try std.fmt.bufPrint(&buf, "{s}/.gitz/refs/tags", .{dest});
-    std.Io.Dir.cwd().createDirPath(io, tags_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, tags_dir);
 
     const objects_dir = try std.fmt.bufPrint(&buf, "{s}/.gitz/objects", .{dest});
-    std.Io.Dir.cwd().createDirPath(io, objects_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, objects_dir);
 
     // Write HEAD
     const head_path = try std.fmt.bufPrint(&buf, "{s}/.gitz/HEAD", .{dest});
@@ -574,7 +577,7 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
             defer allocator.free(remote_ref);
             const remote_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz/refs/remotes/origin", .{dest});
             defer allocator.free(remote_dir);
-            std.Io.Dir.cwd().createDirPath(io, remote_dir) catch {};
+            try std.Io.Dir.cwd().createDirPath(io, remote_dir);
             try refs_manager.write(allocator, io, remote_ref, ref.sha);
         } else if (std.mem.startsWith(u8, ref.name, "refs/tags/")) {
             try refs_manager.write(allocator, io, ref.name, ref.sha);
@@ -597,7 +600,7 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
 
     // Checkout files
     const checkout_ref = default_branch orelse refs[0].name;
-    const checkout_sha = refs_manager.read(allocator, io, checkout_ref) catch return;
+    const checkout_sha = try refs_manager.read(allocator, io, checkout_ref);
     try checkoutFiles(allocator, io, fetch_git_dir, checkout_sha, dest);
 
     // Print success message via stdout
@@ -611,37 +614,86 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
 fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io, git_dir);
 
-    // Read commit
-    const obj = store.read(allocator, io, commit_sha) catch return;
-    const commit = switch (obj) {
+    const commit_obj = try store.read(allocator, io, commit_sha);
+    const commit = switch (commit_obj) {
         .commit => |c| c,
-        else => return,
+        else => {
+            commit_obj.deinit(allocator);
+            return error.ExpectedCommit;
+        },
     };
+    defer commit_obj.deinit(allocator);
 
-    // Read tree
-    const tree_obj = store.read(allocator, io, commit.tree) catch return;
+    const tree_obj = try store.read(allocator, io, commit.tree);
     const tree = switch (tree_obj) {
         .tree => |t| t,
-        else => return,
+        else => {
+            tree_obj.deinit(allocator);
+            return error.ExpectedTree;
+        },
     };
+    defer tree_obj.deinit(allocator);
 
     for (tree.entries) |entry| {
-        const blob_obj = store.read(allocator, io, entry.sha) catch continue;
-        const content = switch (blob_obj) {
-            .blob => |b| b.content,
-            else => continue,
-        };
-
-        // Ensure parent directory exists
-        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest, entry.name });
-        defer allocator.free(file_path);
-
-        if (std.fs.path.dirname(file_path)) |dir| {
-            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-        }
-
-        var file = std.Io.Dir.cwd().createFile(io, file_path, .{}) catch continue;
-        defer file.close(io);
-        try std.Io.File.writeStreamingAll(file, io, content);
+        try checkoutTreeEntry(allocator, io, &store, entry, dest);
     }
+}
+
+fn checkoutTreeEntry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: *const storage_mod.StorageBackend,
+    entry: object.TreeEntry,
+    base: []const u8,
+) !void {
+    try safety.validateTreeEntryName(entry.name);
+
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, entry.name });
+    defer allocator.free(file_path);
+    if (std.Io.Dir.cwd().access(io, file_path, .{})) |_| {
+        return error.CheckoutPathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const obj = try store.read(allocator, io, entry.sha);
+    defer obj.deinit(allocator);
+
+    switch (obj) {
+        .blob => |b| {
+            if (std.fs.path.dirname(file_path)) |dir| {
+                try std.Io.Dir.cwd().createDirPath(io, dir);
+            }
+            var file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .exclusive = true });
+            defer file.close(io);
+            try std.Io.File.writeStreamingAll(file, io, b.content);
+        },
+        .tree => |t| {
+            try std.Io.Dir.cwd().createDirPath(io, file_path);
+            for (t.entries) |sub_entry| {
+                try checkoutTreeEntry(allocator, io, store, sub_entry, file_path);
+            }
+        },
+        else => return error.ExpectedBlobOrTree,
+    }
+}
+
+test "legacy HTTP clone checkout rejects traversal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const dest = "/tmp/gitz-test-http-clone-safety";
+    try std.Io.Dir.cwd().createDirPath(io, dest);
+    defer std.Io.Dir.cwd().deleteTree(io, dest) catch {};
+
+    const store = storage_mod.StorageBackend.looseBackend(dest);
+    const entry = object.TreeEntry{
+        .mode = 0o100644,
+        .name = "../../victim.txt",
+        .sha = Sha1.hash("missing"),
+    };
+    try std.testing.expectError(
+        error.UnsafeCheckoutEntryName,
+        checkoutTreeEntry(allocator, io, &store, entry, dest),
+    );
 }

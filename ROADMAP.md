@@ -184,7 +184,7 @@ gitz lfs track "*.psd"       Track large files by pattern
 | 36 | Documentation | Done -- README + ROADMAP + STATUS |
 | 37 | Error Messages | Partial -- basic |
 | 38 | Dogfooding | Done -- GitZ versions itself |
-| 39 | Final Tests | Partial -- 124 tests, 0 leaks |
+| 39 | Final Tests | Partial -- 147 tests, 0 leaks |
 | 40 | Benchmark Suite | Done -- benchmarks/bench.sh |
 | 41 | Release v1.0 | **Missing** |
 | 42 | Auto-update system | Done -- `gitz update` command |

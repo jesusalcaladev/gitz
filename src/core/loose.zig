@@ -63,22 +63,26 @@ pub const LooseStore = struct {
     }
 
     pub fn write(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, obj: GitObject) ![20]u8 {
-        const sha = try obj.hash(allocator);
+        // Serialize once and hash the same buffer. The old path serialized the
+        // object twice (once in hash() and once for storage), doubling the
+        // allocation/copy cost for every write.
         const serialized = try obj.serialize(allocator);
         defer allocator.free(serialized);
-
-        try self.writeRaw(allocator, io, obj.typeEnum(), serialized);
+        const sha = Sha1.hash(serialized);
+        try self.writeSerialized(allocator, io, sha, serialized);
         return sha;
     }
 
     pub fn writeRaw(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, obj_type: ObjectType, data: []const u8) !void {
         _ = obj_type;
+        try self.writeSerialized(allocator, io, Sha1.hash(data), data);
+    }
 
+    fn writeSerialized(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8, data: []const u8) !void {
         const objects_dir = try std.fmt.allocPrint(allocator, "{s}/objects", .{self.git_dir});
         defer allocator.free(objects_dir);
         try std.Io.Dir.cwd().createDirPath(io, objects_dir);
 
-        const sha = Sha1.hash(data);
         const hex = Sha1.hex(sha);
 
         const sub_path = try std.fmt.allocPrint(allocator, "{s}/objects/{s}", .{ self.git_dir, hex[0..2] });

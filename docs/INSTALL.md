@@ -44,6 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/gitz/main/install.sh
 | `INSTALL_DIR` | Same as `--dir` (default: `~/.local/bin`) |
 | `GITZ_VERSION` | Install a specific release instead of the latest |
 | `NO_COLOR` | Disable colored output |
+| `GITZ_CHECK_FOR_UPDATES` | Set to `1`/`true` to opt into the interactive update notice (off by default) |
 
 ## Pre-built Binaries
 

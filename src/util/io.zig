@@ -5,25 +5,94 @@ const std = @import("std");
 pub const Io = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
+    color: bool,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator) Io {
-        return .{ .io = io, .allocator = allocator };
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) Io {
+        const no_color = std.process.Environ.contains(environ, std.heap.page_allocator, "NO_COLOR") catch false;
+        return .{
+            .io = io,
+            .allocator = allocator,
+            .color = !no_color,
+        };
     }
 
     // ── Output ───────────────────────────────────────────────────────
 
     pub fn print(self: Io, comptime fmt: []const u8, args: anytype) !void {
         var buf: [8192]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        var stdout = std.Io.File.stdout();
-        try stdout.writeStreamingAll(self.io, msg);
+        var owned_msg: ?[]u8 = null;
+        defer if (owned_msg) |msg| self.allocator.free(msg);
+
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch |err| switch (err) {
+            error.NoSpaceLeft => blk: {
+                owned_msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+                break :blk owned_msg.?;
+            },
+        };
+
+        try self.writeOutput(std.Io.File.stdout(), msg);
     }
 
     pub fn eprint(self: Io, comptime fmt: []const u8, args: anytype) !void {
         var buf: [8192]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        var stderr = std.Io.File.stderr();
-        try stderr.writeStreamingAll(self.io, msg);
+        var owned_msg: ?[]u8 = null;
+        defer if (owned_msg) |msg| self.allocator.free(msg);
+
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch |err| switch (err) {
+            error.NoSpaceLeft => blk: {
+                owned_msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+                break :blk owned_msg.?;
+            },
+        };
+
+        try self.writeOutput(std.Io.File.stderr(), msg);
+    }
+
+    fn writeOutput(self: Io, file: std.Io.File, msg: []const u8) !void {
+        if (self.color) return file.writeStreamingAll(self.io, msg);
+
+        const plain = try stripAnsi(self.allocator, msg);
+        defer self.allocator.free(plain);
+        try file.writeStreamingAll(self.io, plain);
+    }
+
+    fn stripAnsi(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+        var plain_len: usize = 0;
+        var i: usize = 0;
+        while (i < bytes.len) {
+            if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '[') {
+                i += 2;
+                while (i < bytes.len) : (i += 1) {
+                    if (bytes[i] >= 0x40 and bytes[i] <= 0x7e) {
+                        i += 1;
+                        break;
+                    }
+                }
+            } else {
+                plain_len += 1;
+                i += 1;
+            }
+        }
+
+        const plain = try allocator.alloc(u8, plain_len);
+        var out: usize = 0;
+        i = 0;
+        while (i < bytes.len) {
+            if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '[') {
+                i += 2;
+                while (i < bytes.len) : (i += 1) {
+                    if (bytes[i] >= 0x40 and bytes[i] <= 0x7e) {
+                        i += 1;
+                        break;
+                    }
+                }
+            } else {
+                plain[out] = bytes[i];
+                out += 1;
+                i += 1;
+            }
+        }
+        return plain;
     }
 
     // ── Filesystem ───────────────────────────────────────────────────
@@ -64,3 +133,9 @@ pub const Io = struct {
         });
     }
 };
+
+test "NO_COLOR strips terminal control sequences" {
+    const plain = try Io.stripAnsi(std.testing.allocator, "\x1b[1;31mred\x1b[0m plain\x1b[2K");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("red plain", plain);
+}

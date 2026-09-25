@@ -9,21 +9,27 @@ pub fn main(init: std.process.Init) !void {
     const allocator = arena.allocator();
 
     const args = try init.minimal.args.toSlice(allocator);
-    const io = Io.init(init.io, allocator);
+    const io = Io.init(init.io, allocator, init.minimal.environ);
 
     if (args.len < 2) {
         try cli.printHelp(io);
-        return;
+        std.process.exit(cli.Exit.usage);
     }
 
     const command = args[1];
     try cli.dispatch(allocator, command, args[2..], io);
 
-    // Check for updates after command execution (non-blocking, silent failures)
-    // Skip if user is already running update command or if no internet
-    if (!std.mem.eql(u8, command, "update") and !std.mem.eql(u8, command, "--version") and !std.mem.eql(u8, command, "-v")) {
+    // Network checks are explicit opt-in. The former unconditional curl made
+    // every local command block and could contaminate redirected output.
+    if (!std.mem.eql(u8, command, "update") and updateCheckRequested(allocator, init.minimal.environ)) {
         update_cmd.checkForUpdates(allocator, io);
     }
+}
+
+fn updateCheckRequested(allocator: std.mem.Allocator, environ: std.process.Environ) bool {
+    const enabled = environ.getAlloc(allocator, "GITZ_CHECK_FOR_UPDATES") catch return false;
+    defer allocator.free(enabled);
+    return std.mem.eql(u8, enabled, "1") or std.mem.eql(u8, enabled, "true");
 }
 
 comptime {

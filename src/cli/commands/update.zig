@@ -295,8 +295,11 @@ fn downloadAndInstall(
     }) catch {};
 }
 
-/// Check for updates and print a message if available (non-blocking)
+/// Check for updates and print a courtesy notice to an interactive stderr.
+/// The hot command path calls this only when explicitly enabled by the user.
 pub fn checkForUpdates(allocator: std.mem.Allocator, io: Io) void {
+    if (!(std.Io.File.stderr().isTty(io.io) catch return)) return;
+
     const latest_version = getLatestVersion(allocator, io) catch return;
     defer if (latest_version) |v| allocator.free(v);
 
@@ -306,7 +309,7 @@ pub fn checkForUpdates(allocator: std.mem.Allocator, io: Io) void {
     const current = VERSION;
 
     if (!std.mem.eql(u8, current, latest)) {
-        io.print("\x1b[33mNew version available: {s} -> {s}\x1b[0m\n", .{ current, latest }) catch {};
-        io.print("\x1b[33m  Run 'gitz update' to install\x1b[0m\n\n", .{}) catch {};
+        io.eprint("New version available: {s} -> {s}\n", .{ current, latest }) catch {};
+        io.eprint("Run 'gitz update' to install.\n\n", .{}) catch {};
     }
 }

@@ -3,6 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
+const alternates_mod = @import("../../core/alternates.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
 const ignore_mod = @import("../../core/ignore.zig");
@@ -42,24 +43,28 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    var alts = try alternates_mod.Reader.init(allocator, io.io, git_dir);
+    defer alts.deinit();
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
     if (head_sha) |sha| {
-        const commit_obj = store.read(allocator, io.io, sha) catch null;
+        const commit_obj = readWithAlternates(allocator, io.io, &store, &alts, sha) catch null;
         if (commit_obj) |obj| {
+            defer obj.deinit(allocator);
             const commit = switch (obj) {
                 .commit => |c| c,
                 else => null,
             };
             if (commit) |c| {
-                const tree_obj = store.read(allocator, io.io, c.tree) catch null;
+                const tree_obj = readWithAlternates(allocator, io.io, &store, &alts, c.tree) catch null;
                 if (tree_obj) |tobj| {
+                    defer tobj.deinit(allocator);
                     const tree = switch (tobj) {
                         .tree => |t| t,
                         else => null,
                     };
                     if (tree) |t| {
-                        try flattenTreeSha(store, allocator, io.io, t, "", &head_shas);
+                        try flattenTreeSha(&store, &alts, allocator, io.io, t, "", &head_shas);
                     }
                 }
             }
@@ -257,8 +262,20 @@ fn findWorkingFile(files: []const WorkingFile, name: []const u8) ?WorkingFile {
     return null;
 }
 
+fn readWithAlternates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: *const storage_mod.StorageBackend,
+    alts: *const alternates_mod.Reader,
+    sha: [20]u8,
+) !object.GitObject {
+    return store.read(allocator, io, sha) catch {
+        return alts.readObject(allocator, io, sha);
+    };
+}
+
 /// Recursively flatten tree into SHA map with full paths
-fn flattenTreeSha(store: storage_mod.StorageBackend, allocator: std.mem.Allocator, io: std.Io, tree: object.Tree, prefix: []const u8, map: *std.StringHashMap([20]u8)) !void {
+fn flattenTreeSha(store: *const storage_mod.StorageBackend, alts: *const alternates_mod.Reader, allocator: std.mem.Allocator, io: std.Io, tree: object.Tree, prefix: []const u8, map: *std.StringHashMap([20]u8)) !void {
     for (tree.entries) |entry| {
         const full_path = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
@@ -266,10 +283,11 @@ fn flattenTreeSha(store: storage_mod.StorageBackend, allocator: std.mem.Allocato
             try allocator.dupe(u8, entry.name);
 
         if (entry.mode == 0o040000) {
-            const sub_obj = store.read(allocator, io, entry.sha) catch {
+            const sub_obj = readWithAlternates(allocator, io, store, alts, entry.sha) catch {
                 allocator.free(full_path);
                 continue;
             };
+            defer sub_obj.deinit(allocator);
             const sub_tree = switch (sub_obj) {
                 .tree => |t| t,
                 else => {
@@ -277,7 +295,7 @@ fn flattenTreeSha(store: storage_mod.StorageBackend, allocator: std.mem.Allocato
                     continue;
                 },
             };
-            try flattenTreeSha(store, allocator, io, sub_tree, full_path, map);
+            try flattenTreeSha(store, alts, allocator, io, sub_tree, full_path, map);
             allocator.free(full_path);
         } else {
             try map.put(full_path, entry.sha);

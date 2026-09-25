@@ -3,6 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
+const alternates_mod = @import("../../core/alternates.zig");
 const refs_mod = @import("../../core/refs.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
@@ -53,9 +54,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
+    var alts = try alternates_mod.Reader.init(allocator, io.io, git_dir);
+    defer alts.deinit();
+
     // Show a specific commit
     if (show_commit) |sha_str| {
-        try showSpecificCommit(allocator, git_dir, sha_str, io);
+        try showSpecificCommit(allocator, git_dir, sha_str, io, &alts);
         return;
     }
 
@@ -82,7 +86,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             var current_sha = branch_sha;
 
             while (shown < count) {
-                const obj = store.read(allocator, io.io, current_sha) catch break;
+                const obj = readWithAlternates(allocator, io.io, &store, &alts, current_sha) catch break;
+                defer obj.deinit(allocator);
                 const commit = switch (obj) {
                     .commit => |c| c,
                     else => break,
@@ -129,7 +134,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     var current_sha = head_sha;
 
     while (shown < count) {
-        const obj = store.read(allocator, io.io, current_sha) catch break;
+        const obj = readWithAlternates(allocator, io.io, &store, &alts, current_sha) catch break;
+        defer obj.deinit(allocator);
         const commit = switch (obj) {
             .commit => |c| c,
             else => break,
@@ -158,7 +164,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
         // File filter: check if file was modified in this commit
         if (file_path) |fp| {
-            if (!commitTouchesFile(allocator, io.io, store, commit, fp)) {
+            if (!commitTouchesFile(allocator, io.io, store, &alts, commit, fp)) {
                 if (commit.parents.len > 0) {
                     current_sha = commit.parents[0];
                 } else break;
@@ -210,14 +216,26 @@ fn printCommit(
     }
 }
 
-fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str: []const u8, io: Io) !void {
+fn readWithAlternates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: *const storage_mod.StorageBackend,
+    alts: *const alternates_mod.Reader,
+    sha: [20]u8,
+) !object.GitObject {
+    return store.read(allocator, io, sha) catch {
+        return alts.readObject(allocator, io, sha);
+    };
+}
+
+fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str: []const u8, io: Io, alts: *const alternates_mod.Reader) !void {
     const sha = Sha1.fromHex(sha_str) catch {
         try io.eprint("fatal: invalid commit SHA '{s}'\n", .{sha_str});
         return;
     };
 
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const obj = store.read(allocator, io.io, sha) catch {
+    const obj = readWithAlternates(allocator, io.io, &store, alts, sha) catch {
         try io.eprint("fatal: not a commit object '{s}'\n", .{sha_str});
         return;
     };
@@ -226,9 +244,11 @@ fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str
         .commit => |c| c,
         else => {
             try io.eprint("fatal: object '{s}' is not a commit\n", .{sha_str});
+            obj.deinit(allocator);
             return;
         },
     };
+    defer obj.deinit(allocator);
 
     try printCommit(io, sha, commit, false, false);
 
@@ -243,11 +263,13 @@ fn commitTouchesFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     store: storage_mod.StorageBackend,
+    alts: *const alternates_mod.Reader,
     commit: object.Commit,
     file_path: []const u8,
 ) bool {
     // Get the current commit's tree
-    const tree_obj = store.read(allocator, io, commit.tree) catch return false;
+    const tree_obj = readWithAlternates(allocator, io, &store, alts, commit.tree) catch return false;
+    defer tree_obj.deinit(allocator);
     const tree = switch (tree_obj) {
         .tree => |t| t,
         else => return false,
@@ -264,12 +286,14 @@ fn commitTouchesFile(
 
     // Check parent tree
     if (commit.parents.len > 0) {
-        const parent_obj = store.read(allocator, io, commit.parents[0]) catch return in_current;
+        const parent_obj = readWithAlternates(allocator, io, &store, alts, commit.parents[0]) catch return in_current;
+        defer parent_obj.deinit(allocator);
         const parent_commit = switch (parent_obj) {
             .commit => |c| c,
             else => return in_current,
         };
-        const parent_tree = store.read(allocator, io, parent_commit.tree) catch return in_current;
+        const parent_tree = readWithAlternates(allocator, io, &store, alts, parent_commit.tree) catch return in_current;
+        defer parent_tree.deinit(allocator);
         const ptree = switch (parent_tree) {
             .tree => |t| t,
             else => return in_current,

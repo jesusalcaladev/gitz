@@ -59,23 +59,25 @@ pub const MergeEngine = struct {
         base: ?[]const u8,
         ours: []const u8,
         theirs: []const u8,
-    ) MergeFileResult {
-        _ = self;
+    ) !MergeFileResult {
         // If no base, it's a new file from both sides
         if (base == null) {
             if (std.mem.eql(u8, ours, theirs)) {
-                return .{ .merged = ours, .conflicts = &.{} };
+                return .{
+                    .merged = ours,
+                    .conflicts = &.{},
+                    .allocator = self.allocator,
+                };
             }
             return .{
                 .merged = null,
-                .conflicts = &.{
-                    Conflict{
-                        .path = "",
-                        .ours = ours,
-                        .theirs = theirs,
-                        .base = null,
-                    },
-                },
+                .conflicts = try self.allocator.dupe(Conflict, &.{.{
+                    .path = "",
+                    .ours = ours,
+                    .theirs = theirs,
+                    .base = null,
+                }}),
+                .allocator = self.allocator,
             };
         }
 
@@ -83,30 +85,44 @@ pub const MergeEngine = struct {
 
         // If ours equals base, take theirs (theirs changed)
         if (std.mem.eql(u8, ours, base_content)) {
-            return .{ .merged = theirs, .conflicts = &.{} };
+            return .{
+                .merged = theirs,
+                .conflicts = &.{},
+                .allocator = self.allocator,
+            };
         }
 
         // If theirs equals base, take ours (we changed)
         if (std.mem.eql(u8, theirs, base_content)) {
-            return .{ .merged = ours, .conflicts = &.{} };
+            return .{
+                .merged = ours,
+                .conflicts = &.{},
+                .allocator = self.allocator,
+            };
         }
 
         // If both changed but to the same content
         if (std.mem.eql(u8, ours, theirs)) {
-            return .{ .merged = ours, .conflicts = &.{} };
+            return .{
+                .merged = ours,
+                .conflicts = &.{},
+                .allocator = self.allocator,
+            };
         }
 
-        // Both changed differently → conflict
+        // Both changed differently → conflict. The conflict must be owned: a
+        // pointer to an array literal containing runtime values may point at
+        // this function's stack frame after it returns (and fails in
+        // ReleaseFast builds).
         return .{
             .merged = null,
-            .conflicts = &.{
-                Conflict{
-                    .path = "",
-                    .ours = ours,
-                    .theirs = theirs,
-                    .base = base_content,
-                },
-            },
+            .conflicts = try self.allocator.dupe(Conflict, &.{.{
+                .path = "",
+                .ours = ours,
+                .theirs = theirs,
+                .base = base_content,
+            }}),
+            .allocator = self.allocator,
         };
     }
 
@@ -130,6 +146,13 @@ pub const MergeEngine = struct {
 pub const MergeFileResult = struct {
     merged: ?[]const u8,
     conflicts: []const Conflict,
+    allocator: Allocator,
+
+    pub fn deinit(self: MergeFileResult) void {
+        if (self.conflicts.len != 0) {
+            self.allocator.free(@constCast(self.conflicts));
+        }
+    }
 };
 
 // ============================================================================
@@ -167,7 +190,8 @@ test "merge base not found" {
 
 test "merge file - ours changed" {
     const engine = MergeEngine.init(testing.allocator);
-    const result = engine.mergeFileContents("base", "ours", "base");
+    const result = try engine.mergeFileContents("base", "ours", "base");
+    defer result.deinit();
     try testing.expect(result.conflicts.len == 0);
     try testing.expect(result.merged != null);
     try testing.expectEqualStrings("ours", result.merged.?);
@@ -175,7 +199,8 @@ test "merge file - ours changed" {
 
 test "merge file - theirs changed" {
     const engine = MergeEngine.init(testing.allocator);
-    const result = engine.mergeFileContents("base", "base", "theirs");
+    const result = try engine.mergeFileContents("base", "base", "theirs");
+    defer result.deinit();
     try testing.expect(result.conflicts.len == 0);
     try testing.expect(result.merged != null);
     try testing.expectEqualStrings("theirs", result.merged.?);
@@ -183,7 +208,8 @@ test "merge file - theirs changed" {
 
 test "merge file - same change" {
     const engine = MergeEngine.init(testing.allocator);
-    const result = engine.mergeFileContents("base", "same", "same");
+    const result = try engine.mergeFileContents("base", "same", "same");
+    defer result.deinit();
     try testing.expect(result.conflicts.len == 0);
     try testing.expect(result.merged != null);
     try testing.expectEqualStrings("same", result.merged.?);
@@ -191,7 +217,8 @@ test "merge file - same change" {
 
 test "merge file - conflict" {
     const engine = MergeEngine.init(testing.allocator);
-    const result = engine.mergeFileContents("base", "ours", "theirs");
+    const result = try engine.mergeFileContents("base", "ours", "theirs");
+    defer result.deinit();
     try testing.expect(result.conflicts.len == 1);
     try testing.expect(result.merged == null);
     try testing.expectEqualStrings("ours", result.conflicts[0].ours.?);
@@ -200,14 +227,16 @@ test "merge file - conflict" {
 
 test "merge file - no base" {
     const engine = MergeEngine.init(testing.allocator);
-    const result = engine.mergeFileContents(null, "content", "content");
+    const result = try engine.mergeFileContents(null, "content", "content");
+    defer result.deinit();
     try testing.expect(result.conflicts.len == 0);
     try testing.expectEqualStrings("content", result.merged.?);
 }
 
 test "merge file - no base conflict" {
     const engine = MergeEngine.init(testing.allocator);
-    const result = engine.mergeFileContents(null, "ours", "theirs");
+    const result = try engine.mergeFileContents(null, "ours", "theirs");
+    defer result.deinit();
     try testing.expect(result.conflicts.len == 1);
     try testing.expect(result.merged == null);
 }

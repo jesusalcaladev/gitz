@@ -162,6 +162,132 @@ pub const Alternates = struct {
     }
 };
 
+/// A reusable resolver for a clone checkout. The original Alternates API
+/// intentionally remains stateless for callers that resolve a single object;
+/// this reader parses the alternates file and shard directory names once, then
+/// reuses that layout for every object in a clone.
+pub const Reader = struct {
+    const AlternateInfo = struct {
+        path: []const u8,
+        shards: [][]const u8,
+        shard_count: u16,
+    };
+
+    allocator: std.mem.Allocator,
+    paths: [][]const u8,
+    alternates: []AlternateInfo,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8) !Reader {
+        const base = Alternates.init(git_dir);
+        const paths = try base.read(allocator, io);
+        var alternates: std.ArrayList(AlternateInfo) = .empty;
+        errdefer {
+            for (alternates.items) |info| {
+                for (info.shards) |shard| allocator.free(shard);
+                allocator.free(info.shards);
+            }
+            alternates.deinit(allocator);
+            for (paths) |path| allocator.free(path);
+            if (paths.len != 0) allocator.free(paths);
+        }
+
+        for (paths) |path| {
+            var shards: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (shards.items) |shard| allocator.free(shard);
+                shards.deinit(allocator);
+            }
+
+            var max_shard: u16 = 0;
+            var have_shard = false;
+            if (std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true })) |opened| {
+                var dir = opened;
+                defer dir.close(io);
+                var iter = dir.iterate();
+                while (iter.next(io) catch null) |entry| {
+                    if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "shard_")) continue;
+                    const owned = try allocator.dupe(u8, entry.name);
+                    try shards.append(allocator, owned);
+                    if (std.fmt.parseInt(u16, entry.name[6..], 10) catch null) |index| {
+                        if (!have_shard or index > max_shard) max_shard = index;
+                        have_shard = true;
+                    }
+                }
+            } else |_| {}
+
+            const owned_shards = try shards.toOwnedSlice(allocator);
+            errdefer allocator.free(owned_shards);
+            try alternates.append(allocator, .{
+                .path = path,
+                .shards = owned_shards,
+                .shard_count = if (have_shard) max_shard + 1 else 0,
+            });
+        }
+
+        return .{
+            .allocator = allocator,
+            .paths = paths,
+            .alternates = try alternates.toOwnedSlice(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Reader) void {
+        for (self.alternates) |info| {
+            for (info.shards) |shard| self.allocator.free(shard);
+            self.allocator.free(info.shards);
+        }
+        self.allocator.free(self.alternates);
+        for (self.paths) |path| self.allocator.free(path);
+        if (self.paths.len != 0) self.allocator.free(self.paths);
+    }
+
+    pub fn readObject(self: *const Reader, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !GitObject {
+        const hex = Sha1.hex(sha);
+        var rel_buf: [64]u8 = undefined;
+        const rel_path = try std.fmt.bufPrint(&rel_buf, "{s}/{s}", .{ hex[0..2], hex[2..40] });
+        const resolved = (try self.resolve(allocator, io, rel_path, sha)) orelse return error.ObjectNotFound;
+        defer allocator.free(resolved);
+        return parseLooseFile(allocator, io, resolved);
+    }
+
+    fn resolve(self: *const Reader, allocator: std.mem.Allocator, io: std.Io, rel_path: []const u8, sha: [20]u8) !?[]u8 {
+        for (self.alternates) |info| {
+            const loose = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ info.path, rel_path });
+            if (std.Io.Dir.cwd().access(io, loose, .{})) |_| {
+                return loose;
+            } else |_| {
+                allocator.free(loose);
+            }
+
+            if (info.shard_count == 0) continue;
+            const preferred = @as(u16, sha[0]) % info.shard_count;
+            var preferred_buf: [16]u8 = undefined;
+            const preferred_name = try std.fmt.bufPrint(&preferred_buf, "shard_{x:0>2}", .{preferred});
+            if (try self.tryShard(allocator, io, info, preferred_name, rel_path)) |found| return found;
+
+            // A changed shard-count setting can leave an object in an old
+            // directory. Probe the cached names only as a compatibility
+            // fallback; the common case performs one direct filesystem check.
+            for (info.shards) |shard| {
+                if (std.mem.eql(u8, shard, preferred_name)) continue;
+                if (try self.tryShard(allocator, io, info, shard, rel_path)) |found| return found;
+            }
+        }
+        return null;
+    }
+
+    fn tryShard(self: *const Reader, allocator: std.mem.Allocator, io: std.Io, info: AlternateInfo, shard: []const u8, rel_path: []const u8) !?[]u8 {
+        _ = self;
+        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ info.path, shard, rel_path });
+        if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| {
+            return candidate;
+        } else |_| {
+            allocator.free(candidate);
+            return null;
+        }
+    }
+};
+
 /// Parse a loose (zlib-compressed, "type size\0content") object file.
 fn parseLooseFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !GitObject {
     // Dynamic read — supports arbitrarily large blobs (not capped at 100KB).
@@ -382,4 +508,10 @@ test "alternates resolve object from a sharded source store" {
     const read_obj = try alts.readObject(allocator, io, sha);
     defer allocator.free(read_obj.blob.content);
     try std.testing.expectEqualStrings(payload, read_obj.blob.content);
+
+    var reader = try Reader.init(allocator, io, clone_dir);
+    defer reader.deinit();
+    const cached_obj = try reader.readObject(allocator, io, sha);
+    defer allocator.free(cached_obj.blob.content);
+    try std.testing.expectEqualStrings(payload, cached_obj.blob.content);
 }

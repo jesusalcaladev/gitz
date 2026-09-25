@@ -38,7 +38,9 @@ jobs:
           version: 0.16.0
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
+        # ReleaseSmall keeps the same statically linked binary while cutting
+        # the download size roughly in half versus ReleaseFast.
+        run: zig build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.zig_target }}
 
       - name: Package binary
         run: |
