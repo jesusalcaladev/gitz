@@ -1,4 +1,5 @@
 const std = @import("std");
+const Fs = @import("../util/fs.zig").Fs;
 
 /// Parallel file stat engine.
 /// Stats multiple files concurrently using a thread pool.
@@ -83,7 +84,7 @@ pub const ParallelStat = struct {
 
     /// Recursively collect all file paths.
     fn collectPaths(self: *ParallelStat, paths: *std.ArrayList([]const u8), dir_path: []const u8) !void {
-        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{}) catch return;
+        var dir = Fs.openIterable(self.io, dir_path) catch return;
         defer dir.close(self.io);
 
         var iter = dir.iterate();

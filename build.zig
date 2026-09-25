@@ -53,6 +53,9 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // The differential suite in src/tests/e2e drives the real binary and
+    // compares against real git, so the executable has to exist first.
+    run_unit_tests.step.dependOn(b.getInstallStep());
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit_tests.step);
 }

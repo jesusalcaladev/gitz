@@ -4,6 +4,7 @@ const storage = @import("storage.zig");
 const packfile_mod = @import("packfile.zig");
 const object_mod = @import("object.zig");
 const config_mod = @import("config.zig");
+const Fs = @import("../util/fs.zig").Fs;
 
 const GitObject = object_mod.GitObject;
 const ObjectType = object_mod.ObjectType;
@@ -115,7 +116,7 @@ pub const ObjectStore = struct {
         const objects_dir = try std.fmt.allocPrint(allocator, "{s}/objects", .{self.git_dir});
         defer allocator.free(objects_dir);
 
-        var base_dir = std.Io.Dir.cwd().openDir(io, objects_dir, .{}) catch return 0;
+        var base_dir = Fs.openIterable(io, objects_dir) catch return 0;
         defer base_dir.close(io);
 
         var dir_iter = base_dir.iterate();
@@ -123,7 +124,7 @@ pub const ObjectStore = struct {
             if (entry.name.len != 2) continue;
             const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ objects_dir, entry.name });
             defer allocator.free(sub_path);
-            var sub_dir = std.Io.Dir.cwd().openDir(io, sub_path, .{}) catch continue;
+            var sub_dir = Fs.openIterable(io, sub_path) catch continue;
             defer sub_dir.close(io);
             var file_iter = sub_dir.iterate();
             while (file_iter.next(io) catch null) |file_entry| {

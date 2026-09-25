@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const Fs = @import("../../util/fs.zig").Fs;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const storage_mod = @import("../../core/storage.zig");
 const objectstore_mod = @import("../../core/objectstore.zig");
@@ -48,10 +49,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         dir_name_buf[1] = "0123456789abcdef"[hi & 0x0f];
         dir_name_buf[2] = 0;
 
-        const dir_path = try std.fmt.allocPrint(allocator, "{s}/objects/{s}", .{ objects_dir_path, dir_name_buf[0..2] });
+        // `objects_dir_path` already ends in `/objects`; appending it again
+        // built `.gitz/objects/objects/xx`, so no fanout dir ever opened and
+        // every repository reported "Counting objects: 0".
+        const dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ objects_dir_path, dir_name_buf[0..2] });
         defer allocator.free(dir_path);
 
-        var dir = std.Io.Dir.cwd().openDir(io.io, dir_path, .{}) catch continue;
+        var dir = Fs.openIterable(io.io, dir_path) catch continue;
         defer dir.close(io.io);
 
         var iter = dir.iterate();

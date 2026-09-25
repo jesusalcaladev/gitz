@@ -76,6 +76,18 @@ pub const Index = struct {
         try self.entries.append(allocator, .{ .sha = sha, .size = stat.size, .mtime = stat.mtime, .ctime = stat.ctime, .mode = stat.mode, .name = owned_name });
     }
 
+    /// Remove the entry for `name`. Returns true when an entry was removed.
+    pub fn remove(self: *Index, allocator: std.mem.Allocator, name: []const u8) bool {
+        for (self.entries.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                allocator.free(entry.name);
+                _ = self.entries.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Build hierarchical git tree from flat index entries.
     pub fn writeTree(self: *Index, store: anytype, allocator: std.mem.Allocator, io: std.Io) ![20]u8 {
         const object = @import("object.zig");

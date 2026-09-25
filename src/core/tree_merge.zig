@@ -17,18 +17,11 @@ pub const TextMerge = struct {
     }
 };
 
-/// One side of the merge, expressed in base coordinates: which base lines are
-/// still present (context) and which lines were inserted before each position.
-const SideInfo = struct {
-    ctx: []bool,
-    inserts: std.AutoHashMap(usize, [][]const u8),
-
-    fn deinit(self: *SideInfo, allocator: std.mem.Allocator) void {
-        var it = self.inserts.valueIterator();
-        while (it.next()) |lines| allocator.free(lines.*);
-        self.inserts.deinit();
-        allocator.free(self.ctx);
-    }
+/// One contiguous change to the base, expressed in base coordinates.
+const Hunk = struct {
+    base_start: usize,
+    base_len: usize,
+    lines: []const []const u8,
 };
 
 fn splitLines(allocator: std.mem.Allocator, content: []const u8) !struct { lines: []const []const u8, trailing_newline: bool } {
@@ -38,7 +31,7 @@ fn splitLines(allocator: std.mem.Allocator, content: []const u8) !struct { lines
     const trailing = content[content.len - 1] == '\n';
     const body = if (trailing) content[0 .. content.len - 1] else content;
 
-    var list: std.ArrayList([]const u8) = .empty;
+    var list = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     errdefer list.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, body, '\n');
@@ -48,66 +41,48 @@ fn splitLines(allocator: std.mem.Allocator, content: []const u8) !struct { lines
     return .{ .lines = try list.toOwnedSlice(allocator), .trailing_newline = trailing };
 }
 
-fn buildSide(allocator: std.mem.Allocator, base_lines: []const []const u8, side_lines: []const []const u8) !SideInfo {
-    const edits = try diff_mod.lineEdits(allocator, base_lines, side_lines);
-    defer allocator.free(edits);
-
-    const ctx = try allocator.alloc(bool, base_lines.len);
-    @memset(ctx, false);
-
-    var inserts: std.AutoHashMap(usize, [][]const u8) = .init(allocator);
-    errdefer inserts.deinit();
-
-    var pos: usize = 0;
-    for (edits) |e| {
-        switch (e.type) {
-            .context => {
-                if (pos < ctx.len) ctx[pos] = true;
-                pos += 1;
-            },
-            .deleted => pos += 1,
-            .added => {
-                const gop = try inserts.getOrPut(pos);
-                if (!gop.found_existing) gop.value_ptr.* = &.{};
-                var lines = try allocator.alloc([]const u8, gop.value_ptr.*.len + 1);
-                @memcpy(lines[0..gop.value_ptr.*.len], gop.value_ptr.*);
-                lines[gop.value_ptr.*.len] = e.content;
-                allocator.free(gop.value_ptr.*);
-                gop.value_ptr.* = lines;
-            },
-        }
+/// Group a flat edit script into hunks with base coordinates. A run of
+/// `.deleted` followed by `.added` is one replacement, not two changes.
+fn buildHunks(
+    allocator: std.mem.Allocator,
+    edits: []const diff_mod.DiffLine,
+) ![]Hunk {
+    var list = std.ArrayList(Hunk){ .items = &.{}, .capacity = 0 };
+    errdefer {
+        for (list.items) |h| allocator.free(h.lines);
+        list.deinit(allocator);
     }
 
-    return .{ .ctx = ctx, .inserts = inserts };
+    var base_pos: usize = 0;
+    var i: usize = 0;
+    while (i < edits.len) {
+        if (edits[i].type == .context) {
+            base_pos += 1;
+            i += 1;
+            continue;
+        }
+        const start = base_pos;
+        var repl = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+        while (i < edits.len and edits[i].type != .context) {
+            switch (edits[i].type) {
+                .deleted => base_pos += 1,
+                .added => try repl.append(allocator, edits[i].content),
+                .context => unreachable,
+            }
+            i += 1;
+        }
+        try list.append(allocator, .{
+            .base_start = start,
+            .base_len = base_pos - start,
+            .lines = try repl.toOwnedSlice(allocator),
+        });
+    }
+    return list.toOwnedSlice(allocator);
 }
 
-/// Render one side's version of base[lo..hi).
-fn renderSide(
-    allocator: std.mem.Allocator,
-    base_lines: []const []const u8,
-    side: *const SideInfo,
-    lo: usize,
-    hi: usize,
-) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var p = lo;
-    while (p < hi) : (p += 1) {
-        if (side.inserts.get(p)) |lines| {
-            try out.appendSlice(allocator, lines);
-        }
-        if (p < side.ctx.len and side.ctx[p]) {
-            try out.append(allocator, base_lines[p]);
-        }
-    }
-    // Insertion at end-of-file belongs to the final chunk.
-    if (hi == base_lines.len) {
-        if (side.inserts.get(hi)) |lines| {
-            try out.appendSlice(allocator, lines);
-        }
-    }
-    return out.toOwnedSlice(allocator);
+fn freeHunks(allocator: std.mem.Allocator, hunks: []Hunk) void {
+    for (hunks) |h| allocator.free(h.lines);
+    allocator.free(hunks);
 }
 
 fn linesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -120,6 +95,13 @@ fn linesEqual(a: []const []const u8, b: []const []const u8) bool {
 
 /// 3-way merge of file contents. Returns the merged text; `conflict` is true
 /// when markers were emitted.
+///
+/// Walks the base once, advancing whichever side has the next change. Two
+/// changes that start at different base positions are independent and merge
+/// cleanly; only changes that start at the same position and differ are a real
+/// conflict. That is the standard diff3 rule and the one git implements, and it
+/// is what lets a branch appending at the end of a file merge with another
+/// branch editing an earlier line.
 pub fn mergeLines(
     allocator: std.mem.Allocator,
     base_content: []const u8,
@@ -134,9 +116,9 @@ pub fn mergeLines(
     const theirs = try splitLines(allocator, theirs_content);
     defer allocator.free(theirs.lines);
 
-    // No common base: the chunk walk below has no anchors to iterate over, so
-    // decide directly — one-sided additions merge cleanly, identical additions
-    // agree, and different additions conflict (like git's add/add merge).
+    // No common base: there are no base coordinates to walk, so decide
+    // directly — one-sided additions merge cleanly, identical additions agree,
+    // and different additions conflict (git's add/add rule).
     if (base.lines.len == 0) {
         if (ours_content.len == 0 and theirs_content.len == 0) {
             return .{ .content = try allocator.dupe(u8, ""), .conflict = false };
@@ -148,103 +130,103 @@ pub fn mergeLines(
             return .{ .content = try allocator.dupe(u8, theirs_content), .conflict = false };
         }
         if (std.mem.eql(u8, ours_content, theirs_content)) {
-            return .{ .content = try allocator.dupe(u8, ours_content), .conflict = false };
+            return .{ .content = try allocator.dupe(u8, theirs_content), .conflict = false };
         }
-
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
-        try out.appendSlice(allocator, "<<<<<<< HEAD\n");
-        try out.appendSlice(allocator, ours_content);
-        if (ours_content[ours_content.len - 1] != '\n') try out.append(allocator, '\n');
-        try out.appendSlice(allocator, "=======\n");
-        try out.appendSlice(allocator, theirs_content);
-        if (theirs_content[theirs_content.len - 1] != '\n') try out.append(allocator, '\n');
-        try out.appendSlice(allocator, ">>>>>>> ");
-        try out.appendSlice(allocator, theirs_label);
-        try out.append(allocator, '\n');
-        return .{ .content = try out.toOwnedSlice(allocator), .conflict = true };
+        return try emitConflict(allocator, ours_content, theirs_content, theirs_label);
     }
 
-    var ours_info = try buildSide(allocator, base.lines, ours.lines);
-    defer ours_info.deinit(allocator);
-    var theirs_info = try buildSide(allocator, base.lines, theirs.lines);
-    defer theirs_info.deinit(allocator);
+    const ours_edits = try diff_mod.lineEdits(allocator, base.lines, ours.lines);
+    defer allocator.free(ours_edits);
+    const theirs_edits = try diff_mod.lineEdits(allocator, base.lines, theirs.lines);
+    defer allocator.free(theirs_edits);
 
-    // Chunk boundaries: positions that are clean anchors on BOTH sides.
-    var edges: std.ArrayList(usize) = .empty;
-    defer edges.deinit(allocator);
-    try edges.append(allocator, 0);
-    for (0..base.lines.len + 1) |p| {
-        const no_insert_o = ours_info.inserts.get(p) == null;
-        const no_insert_t = theirs_info.inserts.get(p) == null;
-        const before_ok = (p == 0) or (p > 0 and p - 1 < ours_info.ctx.len and ours_info.ctx[p - 1] and theirs_info.ctx[p - 1]);
-        const at_ok = (p == base.lines.len) or (p < ours_info.ctx.len and ours_info.ctx[p] and theirs_info.ctx[p]);
-        if (no_insert_o and no_insert_t and before_ok and at_ok) {
-            try edges.append(allocator, p);
-        }
-    }
-    try edges.append(allocator, base.lines.len);
+    const ours_hunks = try buildHunks(allocator, ours_edits);
+    defer freeHunks(allocator, ours_hunks);
+    const theirs_hunks = try buildHunks(allocator, theirs_edits);
+    defer freeHunks(allocator, theirs_hunks);
 
-    // Dedupe (edges are non-decreasing).
-    var uniq: std.ArrayList(usize) = .empty;
-    defer uniq.deinit(allocator);
-    var last: ?usize = null;
-    for (edges.items) |p| {
-        if (last) |l| {
-            if (l == p) continue;
-        }
-        try uniq.append(allocator, p);
-        last = p;
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
+    var out = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+    errdefer out.deinit(allocator);
     var conflict = false;
 
-    var i: usize = 0;
-    while (i + 1 < uniq.items.len) : (i += 1) {
-        const lo = uniq.items[i];
-        const hi = uniq.items[i + 1];
+    var pos: usize = 0;
+    var oi: usize = 0;
+    var ti: usize = 0;
 
-        const base_view = base.lines[lo..hi];
-        const ours_view = try renderSide(allocator, base.lines, &ours_info, lo, hi);
-        defer allocator.free(ours_view);
-        const theirs_view = try renderSide(allocator, base.lines, &theirs_info, lo, hi);
-        defer allocator.free(theirs_view);
+    while (true) {
+        const o_start: usize = if (oi < ours_hunks.len) ours_hunks[oi].base_start else std.math.maxInt(usize);
+        const t_start: usize = if (ti < theirs_hunks.len) theirs_hunks[ti].base_start else std.math.maxInt(usize);
+        const next_start = @min(o_start, t_start);
+        if (next_start == std.math.maxInt(usize)) break;
 
-        var chosen: []const []const u8 = undefined;
-        if (linesEqual(ours_view, base_view) and linesEqual(theirs_view, base_view)) {
-            chosen = base_view;
-        } else if (linesEqual(ours_view, base_view)) {
-            chosen = theirs_view; // only theirs changed
-        } else if (linesEqual(theirs_view, base_view)) {
-            chosen = ours_view; // only ours changed
-        } else if (linesEqual(ours_view, theirs_view)) {
-            chosen = ours_view; // identical change on both sides
-        } else {
-            // Real conflict: emit markers.
-            conflict = true;
-            try out.appendSlice(allocator, "<<<<<<< HEAD\n");
-            try appendLines(&out, allocator, ours_view);
-            try out.appendSlice(allocator, "=======\n");
-            try appendLines(&out, allocator, theirs_view);
-            try out.appendSlice(allocator, ">>>>>>> ");
-            try out.appendSlice(allocator, theirs_label);
+        // Base lines nobody touched.
+        while (pos < next_start and pos < base.lines.len) : (pos += 1) {
+            try out.appendSlice(allocator, base.lines[pos]);
             try out.append(allocator, '\n');
-            continue;
         }
 
-        try appendLines(&out, allocator, chosen);
+        const o_here = oi < ours_hunks.len and ours_hunks[oi].base_start == next_start;
+        const t_here = ti < theirs_hunks.len and theirs_hunks[ti].base_start == next_start;
+
+        if (o_here and t_here) {
+            const o = ours_hunks[oi];
+            const t = theirs_hunks[ti];
+            if (linesEqual(o.lines, t.lines)) {
+                // Both sides made the same change.
+                try appendLines(&out, allocator, o.lines);
+            } else {
+                conflict = true;
+                try out.appendSlice(allocator, "<<<<<<< HEAD\n");
+                try appendLines(&out, allocator, o.lines);
+                try out.appendSlice(allocator, "=======\n");
+                try appendLines(&out, allocator, t.lines);
+                try out.appendSlice(allocator, ">>>>>>> ");
+                try out.appendSlice(allocator, theirs_label);
+                try out.append(allocator, '\n');
+            }
+            pos = @max(o.base_start + o.base_len, t.base_start + t.base_len);
+            oi += 1;
+            ti += 1;
+        } else if (o_here) {
+            const o = ours_hunks[oi];
+            try appendLines(&out, allocator, o.lines);
+            pos = o.base_start + o.base_len;
+            oi += 1;
+        } else {
+            const t = theirs_hunks[ti];
+            try appendLines(&out, allocator, t.lines);
+            pos = t.base_start + t.base_len;
+            ti += 1;
+        }
     }
 
-    // Preserve a trailing newline when the inputs had one.
-    if (ours.trailing_newline or theirs.trailing_newline or base.trailing_newline) {
-        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
-            try out.append(allocator, '\n');
-        }
+    // Whatever is left of the base is untouched by both sides.
+    while (pos < base.lines.len) : (pos += 1) {
+        try out.appendSlice(allocator, base.lines[pos]);
+        try out.append(allocator, '\n');
     }
 
     return .{ .content = try out.toOwnedSlice(allocator), .conflict = conflict };
+}
+
+fn emitConflict(
+    allocator: std.mem.Allocator,
+    ours_content: []const u8,
+    theirs_content: []const u8,
+    theirs_label: []const u8,
+) !TextMerge {
+    var out = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "<<<<<<< HEAD\n");
+    try out.appendSlice(allocator, ours_content);
+    if (ours_content.len > 0 and ours_content[ours_content.len - 1] != '\n') try out.append(allocator, '\n');
+    try out.appendSlice(allocator, "=======\n");
+    try out.appendSlice(allocator, theirs_content);
+    if (theirs_content.len > 0 and theirs_content[theirs_content.len - 1] != '\n') try out.append(allocator, '\n');
+    try out.appendSlice(allocator, ">>>>>>> ");
+    try out.appendSlice(allocator, theirs_label);
+    try out.append(allocator, '\n');
+    return .{ .content = try out.toOwnedSlice(allocator), .conflict = true };
 }
 
 fn appendLines(out: *std.ArrayList(u8), allocator: std.mem.Allocator, lines: []const []const u8) !void {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const Fs = @import("../../util/fs.zig").Fs;
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const index_mod = @import("../../core/index.zig");
 const object = @import("../../core/object.zig");
@@ -7,14 +8,36 @@ const storage_mod = @import("../../core/storage.zig");
 const ignore_mod = @import("../../core/ignore.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
-    if (args.len == 0) {
-        try io.eprint("usage: gitz add <paths...>\n", .{});
+    // `add -A` / `add -u` / `add .` all mean "stage the whole worktree",
+    // deletions included. Without `-A` there is still nothing to do.
+    var stage_all = false;
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-A") or std.mem.eql(u8, arg, "--all") or
+            std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--update"))
+        {
+            stage_all = true;
+        } else if (std.mem.eql(u8, arg, ".") or std.mem.eql(u8, arg, "./")) {
+            // git treats `add .` as "stage everything under here", which
+            // includes files that were deleted from the worktree.
+            stage_all = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            try paths.append(allocator, arg);
+        }
+    }
+
+    if (!stage_all and paths.items.len == 0) {
+        try io.eprint("usage: gitz add [-A|--all] <paths...>\n", .{});
         std.process.exit(1);
     }
 
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
     defer idx.deinit(allocator);
 
+    // Reported after the index has been written, so a bad pathspec alongside
+    // good ones does not throw away the work that did resolve.
     var pathspec_failed = false;
 
     // Load .gitignore rules
@@ -22,39 +45,75 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer ignore_stack.deinit();
     ignore_stack.loadFile(io.io, ".gitignore") catch {};
 
-    for (args) |path| {
-        if (std.mem.eql(u8, path, ".")) {
-            try addDirectory(allocator, git_dir, &idx, ".", io, &ignore_stack);
+    for (paths.items) |path| {
+        // Check if path is ignored
+        if (ignore_stack.isIgnored(path, false)) {
+            continue; // silently skip ignored files
+        }
+        if (isDirectory(path, io)) {
+            try addDirectory(allocator, git_dir, &idx, path, io, &ignore_stack);
         } else {
-            // Check if path is ignored
-            if (ignore_stack.isIgnored(path, false)) {
-                continue; // silently skip ignored files
-            }
             addFile(allocator, git_dir, &idx, path, io) catch {
-                try io.eprint("fatal: pathspec '{s}' did not match any files\n", .{path});
-                pathspec_failed = true;
+                // A pathspec that no longer exists may be a deletion rather
+                // than a typo; only complain when it is in the index nowhere.
+                if (!removeIfTracked(allocator, &idx, path)) {
+                    try io.eprint("fatal: pathspec '{s}' did not match any files\n", .{path});
+                    pathspec_failed = true;
+                }
             };
         }
+    }
+
+    if (stage_all) {
+        try addDirectory(allocator, git_dir, &idx, ".", io, &ignore_stack);
+        stageDeletions(allocator, &idx, io);
     }
 
     try idx.writeToFile(git_dir, allocator, io.io);
     if (pathspec_failed) std.process.exit(128);
 }
 
+/// Drop index entries whose file is gone from the working tree. Without this
+/// a deleted file is invisible: `status` reported a clean tree and `commit`
+/// happily re-created the file in the next commit.
+fn stageDeletions(allocator: std.mem.Allocator, idx: *index_mod.Index, io: Io) void {
+    var i: usize = 0;
+    while (i < idx.entries.items.len) {
+        const name = idx.entries.items[i].name;
+        if (std.Io.Dir.cwd().access(io.io, name, .{})) |_| {
+            i += 1;
+        } else |_| {
+            _ = idx.remove(allocator, name);
+        }
+    }
+}
+
+fn removeIfTracked(allocator: std.mem.Allocator, idx: *index_mod.Index, path: []const u8) bool {
+    const clean = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
+    if (idx.remove(allocator, clean)) return true;
+    for (idx.entries.items) |entry| {
+        const name = if (std.mem.startsWith(u8, entry.name, "./")) entry.name[2..] else entry.name;
+        if (std.mem.eql(u8, name, clean)) return idx.remove(allocator, entry.name);
+    }
+    return false;
+}
+
 fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.Index, path: []const u8, io: Io) !void {
     var f = io.openFile(path) catch return error.FileNotFound;
     defer f.close(io.io);
 
-    var buf: [10 * 1024 * 1024]u8 = undefined;
-    const n = try f.readStreaming(io.io, &.{&buf});
-    const content = buf[0..n];
+    const stat = try std.Io.Dir.cwd().statFile(io.io, path, .{});
+
+    // Read through the file's real size rather than a fixed buffer: a blob
+    // larger than the buffer would otherwise be silently truncated, and the
+    // index would record a hash of the first N bytes.
+    const content = try std.Io.Dir.cwd().readFileAlloc(io.io, path, allocator, .unlimited);
+    defer allocator.free(content);
 
     // Write blob to object store
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const blob = object.GitObject{ .blob = .{ .content = content } };
     const sha = try store.write(allocator, io.io, blob);
-
-    const stat = try std.Io.Dir.cwd().statFile(io.io, path, .{});
 
     try idx.add(allocator, path, sha, .{
         .size = @intCast(stat.size),
@@ -80,7 +139,7 @@ fn addDirectory(
         entries.deinit(allocator);
     }
 
-    try collectFiles(allocator, dir_path, &entries, ignore);
+    try collectFiles(allocator, dir_path, &entries, ignore, io);
 
     for (entries.items) |entry| {
         try addFile(allocator, git_dir, idx, entry, io);
@@ -92,6 +151,7 @@ fn collectFiles(
     dir_path: []const u8,
     entries: *std.ArrayList([]const u8),
     ignore: *ignore_mod.IgnoreStack,
+    io: Io,
 ) !void {
     var dirs_to_visit: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
     defer {
@@ -101,64 +161,39 @@ fn collectFiles(
 
     try dirs_to_visit.append(allocator, try allocator.dupe(u8, dir_path));
 
-    while (dirs_to_visit.items.len > 0) {
-        const current = dirs_to_visit.pop() orelse break;
+    while (dirs_to_visit.pop()) |current_z| {
+        defer allocator.free(current_z);
+        const current = try allocator.dupe(u8, std.mem.sliceTo(current_z, 0));
         defer allocator.free(current);
 
-        const current_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{current}, 0);
-        defer allocator.free(current_z);
+        var dir = Fs.openIterable(io.io, current) catch continue;
+        defer dir.close(io.io);
 
-        const fd = std.posix.openat(std.posix.AT.FDCWD, current_z, std.posix.O{ .ACCMODE = .RDONLY }, 0) catch continue;
-        defer {
-            _ = std.os.linux.close(@intCast(fd));
-        }
+        var iter = dir.iterate();
+        while (iter.next(io.io) catch null) |entry| {
+            const skip = (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..") or
+                std.mem.eql(u8, entry.name, ".gitz") or std.mem.eql(u8, entry.name, ".git"));
+            if (skip) continue;
 
-        var buf: [4096]u8 align(@alignOf(usize)) = undefined;
-        while (true) {
-            const rc = std.os.linux.getdents64(@intCast(fd), &buf, buf.len);
-            const n: usize = if (rc > 0) @intCast(rc) else break;
-            if (n == 0) break;
+            const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current, entry.name });
+            const is_dir = entry.kind == .directory;
 
-            var pos: usize = 0;
-            while (pos < n) {
-                const direntry: *align(1) const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
-                const name: []const u8 = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&direntry.name)), 0);
+            if (ignore.isIgnored(full_path, is_dir)) {
+                allocator.free(full_path);
+                continue;
+            }
 
-                const skip = (name.len == 1 and name[0] == '.') or
-                    (name.len == 2 and name[0] == '.' and name[1] == '.') or
-                    (name.len == 5 and name[0] == '.' and std.mem.eql(u8, name, ".gitz"));
-                if (!skip) {
-                    const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current, name });
-
-                    // Check .gitignore
-                    const is_dir = isDirectory(full_path);
-                    if (ignore.isIgnored(full_path, is_dir)) {
-                        if (is_dir) {
-                            // Skip entire ignored directory
-                            pos += direntry.reclen;
-                            continue;
-                        }
-                        pos += direntry.reclen;
-                        continue;
-                    }
-
-                    if (is_dir) {
-                        try dirs_to_visit.append(allocator, full_path);
-                    } else {
-                        try entries.append(allocator, full_path);
-                    }
-                }
-                pos += direntry.reclen;
+            if (is_dir) {
+                try dirs_to_visit.append(allocator, full_path);
+            } else {
+                try entries.append(allocator, full_path);
             }
         }
     }
 }
 
-fn isDirectory(path: []const u8) bool {
-    const path_z = std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}", .{path}, 0) catch return false;
-    defer std.heap.page_allocator.free(path_z);
-
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, std.posix.O{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return false;
-    _ = std.os.linux.close(@intCast(fd));
+fn isDirectory(path: []const u8, io: Io) bool {
+    const dir = Fs.openIterable(io.io, path) catch return false;
+    dir.close(io.io);
     return true;
 }

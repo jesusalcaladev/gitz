@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const repo_config = @import("../../core/config.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var global = false;
@@ -80,32 +81,58 @@ fn readConfig(allocator: std.mem.Allocator, path: []const u8, io: Io) !std.Strin
     const content = io.readFileAlloc(path) catch return map;
     defer allocator.free(content);
 
-    var current_section: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+    // One parser for the whole codebase: `core/config.zig` understands real
+    // git config syntax, including `[section "subsection"]` headers.
+    var parsed = repo_config.Config.init(allocator);
+    defer parsed.deinit();
+    parsed.parse(content) catch return map;
 
-        if (trimmed[0] == '[') {
-            const end = std.mem.indexOf(u8, trimmed, "]") orelse continue;
-            current_section = try allocator.dupe(u8, trimmed[1..end]);
-            continue;
-        }
-
-        if (std.mem.indexOf(u8, trimmed, "=")) |eq_pos| {
-            const k = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
-            const v = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t\"");
-
-            const full_key = if (current_section) |sec|
-                try std.fmt.allocPrint(allocator, "{s}.{s}", .{ sec, k })
-            else
-                try allocator.dupe(u8, k);
-
-            try map.put(full_key, try allocator.dupe(u8, v));
+    var it = parsed.sections.iterator();
+    while (it.next()) |section| {
+        var vals = section.value_ptr.iterator();
+        while (vals.next()) |kv| {
+            const full_key = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ section.key_ptr.*, kv.key_ptr.* });
+            errdefer allocator.free(full_key);
+            const owned_value = try allocator.dupe(u8, kv.value_ptr.*);
+            errdefer allocator.free(owned_value);
+            if (map.getPtr(full_key)) |old| {
+                allocator.free(old.*);
+                old.* = owned_value;
+            } else {
+                try map.put(full_key, owned_value);
+            }
         }
     }
 
     return map;
+}
+
+/// Write `map` (flat `section.key = value` form) back as a git config file
+/// that real git accepts.
+///
+/// The previous version emitted `core.repositoryformatversion = 0` with no
+/// `[core]` header, which git rejects outright:
+/// `fatal: bad config line 1 in file .gitz/config`. Sections are reconstructed
+/// from the dotted keys, and the values already in the file keep their original
+/// order so that unrelated rewrites do not churn the config.
+fn writeConfigFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    map: *const std.StringHashMap([]const u8),
+    io: Io,
+) !void {
+    var parsed = repo_config.Config.init(allocator);
+    defer parsed.deinit();
+
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        const dot = std.mem.indexOfScalar(u8, entry.key_ptr.*, '.') orelse continue;
+        try parsed.set(entry.key_ptr.*[0..dot], entry.key_ptr.*[dot + 1 ..], entry.value_ptr.*);
+    }
+
+    const serialized = try parsed.serialize(allocator);
+    defer allocator.free(serialized);
+    try io.writeFile(path, serialized);
 }
 
 fn freeConfigMap(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void {
@@ -164,18 +191,7 @@ fn setConfigValue(allocator: std.mem.Allocator, git_dir: []const u8, key: []cons
         try map.put(owned_key, owned_value);
     }
 
-    var content = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    defer content.deinit(allocator);
-
-    var map_iter = map.iterator();
-    while (map_iter.next()) |entry| {
-        try content.print(allocator, "{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-    }
-
-    const result = try content.toOwnedSlice(allocator);
-    defer allocator.free(result);
-
-    try io.writeFile(path, result);
+    try writeConfigFile(allocator, path, &map, io);
     try io.print("'{s}' = '{s}'\n", .{ key, value });
 }
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const Sha1 = @import("sha1.zig").Sha1;
 const object = @import("object.zig");
 const zlib_mod = @import("zlib.zig");
+const alternates_mod = @import("alternates.zig");
 
 const GitObject = object.GitObject;
 const ObjectType = object.ObjectType;
@@ -26,6 +27,15 @@ pub const LooseStore = struct {
     }
 
     pub fn read(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !GitObject {
+        const own = self.readOwn(allocator, io, sha) catch |e| switch (e) {
+            error.ObjectNotFound => return self.readAlternate(allocator, io, sha),
+            else => return e,
+        };
+        return own;
+    }
+
+    /// Read from the repository's own object store only.
+    fn readOwn(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !GitObject {
         var path_buf: [52]u8 = undefined;
         objectPath(sha, &path_buf);
 
@@ -60,6 +70,25 @@ pub const LooseStore = struct {
             .commit => try object.deserialize(allocator, .commit, content),
             .tag => try object.deserialize(allocator, .tag, content),
         };
+    }
+
+    /// Fall back to the object stores listed in `objects/info/alternates`.
+    ///
+    /// This is what makes `gitz clone --shared` usable: the clone's own object
+    /// directory is empty and every object lives in the source repository, so
+    /// without this, every command (status, log, diff, merge) sees a shared
+    /// clone as a repository with no objects at all.
+    ///
+    /// Only reached after a miss, and gated on the alternates file existing, so
+    /// the cost for an ordinary repository is a single failed lookup that was
+    /// already happening.
+    fn readAlternate(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8) !GitObject {
+        const path = try std.fmt.allocPrint(allocator, "{s}/objects/info/alternates", .{self.git_dir});
+        defer allocator.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch return error.ObjectNotFound;
+
+        const alts = alternates_mod.Alternates.init(self.git_dir);
+        return alts.readObject(allocator, io, sha);
     }
 
     pub fn write(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, obj: GitObject) ![20]u8 {

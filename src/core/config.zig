@@ -7,11 +7,16 @@ const testing = std.testing;
 /// Simple INI-style config parser for Git config files
 pub const Config = struct {
     sections: std.StringHashMap(std.StringHashMap([]const u8)),
+    /// Section names in first-seen order. `sections` is a hash map, so without
+    /// this the serialized file would come out in a different order on every
+    /// write and `gitz config` would produce a noisy diff of the repo config.
+    order: std.ArrayList([]const u8),
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) Config {
         return .{
             .sections = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
+            .order = .empty,
             .allocator = allocator,
         };
     }
@@ -25,14 +30,37 @@ pub const Config = struct {
                 self.allocator.free(val.value_ptr.*);
             }
             entry.value_ptr.deinit();
-            self.allocator.free(entry.key_ptr.*);
         }
         self.sections.deinit();
+        // `order` holds the owned section names; `sections` only borrows them.
+        for (self.order.items) |name| self.allocator.free(name);
+        self.order.deinit(self.allocator);
+    }
+
+    /// Get the key map stored under `name`, creating the section if needed.
+    /// The returned map is only valid until the next `sections` mutation.
+    ///
+    /// The section name is copied, not borrowed: `parse` is handed a buffer it
+    /// does not own, and callers routinely free it as soon as `parse` returns.
+    /// A borrowed key would leave every later lookup reading freed memory.
+    fn sectionMap(self: *Config, name: []const u8) !*std.StringHashMap([]const u8) {
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+
+        const gop = try self.sections.getOrPut(owned);
+        if (gop.found_existing) {
+            self.allocator.free(owned);
+            return gop.value_ptr;
+        }
+        gop.value_ptr.* = std.StringHashMap([]const u8).init(self.allocator);
+        errdefer gop.value_ptr.deinit();
+        try self.order.append(self.allocator, owned);
+        return gop.value_ptr;
     }
 
     /// Parse a config file
     pub fn parse(self: *Config, content: []const u8) !void {
-        var current_section: ?[]const u8 = null;
+        var current_name: ?[]const u8 = null;
         var lines = std.mem.splitScalar(u8, content, '\n');
 
         while (lines.next()) |line| {
@@ -42,15 +70,11 @@ pub const Config = struct {
             // Section header: [section "subsection"]
             if (trimmed[0] == '[') {
                 const end = std.mem.indexOf(u8, trimmed, "]") orelse continue;
-                const section_name = try self.allocator.dupe(u8, trimmed[1..end]);
-                const gop = try self.sections.getOrPut(section_name);
-                if (gop.found_existing) {
-                    // Section already exists — free the duplicate we just made
-                    self.allocator.free(section_name);
-                } else {
-                    gop.value_ptr.* = std.StringHashMap([]const u8).init(self.allocator);
+                if (self.sectionMap(trimmed[1..end])) |_| {
+                    current_name = self.order.items[self.order.items.len - 1];
+                } else |_| {
+                    current_name = null;
                 }
-                current_section = gop.key_ptr.*;
                 continue;
             }
 
@@ -59,19 +83,21 @@ pub const Config = struct {
                 const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
                 const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t\"");
 
-                if (current_section) |section| {
-                    if (self.sections.getPtr(section)) |section_map| {
-                        const owned_key = try self.allocator.dupe(u8, key);
-                        const owned_val = try self.allocator.dupe(u8, value);
-                        const gop = try section_map.getOrPut(owned_key);
-                        if (gop.found_existing) {
-                            self.allocator.free(owned_key);
-                            self.allocator.free(gop.value_ptr.*);
-                            gop.value_ptr.* = owned_val;
-                        } else {
-                            gop.value_ptr.* = owned_val;
-                        }
+                if (current_name) |name| {
+                    const section_map = self.sectionMap(name) catch continue;
+                    const owned_key = try self.allocator.dupe(u8, key);
+                    errdefer self.allocator.free(owned_key);
+                    const owned_val = try self.allocator.dupe(u8, value);
+                    const gop = section_map.getOrPut(owned_key) catch {
+                        self.allocator.free(owned_key);
+                        self.allocator.free(owned_val);
+                        continue;
+                    };
+                    if (gop.found_existing) {
+                        self.allocator.free(owned_key);
+                        self.allocator.free(gop.value_ptr.*);
                     }
+                    gop.value_ptr.* = owned_val;
                 }
             }
         }
@@ -86,38 +112,30 @@ pub const Config = struct {
     }
 
     /// Set a config value
-    pub fn set(self: *Config, section: []const u8, key: []const u8, value: []const u8) !void {
-        const owned_section = try self.allocator.dupe(u8, section);
-        const entry = try self.sections.getOrPut(owned_section);
-        if (entry.found_existing) {
-            // Section already exists — free the duplicate we just made
-            self.allocator.free(owned_section);
-        } else {
-            entry.value_ptr.* = std.StringHashMap([]const u8).init(self.allocator);
-        }
+    pub fn set(self: *Config, section_name: []const u8, key: []const u8, value: []const u8) !void {
+        const section_map = try self.sectionMap(section_name);
         // Check if key already exists — if so, free old value before overwriting
         const new_key = try self.allocator.dupe(u8, key);
-        const gop = try entry.value_ptr.getOrPut(new_key);
+        errdefer self.allocator.free(new_key);
+        const gop = try section_map.getOrPut(new_key);
         if (gop.found_existing) {
             // Old key stays, new_key is lost — free it
             self.allocator.free(new_key);
             // Free old value
             self.allocator.free(gop.value_ptr.*);
-            gop.value_ptr.* = try self.allocator.dupe(u8, value);
-        } else {
-            gop.value_ptr.* = try self.allocator.dupe(u8, value);
         }
+        gop.value_ptr.* = try self.allocator.dupe(u8, value);
     }
 
-    /// Serialize config to string
+    /// Serialize config to string, in the order sections were first seen.
     pub fn serialize(self: Config, allocator: Allocator) ![]u8 {
         var result = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
         errdefer result.deinit(allocator);
 
-        var section_iter = self.sections.iterator();
-        while (section_iter.next()) |section| {
-            try result.print(allocator, "[{s}]\n", .{section.key_ptr.*});
-            var val_iter = section.value_ptr.iterator();
+        for (self.order.items) |name| {
+            const section_map = self.sections.get(name) orelse continue;
+            try result.print(allocator, "[{s}]\n", .{name});
+            var val_iter = section_map.iterator();
             while (val_iter.next()) |entry| {
                 try result.print(allocator, "\t{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             }
@@ -204,9 +222,52 @@ test "config parse empty" {
     try testing.expectEqual(@as(?[]const u8, null), config.get("user", "name"));
 }
 
+
 // =============================================================================
 // TDD Bug-Hunt Tests — Config Edge Cases
 // =============================================================================
+
+test "BUG: config owns section names, not the parsed buffer" {
+    // `parse` receives a buffer it does not own; callers free it as soon as
+    // `parse` returns. If the section names were borrowed from it, every
+    // `get` after that point would read freed memory and find nothing.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    const content = try gpa.dupe(u8, "[remote \"origin\"]\n\turl = https://example.com/x.git\n");
+    const name = try gpa.dupe(u8, content);
+
+    var config = Config.init(gpa);
+    defer config.deinit();
+    try config.parse(name);
+
+    try testing.expectEqualStrings("https://example.com/x.git", config.get("remote \"origin\"", "url").?);
+}
+
+test "BUG: config roundtrip preserves section order" {
+    var config = Config.init(testing.allocator);
+    defer config.deinit();
+
+    try config.set("core", "repositoryformatversion", "0");
+    try config.set("user", "name", "Alice");
+    try config.set("core", "bare", "false");
+
+    const serialized = try config.serialize(testing.allocator);
+    defer testing.allocator.free(serialized);
+
+    // Sections must come out in first-set order, not hash order, so that
+    // rewriting the config does not reorder it.
+    const core_at = std.mem.indexOf(u8, serialized, "[core]").?;
+    const user_at = std.mem.indexOf(u8, serialized, "[user]").?;
+    try testing.expect(core_at < user_at);
+
+    var reparsed = Config.init(testing.allocator);
+    defer reparsed.deinit();
+    try reparsed.parse(serialized);
+    try testing.expectEqualStrings("Alice", reparsed.get("user", "name").?);
+    try testing.expectEqualStrings("0", reparsed.get("core", "repositoryformatversion").?);
+}
 
 test "BUG: config serialize roundtrip" {
     var config = Config.init(testing.allocator);

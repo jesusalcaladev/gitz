@@ -170,14 +170,20 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
-    // Check for deleted tracked files not in working tree
+    // Deletions. A HEAD file missing from the working tree is a deletion; if
+    // it is also gone from the index the deletion has already been staged.
+    //
+    // This used to skip any name present in `tracked_names`, which by
+    // construction contains every HEAD file — so a deleted file was never
+    // reported and `status` said "working tree clean".
     var ht_iter = head_shas.iterator();
     while (ht_iter.next()) |entry| {
         const name = entry.key_ptr.*;
-        if (tracked_names.get(name) != null) continue;
-        const in_working = findWorkingFile(working_files.items, name) != null;
-        if (!in_working) {
+        if (findWorkingFile(working_files.items, name) != null) continue;
+        if (findIndexEntry(&idx, name) != null) {
             try unstaged_deleted.append(allocator, name);
+        } else {
+            try staged_deleted.append(allocator, name);
         }
     }
 
