@@ -94,5 +94,6 @@ comptime {
     _ = @import("tests/integration/compat.zig");
     _ = @import("tests/integration/http_transport.zig");
     _ = @import("tests/integration/shared_clone.zig");
+    _ = @import("tests/integration/data_loss.zig");
     _ = @import("tests/e2e/differential.zig");
 }

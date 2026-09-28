@@ -5,6 +5,8 @@ const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
+const checkout_mod = @import("../../core/checkout.zig");
+const safety = @import("../../util/clone_safety.zig");
 
 pub const ResetMode = enum { soft, mixed, hard };
 
@@ -100,9 +102,16 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try io.print("HEAD is now at {s}\n", .{hex[0..7]});
         },
         .hard => {
+            // The set of tracked paths has to be captured *before* the index is
+            // rewritten, otherwise the "old" index already matches the target
+            // commit and nothing looks stale, so files added after the target
+            // commit were never removed.
+            var previous = try collectIndexPaths(allocator, git_dir, io.io);
+            defer freePathSet(allocator, &previous);
+
             // Move HEAD, reset index, and overwrite working tree
             try resetIndex(allocator, git_dir, io.io, store, commit_sha);
-            try resetWorkingTree(allocator, git_dir, io.io, store, commit_sha);
+            try resetWorkingTree(allocator, git_dir, io.io, store, commit_sha, &previous);
             try io.print("HEAD is now at {s}\n", .{hex[0..7]});
         },
     }
@@ -151,37 +160,118 @@ fn flattenTreeToIndex(idx: *index_mod.Index, store: storage_mod.StorageBackend, 
 }
 
 /// Reset working tree to match the given commit's tree
-fn resetWorkingTree(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: storage_mod.StorageBackend, commit_sha: [20]u8) !void {
+///
+/// The previous version iterated only the root tree, so a `040000` entry
+/// resolved to a tree object and hit `else => continue`: every file under a
+/// subdirectory kept its newer content while the index claimed the old SHA.
+/// It also never deleted anything, so files added after the target commit
+/// stayed on disk and showed up as untracked.
+fn resetWorkingTree(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io, store: storage_mod.StorageBackend, commit_sha: [20]u8, previous: *std.StringHashMap(void)) !void {
     _ = git_dir;
     const commit_obj = store.read(allocator, io, commit_sha) catch return;
+    defer commit_obj.deinit(allocator);
     const commit = switch (commit_obj) {
         .commit => |c| c,
         else => return,
     };
 
-    const tree_obj = store.read(allocator, io, commit.tree) catch return;
-    const tree = switch (tree_obj) {
-        .tree => |t| t,
-        else => return,
-    };
+    var target = checkout_mod.FileMap.init(allocator);
+    defer {
+        var iter = target.iterator();
+        while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+        target.deinit();
+    }
+    checkout_mod.flattenTree(allocator, io, store, commit.tree, "", &target) catch return;
 
-    for (tree.entries) |entry| {
-        // Read blob content
-        const blob_obj = store.read(allocator, io, entry.sha) catch continue;
-        const content = switch (blob_obj) {
-            .blob => |b| b.content,
-            else => continue,
-        };
+    // Restore every tracked file of the target commit.
+    var target_iter = target.iterator();
+    while (target_iter.next()) |entry| {
+        const path = entry.key_ptr.*;
+        safety.validateWorktreePath(path) catch continue;
 
-        // Ensure parent directory exists
-        if (std.fs.path.dirname(entry.name)) |dir| {
+        const content = checkout_mod.readBlob(allocator, io, store, entry.value_ptr.sha) orelse continue;
+        defer allocator.free(content);
+
+        if (std.fs.path.dirname(path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
 
-        // Write file (overwrite)
-        var file = std.Io.Dir.cwd().createFile(io, entry.name, .{}) catch continue;
+        var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch continue;
         defer file.close(io);
         try std.Io.File.writeStreamingAll(file, io, content);
+    }
+
+    // Remove files that were tracked before the reset and that the target
+    // commit no longer contains. Untracked files are never touched.
+    var stale_dirs = std.StringHashMap(void).init(allocator);
+    defer {
+        var siter = stale_dirs.iterator();
+        while (siter.next()) |entry| allocator.free(entry.key_ptr.*);
+        stale_dirs.deinit();
+    }
+
+    var prev_iter = previous.iterator();
+    while (prev_iter.next()) |entry| {
+        const path = entry.key_ptr.*;
+        if (target.contains(path)) continue;
+        safety.validateWorktreePath(path) catch continue;
+
+        std.Io.Dir.cwd().deleteFile(io, path) catch continue;
+
+        if (std.fs.path.dirname(path)) |dir| {
+            if (dir.len > 0) {
+                const key = allocator.dupe(u8, dir) catch continue;
+                if (stale_dirs.get(key) == null) try stale_dirs.put(key, {});
+            }
+        }
+    }
+
+    // Prune directories that became empty, deepest first.
+    pruneEmptyDirs(io, &stale_dirs);
+}
+
+/// The set of paths the index tracked before the reset.
+fn collectIndexPaths(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io) !std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(allocator);
+    errdefer freePathSet(allocator, &set);
+
+    var old_idx = index_mod.Index.readFromFile(allocator, git_dir, io) catch return set;
+    defer old_idx.deinit(allocator);
+
+    for (old_idx.entries.items) |entry| {
+        const name = if (std.mem.startsWith(u8, entry.name, "./")) entry.name[2..] else entry.name;
+        const key = allocator.dupe(u8, name) catch continue;
+        if (set.get(key) != null) {
+            allocator.free(key);
+            continue;
+        }
+        try set.put(key, {});
+    }
+    return set;
+}
+
+fn freePathSet(allocator: std.mem.Allocator, set: *std.StringHashMap(void)) void {
+    var iter = set.iterator();
+    while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+    set.deinit();
+}
+
+/// Remove now-empty directories left behind by deleted files.
+fn pruneEmptyDirs(io: std.Io, dirs: *std.StringHashMap(void)) void {
+    var it = dirs.iterator();
+    while (it.next()) |entry| {
+        const path = entry.key_ptr.*;
+        // Walk up: `a/b/c` may leave `a/b` and `a` empty as well.
+        var current = path;
+        while (current.len > 0 and !std.mem.eql(u8, current, ".")) {
+            var dir = std.Io.Dir.cwd().openDir(io, current, .{ .iterate = true }) catch break;
+            var iter = dir.iterate();
+            const empty = (iter.next(io) catch null) == null;
+            dir.close(io);
+            if (!empty) break;
+            std.Io.Dir.cwd().deleteDir(io, current) catch break;
+            current = std.fs.path.dirname(current) orelse break;
+        }
     }
 }
 

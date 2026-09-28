@@ -19,6 +19,28 @@ pub fn validateTreeEntryName(name: []const u8) !void {
     }
 }
 
+/// Validate a full worktree-relative path (as assembled from tree entries).
+///
+/// `validateTreeEntryName` only accepts a single component, because clone
+/// consumes one tree entry at a time. Checkout, merge and reset work on
+/// assembled paths like `src/lib/foo.zig`, so each component is checked
+/// separately here. Without this, a tree containing an entry named
+/// `../../../../home/user/.bashrc` made `restoreTree` write outside the
+/// worktree.
+pub fn validateWorktreePath(path: []const u8) !void {
+    if (path.len == 0) return error.UnsafeCheckoutEntryName;
+    if (std.fs.path.isAbsolute(path)) return error.UnsafeCheckoutEntryName;
+    // A backslash is a separator on Windows and a legal filename character on
+    // POSIX; rejecting it keeps a tree from changing meaning across platforms.
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return error.UnsafeCheckoutEntryName;
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        if (component.len == 0) continue; // collapse of "a//b" is harmless
+        try validateTreeEntryName(component);
+    }
+}
+
 /// Refuse to write into an existing non-empty destination. A symlink is also
 /// rejected so a clone cannot be redirected outside the user-named path.
 pub fn ensureEmptyDestination(io: std.Io, dest: []const u8) !void {

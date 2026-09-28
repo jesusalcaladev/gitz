@@ -9,6 +9,70 @@ pub const LineType = enum {
     deleted,
 };
 
+/// Result of splitting file content into diff lines.
+pub const SplitLines = struct {
+    lines: [][]const u8,
+    /// The last line is not newline-terminated, so a `\ No newline at end of
+    /// file` marker belongs after it.
+    missing_final_newline: bool,
+
+    pub fn deinit(self: SplitLines, allocator: Allocator) void {
+        allocator.free(self.lines);
+    }
+};
+
+/// Split file content into lines the way git does.
+///
+/// `std.mem.splitScalar` always yields a final empty element for content that
+/// ends in a newline. Diffing that phantom line produced an extra ` ` context
+/// line and an inflated `@@ -a,4 +b,2 @@` header, which made the emitted patch
+/// unappliable. A trailing newline terminates the last line instead.
+pub fn splitLines(allocator: Allocator, content: []const u8) !SplitLines {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer lines.deinit(allocator);
+
+    const ends_with_newline = content.len > 0 and content[content.len - 1] == '\n';
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        try lines.append(allocator, line);
+    }
+
+    if (ends_with_newline and lines.items.len > 0) {
+        _ = lines.pop();
+    }
+
+    return .{
+        .lines = try lines.toOwnedSlice(allocator),
+        .missing_final_newline = content.len > 0 and !ends_with_newline,
+    };
+}
+
+/// Render a `@@ -a,b +c,d @@` hunk header into `buf`.
+///
+/// Git omits a count that is exactly 1, on each side independently: a hunk
+/// with 4 old lines and 1 new line is `@@ -1,4 +1 @@`, not `@@ -1,4 +1,1 @@`.
+/// A count of 0 is always written, since `@@ -1 +1 @@` and `@@ -1,0 +1 @@` mean
+/// different things.
+pub fn formatHunkHeader(
+    buf: []u8,
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+) ![]const u8 {
+    if (old_count == 1 and new_count == 1) {
+        return std.fmt.bufPrint(buf, "@@ -{d} +{d} @@\n", .{ old_start, new_start });
+    }
+    if (new_count == 1) {
+        return std.fmt.bufPrint(buf, "@@ -{d},{d} +{d} @@\n", .{ old_start, old_count, new_start });
+    }
+    if (old_count == 1) {
+        return std.fmt.bufPrint(buf, "@@ -{d} +{d},{d} @@\n", .{ old_start, new_start, new_count });
+    }
+    return std.fmt.bufPrint(buf, "@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_count, new_start, new_count });
+}
+
 pub const DiffLine = struct {
     content: []const u8,
     old_line: ?u32 = null,

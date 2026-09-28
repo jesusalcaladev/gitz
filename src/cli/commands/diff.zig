@@ -6,6 +6,7 @@ const object = @import("../../core/object.zig");
 const refs = @import("../../core/refs.zig");
 const index_mod = @import("../../core/index.zig");
 const diff_mod = @import("../../core/diff.zig");
+const checkout_mod = @import("../../core/checkout.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var staged = false;
@@ -27,6 +28,39 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     try diffWorking(allocator, git_dir, io, no_color);
 }
 
+/// Flatten a commit's tree into path -> blob SHA.
+///
+/// The previous implementation iterated `tree.entries` of the root tree only,
+/// so every file under a subdirectory was invisible: `gitz diff` printed
+/// nothing for a change in `src/main.zig`, and `diff --staged` reported every
+/// nested file as brand new.
+fn flattenCommitTree(
+    allocator: std.mem.Allocator,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    head_sha: [20]u8,
+) !checkout_mod.FileMap {
+    var map = checkout_mod.FileMap.init(allocator);
+
+    const commit_obj = store.read(allocator, io.io, head_sha) catch return map;
+    defer commit_obj.deinit(allocator);
+    const commit = switch (commit_obj) {
+        .commit => |c| c,
+        else => return map,
+    };
+
+    checkout_mod.flattenTree(allocator, io.io, store, commit.tree, "", &map) catch {};
+    return map;
+}
+
+fn freeFileMap(allocator: std.mem.Allocator, map: *checkout_mod.FileMap) void {
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+    }
+    map.deinit();
+}
+
 fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_color: bool) !void {
     var idx = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch {
         try io.print("No changes\n", .{});
@@ -42,31 +76,8 @@ fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_colo
         return;
     };
 
-    // Get HEAD tree
-    var head_entries = std.StringHashMap([20]u8).init(allocator);
-    defer {
-        var iter = head_entries.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
-        head_entries.deinit();
-    }
-
-    const commit_obj = store.read(allocator, io.io, head_sha) catch return;
-    const commit = switch (commit_obj) {
-        .commit => |c| c,
-        else => return,
-    };
-    const tree_obj = store.read(allocator, io.io, commit.tree) catch return;
-    const tree = switch (tree_obj) {
-        .tree => |t| t,
-        else => return,
-    };
-
-    for (tree.entries) |entry| {
-        const owned_name = try allocator.dupe(u8, entry.name);
-        try head_entries.put(owned_name, entry.sha);
-    }
+    var head_entries = try flattenCommitTree(allocator, io, store, head_sha);
+    defer freeFileMap(allocator, &head_entries);
 
     var has_diff = false;
     for (idx.entries.items) |index_entry| {
@@ -75,46 +86,24 @@ fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_colo
         else
             index_entry.name;
 
-        if (head_entries.get(clean_name)) |old_sha| {
+        if (head_entries.get(clean_name)) |old_entry| {
             // Modified file - compare old vs new
-            if (std.mem.eql(u8, &old_sha, &index_entry.sha)) continue;
+            if (std.mem.eql(u8, &old_entry.sha, &index_entry.sha)) continue;
 
-            const old_obj = store.read(allocator, io.io, old_sha) catch continue;
-            const old_content = switch (old_obj) {
-                .blob => |b| b.content,
-                else => continue,
-            };
-
-            const new_obj = store.read(allocator, io.io, index_entry.sha) catch continue;
-            const new_content = switch (new_obj) {
-                .blob => |b| b.content,
-                else => continue,
-            };
+            const old_content = checkout_mod.readBlob(allocator, io.io, store, old_entry.sha) orelse continue;
+            defer allocator.free(old_content);
+            const new_content = checkout_mod.readBlob(allocator, io.io, store, index_entry.sha) orelse continue;
+            defer allocator.free(new_content);
 
             has_diff = true;
             try printDiff(allocator, io, clean_name, old_content, new_content, no_color);
         } else {
             // New file
-            const obj = store.read(allocator, io.io, index_entry.sha) catch continue;
-            const content = switch (obj) {
-                .blob => |b| b.content,
-                else => continue,
-            };
+            const content = checkout_mod.readBlob(allocator, io.io, store, index_entry.sha) orelse continue;
+            defer allocator.free(content);
 
             has_diff = true;
-            try io.print("diff --git a/{s} b/{s}\n", .{ clean_name, clean_name });
-            try io.print("new file mode 100644\n", .{});
-            try io.print("--- /dev/null\n", .{});
-            try io.print("+++ b/{s}\n", .{clean_name});
-
-            var lines = std.mem.splitScalar(u8, content, '\n');
-            while (lines.next()) |line| {
-                if (no_color) {
-                    try io.print("+{s}\n", .{line});
-                } else {
-                    try io.print("\x1b[32m+{s}\x1b[0m\n", .{line});
-                }
-            }
+            try printWholeFile(allocator, io, clean_name, content, .added, no_color);
         }
     }
 
@@ -123,24 +112,9 @@ fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_colo
     while (ht_iter.next()) |entry| {
         if (idx.get(entry.key_ptr.*) == null) {
             has_diff = true;
-            const old_obj = store.read(allocator, io.io, entry.value_ptr.*) catch continue;
-            const old_content = switch (old_obj) {
-                .blob => |b| b.content,
-                else => continue,
-            };
-            try io.print("diff --git a/{s} b/{s}\n", .{ entry.key_ptr.*, entry.key_ptr.* });
-            try io.print("deleted file mode 100644\n", .{});
-            try io.print("--- a/{s}\n", .{entry.key_ptr.*});
-            try io.print("+++ /dev/null\n", .{});
-
-            var lines = std.mem.splitScalar(u8, old_content, '\n');
-            while (lines.next()) |line| {
-                if (no_color) {
-                    try io.print("-{s}\n", .{line});
-                } else {
-                    try io.print("\x1b[31m-{s}\x1b[0m\n", .{line});
-                }
-            }
+            const old_content = checkout_mod.readBlob(allocator, io.io, store, entry.value_ptr.sha) orelse continue;
+            defer allocator.free(old_content);
+            try printWholeFile(allocator, io, entry.key_ptr.*, old_content, .deleted, no_color);
         }
     }
 
@@ -158,70 +132,29 @@ fn diffWorking(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_col
         return;
     };
 
-    // Get HEAD tree entries
-    var head_entries = std.StringHashMap([20]u8).init(allocator);
-    defer {
-        var iter = head_entries.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
-        head_entries.deinit();
-    }
-
-    const commit_obj = store.read(allocator, io.io, head_sha) catch return;
-    const commit = switch (commit_obj) {
-        .commit => |c| c,
-        else => return,
-    };
-    const tree_obj = store.read(allocator, io.io, commit.tree) catch return;
-    const tree = switch (tree_obj) {
-        .tree => |t| t,
-        else => return,
-    };
-
-    for (tree.entries) |entry| {
-        const owned_name = try allocator.dupe(u8, entry.name);
-        try head_entries.put(owned_name, entry.sha);
-    }
+    var head_entries = try flattenCommitTree(allocator, io, store, head_sha);
+    defer freeFileMap(allocator, &head_entries);
 
     var has_diff = false;
     var ht_iter = head_entries.iterator();
     while (ht_iter.next()) |entry| {
         const file_name = entry.key_ptr.*;
-        const blob_sha = entry.value_ptr.*;
+        const blob_sha = entry.value_ptr.sha;
 
         // Read current working tree version
         const new_content = std.Io.Dir.cwd().readFileAlloc(io.io, file_name, allocator, .unlimited) catch {
             // File deleted
             has_diff = true;
-            const old_obj = store.read(allocator, io.io, blob_sha) catch continue;
-            const old_content = switch (old_obj) {
-                .blob => |b| b.content,
-                else => continue,
-            };
-            try io.print("diff --git a/{s} b/{s}\n", .{ file_name, file_name });
-            try io.print("deleted file mode 100644\n", .{});
-            try io.print("--- a/{s}\n", .{file_name});
-            try io.print("+++ /dev/null\n", .{});
-
-            var lines = std.mem.splitScalar(u8, old_content, '\n');
-            while (lines.next()) |line| {
-                if (no_color) {
-                    try io.print("-{s}\n", .{line});
-                } else {
-                    try io.print("\x1b[31m-{s}\x1b[0m\n", .{line});
-                }
-            }
+            const old_content = checkout_mod.readBlob(allocator, io.io, store, blob_sha) orelse continue;
+            defer allocator.free(old_content);
+            try printWholeFile(allocator, io, file_name, old_content, .deleted, no_color);
             continue;
         };
         defer allocator.free(new_content);
 
         // Get old content
-        const old_obj = store.read(allocator, io.io, blob_sha) catch continue;
-        const old_content = switch (old_obj) {
-            .blob => |b| b.content,
-            else => continue,
-        };
+        const old_content = checkout_mod.readBlob(allocator, io.io, store, blob_sha) orelse continue;
+        defer allocator.free(old_content);
 
         if (!std.mem.eql(u8, old_content, new_content)) {
             has_diff = true;
@@ -234,24 +167,60 @@ fn diffWorking(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_col
     }
 }
 
-fn printDiff(allocator: std.mem.Allocator, io: Io, file_name: []const u8, old_content: []const u8, new_content: []const u8, no_color: bool) !void {
-    // Split into lines
-    var old_lines = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
-    defer old_lines.deinit(allocator);
-    var new_lines = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
-    defer new_lines.deinit(allocator);
+/// Emit a whole file as a single hunk, for added and deleted files.
+fn printWholeFile(
+    allocator: std.mem.Allocator,
+    io: Io,
+    file_name: []const u8,
+    content: []const u8,
+    line_type: diff_mod.LineType,
+    no_color: bool,
+) !void {
+    const split = try diff_mod.splitLines(allocator, content);
+    defer split.deinit(allocator);
 
-    var old_iter = std.mem.splitScalar(u8, old_content, '\n');
-    while (old_iter.next()) |line| {
-        try old_lines.append(allocator, line);
+    try io.print("diff --git a/{s} b/{s}\n", .{ file_name, file_name });
+    if (line_type == .added) {
+        try io.print("new file mode 100644\n", .{});
+        try io.print("--- /dev/null\n", .{});
+        try io.print("+++ b/{s}\n", .{file_name});
+    } else {
+        try io.print("deleted file mode 100644\n", .{});
+        try io.print("--- a/{s}\n", .{file_name});
+        try io.print("+++ /dev/null\n", .{});
     }
-    var new_iter = std.mem.splitScalar(u8, new_content, '\n');
-    while (new_iter.next()) |line| {
-        try new_lines.append(allocator, line);
+
+    const count: u32 = @intCast(split.lines.len);
+    var header_buf: [64]u8 = undefined;
+    const header = try diff_mod.formatHunkHeader(
+        &header_buf,
+        if (line_type == .added) 0 else 1,
+        if (line_type == .added) 0 else count,
+        if (line_type == .added) 1 else 0,
+        if (line_type == .added) count else 0,
+    );
+    try io.print("{s}", .{header});
+
+    for (split.lines) |line| {
+        switch (line_type) {
+            .added => try printLine(io, '+', line, .added, no_color),
+            else => try printLine(io, '-', line, .deleted, no_color),
+        }
     }
+
+    if (split.missing_final_newline) {
+        try io.print("\\ No newline at end of file\n", .{});
+    }
+}
+
+fn printDiff(allocator: std.mem.Allocator, io: Io, file_name: []const u8, old_content: []const u8, new_content: []const u8, no_color: bool) !void {
+    const old_split = try diff_mod.splitLines(allocator, old_content);
+    defer old_split.deinit(allocator);
+    const new_split = try diff_mod.splitLines(allocator, new_content);
+    defer new_split.deinit(allocator);
 
     // Run Myers diff
-    const diff_result = diff_mod.myersDiff(allocator, old_lines.items, new_lines.items) catch return;
+    const diff_result = diff_mod.myersDiff(allocator, old_split.lines, new_split.lines) catch return;
     defer diff_result.deinit(allocator);
 
     if (diff_result.isEmpty()) return;
@@ -261,28 +230,37 @@ fn printDiff(allocator: std.mem.Allocator, io: Io, file_name: []const u8, old_co
     try io.print("+++ b/{s}\n", .{file_name});
 
     for (diff_result.hunks) |hunk| {
-        try io.print("@@ -{d},{d} +{d},{d} @@\n", .{ hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count });
+        var header_buf: [64]u8 = undefined;
+        const header = try diff_mod.formatHunkHeader(
+            &header_buf,
+            hunk.old_start,
+            hunk.old_count,
+            hunk.new_start,
+            hunk.new_count,
+        );
+        try io.print("{s}", .{header});
 
         for (hunk.lines) |line| {
             switch (line.type) {
-                .context => {
-                    try io.print(" {s}\n", .{line.content});
-                },
-                .added => {
-                    if (no_color) {
-                        try io.print("+{s}\n", .{line.content});
-                    } else {
-                        try io.print("\x1b[32m+{s}\x1b[0m\n", .{line.content});
-                    }
-                },
-                .deleted => {
-                    if (no_color) {
-                        try io.print("-{s}\n", .{line.content});
-                    } else {
-                        try io.print("\x1b[31m-{s}\x1b[0m\n", .{line.content});
-                    }
-                },
+                .context => try io.print(" {s}\n", .{line.content}),
+                .added => try printLine(io, '+', line.content, .added, no_color),
+                .deleted => try printLine(io, '-', line.content, .deleted, no_color),
             }
         }
+    }
+
+    if (old_split.missing_final_newline and new_split.missing_final_newline) {
+        try io.print("\\ No newline at end of file\n", .{});
+    }
+}
+
+fn printLine(io: Io, prefix: u8, content: []const u8, line_type: diff_mod.LineType, no_color: bool) !void {
+    _ = line_type;
+    if (no_color) {
+        try io.print("{c}{s}\n", .{ prefix, content });
+    } else if (prefix == '+') {
+        try io.print("\x1b[32m+{s}\x1b[0m\n", .{content});
+    } else {
+        try io.print("\x1b[31m-{s}\x1b[0m\n", .{content});
     }
 }

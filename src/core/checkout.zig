@@ -3,6 +3,7 @@ const Sha1 = @import("sha1.zig").Sha1;
 const storage_mod = @import("storage.zig");
 const index_mod = @import("index.zig");
 const object = @import("object.zig");
+const safety = @import("../util/clone_safety.zig");
 
 /// Flat map of repository path -> blob SHA (plus mode).
 pub const FileEntry = struct {
@@ -154,9 +155,19 @@ pub fn restoreTree(
         defer allocator.free(full_path);
 
         if (entry.mode == 0o040000) {
+            // The assembled path is validated before it is used as a directory
+            // as well, so a crafted tree cannot create directories outside the
+            // worktree.
+            safety.validateWorktreePath(full_path) catch continue;
             std.Io.Dir.cwd().createDirPath(io, full_path) catch {};
             restoreTree(allocator, io, store, entry.sha, full_path);
         } else {
+            // `entry.name` comes straight from a fetched tree object. The clone
+            // entry points validated it, but checkout (reached from `switch`,
+            // `merge` and `merge --abort`) did not, so an entry named
+            // `../../../../home/user/.bashrc` wrote outside the worktree.
+            safety.validateWorktreePath(full_path) catch continue;
+
             const content = readBlob(allocator, io, store, entry.sha) orelse continue;
             defer allocator.free(content);
             if (std.fs.path.dirname(full_path)) |dir| {

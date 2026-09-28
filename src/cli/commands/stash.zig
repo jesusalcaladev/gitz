@@ -4,12 +4,14 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
+const ignore_mod = @import("../../core/ignore.zig");
+const checkout_mod = @import("../../core/checkout.zig");
 
 const StashInfo = struct { sha: [20]u8, message: []const u8 };
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     if (args.len == 0) {
-        try stashSave(allocator, git_dir, null, io);
+        try stashSave(allocator, git_dir, null, false, io);
         return;
     }
 
@@ -17,16 +19,21 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     if (std.mem.eql(u8, subcmd, "push") or std.mem.eql(u8, subcmd, "save")) {
         var message: ?[]const u8 = null;
+        var include_untracked = false;
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "-m") and i + 1 < args.len) {
                 i += 1;
                 message = args[i];
+            } else if (std.mem.eql(u8, args[i], "-u") or
+                std.mem.eql(u8, args[i], "--include-untracked"))
+            {
+                include_untracked = true;
             } else if (!std.mem.startsWith(u8, args[i], "-")) {
                 if (message == null) message = args[i];
             }
         }
-        try stashSave(allocator, git_dir, message, io);
+        try stashSave(allocator, git_dir, message, include_untracked, io);
     } else if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
         try stashList(allocator, git_dir, io);
     } else if (std.mem.eql(u8, subcmd, "pop")) {
@@ -61,7 +68,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 }
 
 /// Save working tree state as a commit object
-fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]const u8, io: Io) !void {
+///
+/// `include_untracked` mirrors git's `-u`. Without it only tracked
+/// modifications are stashed.
+fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]const u8, include_untracked: bool, io: Io) !void {
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
@@ -97,7 +107,10 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
     var tree_entries = std.ArrayList(object.TreeEntry){ .items = &.{}, .capacity = 0 };
     defer tree_entries.deinit(allocator);
 
-    // Also get untracked files for the stash (like git stash does)
+    // Untracked files are only stashed on request. The previous version always
+    // swept them in and then deleted them from the working tree, so a plain
+    // `gitz stash` destroyed build output, `node_modules/`, `.env` and every
+    // other untracked or ignored file in the repository.
     var untracked_entries = std.ArrayList(object.TreeEntry){ .items = &.{}, .capacity = 0 };
     defer untracked_entries.deinit(allocator);
 
@@ -110,8 +123,11 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
         const file_content = std.Io.Dir.cwd().readFileAlloc(io.io, rel_path, allocator, .unlimited) catch continue;
         defer allocator.free(file_content);
 
-        // Compute SHA of current working file content
-        const work_sha = Sha1.hash(file_content);
+        // A tree entry holds a *blob* SHA, which is the hash of
+        // "blob <len>\0" + content. Hashing the raw content instead never
+        // matched, so every tracked file looked modified and `gitz stash` never
+        // reported "No local changes to save".
+        const work_sha = checkout_mod.blobSha(allocator, file_content) catch continue;
 
         // Only include if the working file differs from what's in HEAD
         if (!std.mem.eql(u8, &old_sha, &work_sha)) {
@@ -127,8 +143,9 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
         }
     }
 
-    // Also scan for untracked files (not in .gitz, not in HEAD tree)
-    try collectUntrackedFiles(allocator, git_dir, io.io, "", &tracked_files, &untracked_entries);
+    if (include_untracked) {
+        try collectUntrackedFiles(allocator, git_dir, io.io, "", &tracked_files, &untracked_entries);
+    }
 
     // Merge tracked modified + untracked into one tree
     for (untracked_entries.items) |entry| {
@@ -285,6 +302,15 @@ fn collectUntrackedFiles(
         try allocator.dupe(u8, ".");
     try dirs_to_visit.append(allocator, .{ .path = initial_path, .prefix = initial_prefix });
 
+    // Without this, `gitz stash -u` swept up .gitignore'd build output and
+    // then deleted it from the working tree.
+    var ignore_stack = ignore_mod.IgnoreStack.init(allocator);
+    defer ignore_stack.deinit();
+    ignore_stack.loadFile(io, ".gitignore") catch {};
+    const exclude_path = try std.fmt.allocPrint(allocator, "{s}/info/exclude", .{git_dir});
+    defer allocator.free(exclude_path);
+    ignore_stack.loadFile(io, exclude_path) catch {};
+
     while (dirs_to_visit.items.len > 0) {
         const item = dirs_to_visit.pop() orelse break;
         defer allocator.free(item.path);
@@ -328,10 +354,22 @@ fn collectUntrackedFiles(
                     };
 
                     if (is_dir) {
-                        try dirs_to_visit.append(allocator, .{ .path = full_path, .prefix = rel_path });
+                        // Ignore rules that name a directory prune the whole
+                        // subtree, exactly as git does.
+                        if (!ignore_stack.isIgnored(rel_path, true)) {
+                            try dirs_to_visit.append(allocator, .{ .path = full_path, .prefix = rel_path });
+                        } else {
+                            allocator.free(full_path);
+                            allocator.free(rel_path);
+                        }
                     } else {
                         // Check if this file is tracked
                         if (tracked.contains(rel_path)) {
+                            allocator.free(full_path);
+                            allocator.free(rel_path);
+                        } else if (ignore_stack.isIgnored(rel_path, false)) {
+                            // Ignored files are never stashed, not even with
+                            // `-u`; `git stash -u` leaves them alone.
                             allocator.free(full_path);
                             allocator.free(rel_path);
                         } else {
