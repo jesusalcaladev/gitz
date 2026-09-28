@@ -12,7 +12,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // deletions included. Without `-A` there is still nothing to do.
     var stage_all = false;
     var paths: std.ArrayList([]const u8) = .empty;
-    defer paths.deinit(allocator);
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "-A") or std.mem.eql(u8, arg, "--all") or
@@ -24,7 +27,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             // includes files that were deleted from the worktree.
             stage_all = true;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
-            try paths.append(allocator, arg);
+            // The command runs from the worktree root, so a path typed inside a
+            // subdirectory has to be re-anchored: `gitz add c.txt` in src/deep
+            // means src/deep/c.txt, not <root>/c.txt.
+            try paths.append(allocator, try io.rebasePath(arg));
         }
     }
 

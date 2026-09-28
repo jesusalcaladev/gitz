@@ -324,7 +324,14 @@ fn collectWorkingTree(allocator: std.mem.Allocator, io: std.Io, dir_path: []cons
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, e.name });
 
         if (e.kind == .directory) {
-            if (ignore.isIgnored(full_path, true) or std.mem.eql(u8, e.name, ".gitz")) {
+            // Both repository directories are skipped. Walking a real `.git`
+            // reported every object, ref and index file as untracked, so a
+            // repository that also had a git clone listed hundreds of entries
+            // that are not the user's work.
+            if (ignore.isIgnored(full_path, true) or
+                std.mem.eql(u8, e.name, ".gitz") or
+                std.mem.eql(u8, e.name, ".git"))
+            {
                 allocator.free(full_path);
                 continue;
             }

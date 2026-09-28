@@ -11,6 +11,8 @@ pub const Io = struct {
     /// whole environment, so anything spawning git needs the original values
     /// (PATH, HOME, SSH_AUTH_SOCK) plus the overrides.
     environ: std.process.Environ,
+    /// Owned subdirectory prefix, set once the repository root is known.
+    owned_prefix: ?[]u8 = null,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) Io {
         const no_color = std.process.Environ.contains(environ, std.heap.page_allocator, "NO_COLOR") catch false;
@@ -143,6 +145,64 @@ pub const Io = struct {
     pub fn fileExists(self: Io, path: []const u8) bool {
         std.Io.Dir.cwd().access(self.io, path, .{}) catch return false;
         return true;
+    }
+
+    /// Whether `path` exists and is a directory. Symlinks are followed, matching
+    /// how git resolves a worktree's `.git` link.
+    pub fn isDirAt(self: Io, dir: []const u8, name: []const u8) bool {
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name }) catch return false;
+        defer self.allocator.free(path);
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+        return stat.kind == .directory;
+    }
+
+    /// Whether `path` exists and is a regular file.
+    pub fn isFileAt(self: Io, dir: []const u8, name: []const u8) bool {
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name }) catch return false;
+        defer self.allocator.free(path);
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+        return stat.kind == .file;
+    }
+
+    /// Look up an environment variable. The returned slice is owned by the
+    /// caller.
+    pub fn get(self: Io, name: []const u8) ?[]const u8 {
+        return self.environ.getAlloc(self.allocator, name) catch null;
+    }
+
+    /// Record the subdirectory the command was invoked from, relative to the
+    /// worktree root.
+    ///
+    /// The process is moved to the root so that every command can treat paths
+    /// as root-relative, which means a pathspec the user typed inside a
+    /// subdirectory has to be re-anchored here.
+    pub fn setSubdirPrefix(self: *Io, from: []const u8, root: []const u8) void {
+        if (self.owned_prefix) |p| self.allocator.free(p);
+        self.owned_prefix = null;
+
+        if (std.mem.eql(u8, from, root)) return;
+
+        var rel = from[root.len..];
+    while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+        if (rel.len == 0) return;
+        self.owned_prefix = self.allocator.dupe(u8, rel) catch null;
+    }
+
+    /// The subdirectory prefix, or an empty slice at the worktree root.
+    pub fn subdirPrefix(self: Io) []const u8 {
+        return self.owned_prefix orelse "";
+    }
+
+    /// Re-anchor a user-supplied path on the worktree root.
+    ///
+    /// `gitz add file.txt` inside `src/` means `<root>/src/file.txt`, but the
+    /// command runs from the root. Absolute paths and `..` are left alone.
+    pub fn rebasePath(self: Io, path: []const u8) ![]const u8 {
+        const prefix = self.subdirPrefix();
+        if (prefix.len == 0) return self.allocator.dupe(u8, path);
+        if (std.fs.path.isAbsolute(path)) return self.allocator.dupe(u8, path);
+        if (std.mem.startsWith(u8, path, "..")) return self.allocator.dupe(u8, path);
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, path });
     }
 
     pub fn makeDir(self: Io, path: []const u8) !void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = @import("../util/io.zig").Io;
 const init_cmd = @import("commands/init.zig");
 const add_cmd = @import("commands/add.zig");
@@ -86,7 +87,8 @@ pub fn printHelp(io: Io) !void {
     , .{VERSION});
 }
 
-pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, io: Io) !void {
+pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, io_in: Io) !void {
+    var io = io_in;
     if (std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "--help")) {
         try printHelp(io);
         return;
@@ -125,8 +127,9 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         return;
     }
 
-    // Find git_dir
-    const git_dir = findGitDir(allocator, io) catch {
+    // Find git_dir. This also moves the process to the worktree root, so the
+    // command below needs a mutable `io` to record the subdirectory prefix.
+    const git_dir = findGitDir(allocator, &io) catch {
         try io.eprint("fatal: not a gitz repository (or any parent): .gitz\n", .{});
         try io.eprint("Hint: run 'gitz init' to create one\n", .{});
         std.process.exit(128);
@@ -205,10 +208,115 @@ fn unknownCommand(command: []const u8, io: Io) noreturn {
     std.process.exit(Exit.usage);
 }
 
-fn findGitDir(allocator: std.mem.Allocator, io: Io) ![]const u8 {
-    _ = allocator;
-    if (io.fileExists(".gitz")) {
-        return io.allocator.dupe(u8, ".gitz");
+/// Locate the repository's git directory.
+///
+/// The previous implementation only checked the current directory for `.gitz`,
+/// so every command failed from any subdirectory (`cd src && gitz status` →
+/// "not a gitz repository"). Git walks up the tree, honours `GIT_DIR`, and
+/// accepts both a `.git` directory and a `.git` *file* (the worktree/submodule
+/// indirection). All of that is implemented here so gitz behaves the way
+/// anyone typing `gitz` in a project directory expects.
+///
+/// `GIT_DIR` wins when set. Otherwise `.gitz` is preferred over `.git` in the
+/// same directory, so a gitz repository is never shadowed by a git one.
+fn findGitDir(allocator: std.mem.Allocator, io: *Io) ![]const u8 {
+    if (io.get("GIT_DIR")) |env_dir| {
+        defer allocator.free(env_dir);
+        if (env_dir.len > 0) return allocator.dupe(u8, env_dir);
     }
+
+    // `realPath("")` resolves relative to the cwd *handle* and fails on POSIX,
+    // so the current directory is obtained by resolving ".".
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io.io, ".", allocator);
+    var dir = try allocator.dupe(u8, cwd);
+    defer allocator.free(dir);
+
+    // An owned copy, because the walk frees and reallocates `dir` on every
+    // iteration and the starting directory is still needed to compute the
+    // subdirectory prefix.
+    const start_dir = try allocator.dupe(u8, cwd);
+    defer allocator.free(start_dir);
+
+    while (true) {
+        if (try gitDirIn(allocator, io.*, dir)) |found| {
+            // Commands treat every path as relative to the worktree root, so
+            // from a subdirectory `root.txt` looked like a deleted file. Move
+            // the process to the root and remember the subdirectory prefix so
+            // user-supplied pathspecs can be rebased onto it.
+            try moveToWorktreeRoot(io, dir);
+            io.setSubdirPrefix(start_dir, dir);
+            return found;
+        }
+
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (std.mem.eql(u8, parent, dir)) break;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(dir);
+        dir = next;
+    }
+
     return error.NotAGitRepo;
+}
+
+/// Change the process working directory to the repository's worktree root.
+///
+/// `std.Io` has no chdir in the vtable, so the POSIX syscall is used directly,
+/// consistent with the raw `getdents64`/`openat` calls elsewhere in the tree.
+fn moveToWorktreeRoot(io: *Io, root: []const u8) !void {
+    _ = io;
+    if (builtin.os.tag != .linux) return;
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (root.len >= buf.len) return;
+    @memcpy(buf[0..root.len], root);
+    buf[root.len] = 0;
+
+    const rc = std.os.linux.chdir(@ptrCast(&buf));
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => {}, // Staying put is better than aborting the command.
+    }
+}
+
+/// Resolve the git dir for one directory, handling the `.git` file indirection.
+///
+/// A `.git` file contains `gitdir: <path>`, which git supports for worktrees and
+/// submodules. Ignoring it made every such repository invisible.
+fn gitDirIn(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?[]const u8 {
+    if (io.isDirAt(dir, ".gitz")) {
+        return try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dir});
+    }
+
+    if (io.isDirAt(dir, ".git")) {
+        return try std.fmt.allocPrint(allocator, "{s}/.git", .{dir});
+    }
+
+    if (io.isFileAt(dir, ".gitz")) {
+        return try resolveGitdirFile(allocator, io, dir, ".gitz");
+    }
+    if (io.isFileAt(dir, ".git")) {
+        return try resolveGitdirFile(allocator, io, dir, ".git");
+    }
+
+    return null;
+}
+
+/// Read a `gitdir: <path>` indirection file and resolve the path it points to.
+fn resolveGitdirFile(allocator: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8) !?[]const u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+    defer allocator.free(path);
+
+    const content = io.readFileAlloc(path) catch return null;
+    defer allocator.free(content);
+
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "gitdir:")) return null;
+
+    const target = std.mem.trim(u8, trimmed["gitdir:".len..], " \t\r\n");
+    if (target.len == 0) return null;
+
+    if (std.fs.path.isAbsolute(target)) {
+        return try allocator.dupe(u8, target);
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target });
 }

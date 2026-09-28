@@ -108,11 +108,24 @@ pub const LooseStore = struct {
     }
 
     fn writeSerialized(self: LooseStore, allocator: std.mem.Allocator, io: std.Io, sha: [20]u8, data: []const u8) !void {
+        // Content-addressed storage: if the object is already there, its bytes
+        // are by definition identical, so there is nothing to write.
+        //
+        // Skipping the write is also required, not just an optimisation. Git
+        // creates loose objects read-only (0444), so opening an existing one
+        // with createFile fails with AccessDenied. That made every write into a
+        // repository git had touched -- including any clone with alternates --
+        // abort with "error: AccessDenied".
+        const hex = Sha1.hex(sha);
+        const existing = try std.fmt.allocPrint(allocator, "{s}/objects/{s}/{s}", .{ self.git_dir, hex[0..2], hex[2..40] });
+        defer allocator.free(existing);
+        if (std.Io.Dir.cwd().access(io, existing, .{})) |_| {
+            return;
+        } else |_| {}
+
         const objects_dir = try std.fmt.allocPrint(allocator, "{s}/objects", .{self.git_dir});
         defer allocator.free(objects_dir);
         try std.Io.Dir.cwd().createDirPath(io, objects_dir);
-
-        const hex = Sha1.hex(sha);
 
         const sub_path = try std.fmt.allocPrint(allocator, "{s}/objects/{s}", .{ self.git_dir, hex[0..2] });
         defer allocator.free(sub_path);
