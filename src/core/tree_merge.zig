@@ -303,6 +303,12 @@ pub const MergedEntry = struct {
     conflict: bool,
     /// Conflict-marker text to place in the working tree (owned), if any.
     marker_content: ?[]const u8,
+    /// Blob of the other side of a conflict, when there is one. Staging both
+    /// sides is what lets `checkout --ours/--theirs` work and what makes the
+    /// unmerged state visible in `status`.
+    their_sha: ?[20]u8 = null,
+    /// Blob of the merge base, when it is known.
+    base_sha: ?[20]u8 = null,
 };
 
 pub const TreeMergeResult = struct {
@@ -392,6 +398,8 @@ pub fn mergeCommits(
         var final_sha: ?[20]u8 = null;
         var conflict = false;
         var markers: ?[]const u8 = null;
+        var their_sha: ?[20]u8 = null;
+        const entry_base_sha: ?[20]u8 = if (b) |e| e.sha else null;
         var mode: u32 = 0o100644;
         if (o) |e| mode = e.mode else if (t) |e| mode = e.mode;
 
@@ -457,12 +465,18 @@ pub fn mergeCommits(
         }
 
         if (final_sha) |sha| {
+            // On a conflict, `sha` is our side; the other side has to be
+            // recorded too, otherwise the index can only stage one of them and
+            // `checkout --theirs` is impossible.
+            if (conflict) their_sha = t.?.sha;
             try results.append(allocator, .{
                 .path = try allocator.dupe(u8, path),
                 .mode = mode,
                 .sha = sha,
                 .conflict = conflict,
                 .marker_content = markers,
+                .their_sha = their_sha,
+                .base_sha = entry_base_sha,
             });
         } else if (markers) |m| {
             allocator.free(m); // deleted + markers shouldn't happen; be safe

@@ -10,6 +10,27 @@ pub const StatInfo = struct {
     ino: u32 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
+    /// Conflict stage; only meaningful when staging a merge result.
+    stage: Stage = .normal,
+};
+
+/// A merge conflict stage. Git keeps three entries per conflicted path: the
+/// common ancestor (1), our side (2) and theirs (3). A single stage-0 entry
+/// means the other side is silently dropped when the merge is committed.
+pub const Stage = enum(u16) {
+    normal = 0,
+    base = 1,
+    ours = 2,
+    theirs = 3,
+
+    pub fn fromBits(bits: u16) Stage {
+        return switch (bits) {
+            1 => .base,
+            2 => .ours,
+            3 => .theirs,
+            else => .normal,
+        };
+    }
 };
 
 pub const IndexEntry = struct {
@@ -17,6 +38,8 @@ pub const IndexEntry = struct {
     mode: u32 = 0o100644,
     size: u32 = 0,
     flags: u16 = 0,
+    /// The merge-conflict stage; 0 for an ordinary entry.
+    stage: Stage = .normal,
     mtime: i64 = 0,
     ctime: i64 = 0,
     dev: u32 = 0,
@@ -76,8 +99,27 @@ pub const Index = struct {
             clean = buf.items;
         }
 
+        // Staging a resolved conflict (stage 0) clears the base/ours/theirs
+        // entries for that path. Without this, `git add <file>` after resolving
+        // left the three stages in place, so the path stayed unmerged forever
+        // and no commit was ever possible.
+        if (stat.stage == .normal) {
+            var i: usize = 0;
+            while (i < self.entries.items.len) {
+                const e = self.entries.items[i];
+                if (e.stage != .normal and std.mem.eql(u8, e.name, clean)) {
+                    allocator.free(e.name);
+                    _ = self.entries.orderedRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
+        // A conflicted path holds one entry per stage, so the match is on name
+        // *and* stage.
         for (self.entries.items, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.name, clean)) {
+            if (std.mem.eql(u8, entry.name, clean) and entry.stage == stat.stage) {
                 // Duplicate first: freeing the old name before the allocation
                 // below left a dangling pointer if the allocation failed.
                 const new_name = try allocator.dupe(u8, clean);
@@ -92,7 +134,33 @@ pub const Index = struct {
             }
         }
         const owned_name = try allocator.dupe(u8, clean);
-        try self.entries.append(allocator, .{ .sha = sha, .size = stat.size, .mtime = stat.mtime, .ctime = stat.ctime, .mode = stat.mode, .name = owned_name });
+        try self.entries.append(allocator, .{ .sha = sha, .size = stat.size, .mtime = stat.mtime, .ctime = stat.ctime, .mode = stat.mode, .stage = stat.stage, .name = owned_name });
+    }
+
+    /// Whether any entry is an unresolved conflict (stage 1, 2 or 3).
+    ///
+    /// `gitz commit` must refuse while this is true, otherwise the merge is
+    /// completed with one side of every conflict silently discarded.
+    pub fn hasConflicts(self: Index) bool {
+        for (self.entries.items) |entry| {
+            if (entry.stage != .normal) return true;
+        }
+        return false;
+    }
+
+    /// Paths that have unresolved conflicts, each listed once.
+    pub fn conflictedPaths(self: Index, allocator: std.mem.Allocator) [][]const u8 {
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (self.entries.items) |entry| {
+            if (entry.stage == .normal) continue;
+            if (seen.contains(entry.name)) continue;
+            seen.put(entry.name, {}) catch return paths.toOwnedSlice(allocator) catch &.{};
+            paths.append(allocator, entry.name) catch break;
+        }
+        return paths.toOwnedSlice(allocator) catch &.{};
     }
 
     /// Remove the entry for `name`. Returns true when an entry was removed.
@@ -110,6 +178,11 @@ pub const Index = struct {
     /// Build hierarchical git tree from flat index entries.
     pub fn writeTree(self: *Index, store: anytype, allocator: std.mem.Allocator, io: std.Io) ![20]u8 {
         const object = @import("object.zig");
+
+        // A tree entry holds one SHA per path, so writing a tree while a
+        // conflict is unresolved would record one arbitrary side of it as if it
+        // were the agreed result. Git refuses the commit instead.
+        if (self.hasConflicts()) return error.UnmergedPaths;
 
         var files: std.ArrayList(object.TreeEntry) = .empty;
         defer files.deinit(allocator);
@@ -220,12 +293,14 @@ pub const Index = struct {
             std.mem.writeInt(u32, buf[pos..][0..4], entry.size, .big); pos += 4;
             @memcpy(buf[pos..][0..20], &entry.sha); pos += 20;
 
-            // The low 12 bits of the flags word hold the name length. They used
-            // to be written as whatever `StatInfo.flags` held (usually 0), so
-            // git read every entry as having an empty name.
+            // The flags word packs the name length (low 12 bits) and the
+            // conflict stage (bits 12-13). Both were written as 0, so git read
+            // every entry as having an empty name and never saw a conflict.
             const name_len = entry.name.len;
             const flag_len: u16 = if (name_len >= 0xFFF) 0xFFF else @intCast(name_len);
-            const flags: u16 = (entry.flags & 0xF000) | flag_len;
+            const stage_bits: u16 = @intFromEnum(entry.stage) << 12;
+            const assume_valid: u16 = if (entry.flags & 0x8000 != 0) 0x8000 else 0;
+            const flags: u16 = assume_valid | stage_bits | flag_len;
             std.mem.writeInt(u16, buf[pos..][0..2], flags, .big); pos += 2;
 
             try emit.put(&body, allocator, buf[0..pos]);
@@ -342,6 +417,7 @@ pub const Index = struct {
                 .ino = ino,
                 .uid = uid,
                 .gid = gid,
+                .stage = Stage.fromBits(flags >> 12),
             });
         }
 

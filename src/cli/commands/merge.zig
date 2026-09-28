@@ -15,10 +15,17 @@ const errors = @import("../errors.zig");
 const MERGE_HEAD = "MERGE_HEAD";
 const MERGE_MSG = "MERGE_MSG";
 
+/// How `-X ours` / `-X theirs` resolves a conflict.
+const ConflictStrategy = enum { ours, theirs };
+
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var no_ff = false;
     var ff_only = false;
     var abort = false;
+    var no_commit = false;
+    var squash = false;
+    var allow_unrelated = false;
+    var strategy: ?ConflictStrategy = null;
     var merge_msg: ?[]const u8 = null;
     var branch_name: ?[]const u8 = null;
 
@@ -31,10 +38,38 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             ff_only = true;
         } else if (std.mem.eql(u8, arg, "--abort")) {
             abort = true;
+        } else if (std.mem.eql(u8, arg, "--no-commit")) {
+            // Stop before committing, leaving the merge staged. Previously
+            // ignored, so `merge --no-commit` committed anyway.
+            no_commit = true;
+        } else if (std.mem.eql(u8, arg, "--squash")) {
+            // Stage the result without recording the merge. Previously ignored,
+            // so `merge --squash` produced a normal merge commit.
+            squash = true;
+        } else if (std.mem.eql(u8, arg, "--allow-unrelated-histories")) {
+            allow_unrelated = true;
+        } else if ((std.mem.eql(u8, arg, "-X") or std.mem.eql(u8, arg, "--strategy-option")) and i + 1 < args.len) {
+            // `-X ours` / `-X theirs` resolves a conflict by taking one side.
+            // Previously ignored, so `merge -X ours` still conflicted.
+            i += 1;
+            const opt = args[i];
+            if (std.mem.eql(u8, opt, "ours")) {
+                strategy = .ours;
+            } else if (std.mem.eql(u8, opt, "theirs")) {
+                strategy = .theirs;
+            } else {
+                errors.errorf(io, "unknown strategy option '{s}'", .{opt});
+            }
         } else if ((std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) and i + 1 < args.len) {
             i += 1;
             merge_msg = args[i];
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.startsWith(u8, arg, "--strategy=")) {
+            // A custom strategy is not implemented; refusing beats silently
+            // merging with the default one.
+            errors.errorf(io, "merge strategies are not supported", .{});
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            errors.errorf(io, "unknown option '{s}'", .{arg});
+        } else {
             branch_name = arg;
         }
     }
@@ -121,6 +156,45 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         errors.fatal(io, "could not merge '{s}'", .{name});
     defer merged.deinit(allocator);
 
+    // `-X ours` / `-X theirs` resolve every conflict by taking one side, so the
+    // merge completes. The option used to be ignored and the merge still
+    // conflicted, which is the opposite of what was asked for.
+    if (strategy) |chosen| {
+        for (merged.entries) |*e| {
+            if (!e.conflict) continue;
+            e.conflict = false;
+            e.marker_content = null;
+            const side = switch (chosen) {
+                .ours => e.sha,
+                .theirs => e.their_sha orelse e.sha,
+            };
+            e.sha = side;
+        }
+    }
+
+    // The merge rewrites the working tree, so local changes it would clobber
+    // have to be refused first. Only the fast-forward branch ran this check, so a
+    // real merge silently discarded uncommitted work.
+    //
+    // The comparison is against the *merge result*, not against the branch being
+    // merged: git also allows a merge when the dirty file is identical on both
+    // sides and therefore untouched by the merge.
+    {
+        const at_risk = try mergeAtRiskPaths(allocator, git_dir, io, store, &merged, current_sha);
+        defer {
+            for (at_risk) |p| allocator.free(p);
+            allocator.free(at_risk);
+        }
+
+        if (at_risk.len > 0) {
+            try io.eprint("error: Your local changes to the following files would be overwritten by merge:\n", .{});
+            for (at_risk) |p| try io.eprint("\t{s}\n", .{p});
+            try io.eprint("Please commit your changes or stash them before you merge.\n", .{});
+            try io.eprint("Aborting\n", .{});
+            std.process.exit(1);
+        }
+    }
+
     var conflicts: usize = 0;
     for (merged.entries) |e| {
         if (e.conflict) conflicts += 1;
@@ -137,8 +211,6 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // refresh both the working tree and the index so the repository stays
     // self-consistent.
     const tree_sha = try writeMergedTree(allocator, io, store, &merged);
-    const merge_sha = try writeMergeCommit(allocator, git_dir, io, store, tree_sha, current_sha, target_sha, merge_msg, name);
-    try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, merge_sha);
     try writeWorktree(allocator, git_dir, io, store, &merged);
 
     var idx = index_mod.Index.init(allocator);
@@ -146,9 +218,60 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     try indexFromMerged(allocator, &idx, &merged);
     try idx.writeToFile(git_dir, allocator, io.io);
 
+    // `--squash` and `--no-commit` both stop before the merge commit: the result
+    // is staged and MERGE_HEAD/MERGE_MSG are left for `gitz commit` to consume.
+    // Both used to be ignored, so `merge --squash` produced an ordinary merge
+    // commit with a second parent.
+    if (squash or no_commit) {
+        // `--squash` deliberately leaves no MERGE_HEAD: `gitz commit` reads that
+        // file to add a second parent, and a squash must produce a single-parent
+        // commit. Its message goes to SQUASH_MSG instead.
+        try writeMergeState(allocator, git_dir, io, target_sha, name, merge_msg, squash);
+        try io.print("Automatic merge went well; stopped before committing as requested\n", .{});
+        return;
+    }
+
+    const merge_sha = try writeMergeCommit(allocator, git_dir, io, store, tree_sha, current_sha, target_sha, merge_msg, name);
+    try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, merge_sha);
+
     const hex = Sha1.hex(merge_sha);
     try io.print("Merge made by the 'ort' strategy.\n", .{});
     try io.print(" {s}\n", .{hex[0..7]});
+}
+
+/// Record the pending-merge state so `gitz commit` finishes the work.
+fn writeMergeState(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    io: Io,
+    target_sha: [20]u8,
+    name: []const u8,
+    merge_msg: ?[]const u8,
+    squash: bool,
+) !void {
+    const msg = merge_msg orelse try std.fmt.allocPrint(allocator, "Merge branch '{s}'", .{name});
+    defer if (merge_msg == null) allocator.free(msg);
+
+    if (squash) {
+        const squash_path = try std.fmt.allocPrint(allocator, "{s}/SQUASH_MSG", .{git_dir});
+        defer allocator.free(squash_path);
+        try io.writeFile(squash_path, msg);
+        return;
+    }
+
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_HEAD });
+    defer allocator.free(head_path);
+
+    const hex = Sha1.hex(target_sha);
+    var wbuf: [42]u8 = undefined;
+    const line = try std.fmt.bufPrint(&wbuf, "{s}\n", .{&hex});
+    var hf = try std.Io.Dir.cwd().createFile(io.io, head_path, .{});
+    defer hf.close(io.io);
+    try std.Io.File.writeStreamingAll(hf, io.io, line);
+
+    const msg_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_MSG });
+    defer allocator.free(msg_path);
+    try io.writeFile(msg_path, msg);
 }
 
 /// Build the merged tree object from the merge result.
@@ -172,6 +295,24 @@ fn indexFromMerged(
     for (merged.entries) |e| {
         try idx.add(allocator, e.path, e.sha, .{ .mode = e.mode });
     }
+}
+
+/// The blob recorded for one side of a conflicted path.
+///
+/// `TreeMergeResult` exposes the merged/ours SHA; the base and theirs blobs
+/// come from the same struct when the three-way walk recorded them.
+fn stageBlob(merged: *const tree_merge.TreeMergeResult, path: []const u8, stage: index_mod.Stage) ?[20]u8 {
+    for (merged.entries) |e| {
+        if (!std.mem.eql(u8, e.path, path)) continue;
+        return switch (stage) {
+            // `e.sha` is our side of the conflict.
+            .ours => e.sha,
+            .base => e.base_sha orelse e.sha,
+            .theirs => e.their_sha orelse e.sha,
+            .normal => e.sha,
+        };
+    }
+    return null;
 }
 
 fn writeMergeCommit(
@@ -231,10 +372,42 @@ fn writeWorktree(
     var old_index = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch null;
     defer if (old_index) |*oi| oi.deinit(allocator);
 
+    // Only paths the merge actually changed are written. Writing every entry of
+    // the merged tree reset unrelated dirty files to their committed content, so
+    // an edit to a file the merge never touched was silently discarded.
+    var head_files = checkout.FileMap.init(allocator);
+    defer checkout.freeMap(allocator, &head_files);
+    {
+        const refs_manager = refs_mod.Refs.init(git_dir);
+        if (refs_manager.read(allocator, io.io, "HEAD")) |hs| {
+            if (store.read(allocator, io.io, hs)) |obj| {
+                var o = obj;
+                defer o.deinit(allocator);
+                if (o == .commit) {
+                    const t = o.commit.tree;
+                    checkout.flattenTree(allocator, io.io, store, t, "", &head_files) catch {};
+                }
+            } else |_| {}
+        } else |_| {}
+    }
+
     for (merged.entries) |e| {
+        const head_entry = head_files.get(e.path);
+        const differs = head_entry == null or !std.mem.eql(u8, &head_entry.?.sha, &e.sha);
+        if (!differs and !e.conflict) continue;
+
         if (std.fs.path.dirname(e.path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io.io, dir) catch {};
         }
+
+        // A conflicted path gets the markers in the working tree.
+        if (e.marker_content) |markers| {
+            var wf = std.Io.Dir.cwd().createFile(io.io, e.path, .{}) catch continue;
+            defer wf.close(io.io);
+            std.Io.File.writeStreamingAll(wf, io.io, markers) catch {};
+            continue;
+        }
+
         const content = checkout.readBlob(allocator, io.io, store, e.sha) orelse continue;
         defer allocator.free(content);
         var wf = std.Io.Dir.cwd().createFile(io.io, e.path, .{}) catch continue;
@@ -258,8 +431,8 @@ fn writeWorktree(
     }
 }
 
-/// True when the working tree has uncommitted changes to files that the
-/// fast-forward would replace.
+/// True when the working tree has uncommitted changes to files that the merge
+/// would replace.
 fn wouldLoseWork(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
@@ -272,6 +445,90 @@ fn wouldLoseWork(
     var r = report;
     defer r.deinit(allocator);
     return r.paths.len > 0;
+}
+
+/// The paths a merge would clobber because they carry uncommitted changes.
+///
+/// A path is at risk when the merge result differs from HEAD's version *and* the
+/// working tree differs from the index. Paths the merge leaves untouched are not
+/// reported, which is why a dirty file that is identical on both sides merges
+/// fine, as it does in git.
+fn mergeAtRiskPaths(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    merged: *const tree_merge.TreeMergeResult,
+    current_sha: [20]u8,
+) ![][]const u8 {
+    var risk: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (risk.items) |p| allocator.free(p);
+        risk.deinit(allocator);
+    }
+
+    var head_files = checkout.FileMap.init(allocator);
+    defer checkout.freeMap(allocator, &head_files);
+    {
+        const obj = store.read(allocator, io.io, current_sha) catch return &.{};
+        defer obj.deinit(allocator);
+        const commit = switch (obj) {
+            .commit => |c| c,
+            else => return &.{},
+        };
+        checkout.flattenTree(allocator, io.io, store, commit.tree, "", &head_files) catch return &.{};
+    }
+
+    var idx = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch null;
+    defer if (idx) |*i| i.deinit(allocator);
+
+    // Changed by the merge, so writing it would overwrite the worktree.
+    var changed = checkout.FileMap.init(allocator);
+    defer checkout.freeMap(allocator, &changed);
+    for (merged.entries) |e| {
+        const head_entry = head_files.get(e.path);
+
+        // A conflicted entry carries our own blob as its `sha` while the merge
+        // will write conflict markers over the file, so it counts as changed
+        // even though the SHA matches HEAD.
+        const differs = head_entry == null or !std.mem.eql(u8, &head_entry.?.sha, &e.sha);
+        if (differs or e.conflict) {
+            // The map keeps the slice, so ownership transfers here: freeing
+            // the key right after the insert left a dangling key and the whole
+            // set of "at risk" paths came out empty, so the dirty-tree check
+            // never fired.
+            const key = try allocator.dupe(u8, e.path);
+            if (changed.get(key) != null) {
+                allocator.free(key);
+                continue;
+            }
+            try changed.put(key, .{ .sha = e.sha, .mode = e.mode });
+        }
+    }
+
+    var it = changed.iterator();
+    while (it.next()) |entry| {
+        const path = entry.key_ptr.*;
+        const content = std.Io.Dir.cwd().readFileAlloc(io.io, path, allocator, .unlimited) catch continue;
+        defer allocator.free(content);
+
+        const work = checkout.blobSha(allocator, content) catch continue;
+        const staged = if (idx) |*i| indexShaOf(i, path) else null;
+        if (staged != null and std.mem.eql(u8, &staged.?, &work)) continue;
+
+        try risk.append(allocator, try allocator.dupe(u8, path));
+    }
+
+    return risk.toOwnedSlice(allocator);
+}
+
+fn indexShaOf(idx: *const index_mod.Index, path: []const u8) ?[20]u8 {
+    for (idx.entries.items) |entry| {
+        if (entry.stage != .normal) continue;
+        const clean = if (std.mem.startsWith(u8, entry.name, "./")) entry.name[2..] else entry.name;
+        if (std.mem.eql(u8, clean, path)) return entry.sha;
+    }
+    return null;
 }
 
 /// Conflicted merge: stage the cleanly merged paths, write conflict markers to
@@ -290,22 +547,59 @@ fn reportConflicts(
     var idx = index_mod.Index.init(allocator);
     defer idx.deinit(allocator);
 
+    // The index holds every path of the merged tree, but only the paths the
+    // merge actually changed are written to the working tree. Rewriting all of
+    // them reset unrelated dirty files to their committed content.
+    var head_files = checkout.FileMap.init(allocator);
+    defer checkout.freeMap(allocator, &head_files);
+    {
+        const refs_manager = refs_mod.Refs.init(git_dir);
+        if (refs_manager.read(allocator, io.io, "HEAD")) |hs| {
+            if (store.read(allocator, io.io, hs)) |obj| {
+                var o = obj;
+                defer o.deinit(allocator);
+                if (o == .commit) {
+                    const t = o.commit.tree;
+                    checkout.flattenTree(allocator, io.io, store, t, "", &head_files) catch {};
+                }
+            } else |_| {}
+        } else |_| {}
+    }
+
     for (merged.entries) |e| {
+        const head_entry = head_files.get(e.path);
+        const differs = head_entry == null or !std.mem.eql(u8, &head_entry.?.sha, &e.sha);
+        const touched = differs or e.conflict;
+
         if (e.conflict) {
             try io.eprint("CONFLICT (content): Merge conflict in {s}\n", .{e.path});
-            // The index keeps the "ours" blob until the user resolves it; the
-            // working tree shows the markers so they can see both sides.
-            try idx.add(allocator, e.path, e.sha, .{ .mode = e.mode });
-            if (e.marker_content) |markers| {
-                if (std.fs.path.dirname(e.path)) |dir| {
-                    std.Io.Dir.cwd().createDirPath(io.io, dir) catch {};
+
+            // The conflicted path is staged as three entries -- base, ours and
+            // theirs -- which is what lets `status` report an unmerged path and
+            // makes `commit` refuse until the user resolves it.
+            //
+            // A single stage-0 entry pointing at our side was written instead,
+            // so `gitz status` showed the file as merely modified and a plain
+            // `gitz commit` completed the merge with the other side thrown away
+            // and nothing in the output to say so.
+            for ([_]index_mod.Stage{ .base, .ours, .theirs }) |stage| {
+                const stage_sha = stageBlob(merged, e.path, stage) orelse continue;
+                try idx.add(allocator, e.path, stage_sha, .{ .mode = e.mode, .stage = stage });
+            }
+
+            if (touched) {
+                if (e.marker_content) |markers| {
+                    if (std.fs.path.dirname(e.path)) |dir| {
+                        std.Io.Dir.cwd().createDirPath(io.io, dir) catch {};
+                    }
+                    var wf = std.Io.Dir.cwd().createFile(io.io, e.path, .{}) catch continue;
+                    defer wf.close(io.io);
+                    std.Io.File.writeStreamingAll(wf, io.io, markers) catch {};
                 }
-                var wf = std.Io.Dir.cwd().createFile(io.io, e.path, .{}) catch continue;
-                defer wf.close(io.io);
-                std.Io.File.writeStreamingAll(wf, io.io, markers) catch {};
             }
         } else {
             try idx.add(allocator, e.path, e.sha, .{ .mode = e.mode });
+            if (!touched) continue;
             const content = checkout.readBlob(allocator, io.io, store, e.sha) orelse continue;
             defer allocator.free(content);
             if (std.fs.path.dirname(e.path)) |dir| {
@@ -316,6 +610,7 @@ fn reportConflicts(
             std.Io.File.writeStreamingAll(wf, io.io, content) catch {};
         }
     }
+
     try idx.writeToFile(git_dir, allocator, io.io);
 
     // Leave the merge in progress, exactly like git.

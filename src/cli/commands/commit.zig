@@ -74,6 +74,24 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
+    // A conflicted merge cannot be committed yet. The index holds three entries
+    // per conflicted path (base/ours/theirs); writing a tree would have to pick
+    // one of them, so the other side would be recorded as if it had been
+    // agreed. Git refuses, and says which paths are in the way.
+    if (!amend and idx.hasConflicts()) {
+        const paths = idx.conflictedPaths(allocator);
+        defer {
+            for (paths) |p| allocator.free(p);
+            allocator.free(paths);
+        }
+        try io.eprint("error: Committing is not possible because you have unmerged files.\n", .{});
+        try io.eprint("hint: Fix them up in the work tree, and then use 'gitz add'\n", .{});
+        try io.eprint("hint: as appropriate to mark resolution and make a commit.\n", .{});
+        try io.eprint("Unmerged paths:\n", .{});
+        for (paths) |p| try io.eprint("\t{s}\n", .{p});
+        std.process.exit(1);
+    }
+
     const tree_sha = try idx.writeTree(store, allocator, io.io);
 
     // "Nothing to commit" is about the tree, not about how many entries the

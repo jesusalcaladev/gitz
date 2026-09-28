@@ -202,11 +202,33 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     // Check staged files: compare index vs HEAD tree
+    //
+    // A conflicted path has three index entries (base/ours/theirs) and is not a
+    // staged modification: git lists it under "Unmerged paths" so the user knows
+    // the merge is unfinished. Reporting it as a normal change is what made
+    // `gitz status` look like an ordinary dirty tree after a failed merge.
+    var unmerged = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    defer unmerged.deinit(allocator);
+    for (idx.conflictedPaths(allocator)) |p| {
+        try unmerged.append(allocator, p);
+    }
+
     for (idx.entries.items) |entry| {
+        if (entry.stage != .normal) continue;
+
         const clean_name = if (std.mem.startsWith(u8, entry.name, "./"))
             entry.name[2..]
         else
             entry.name;
+
+        var is_unmerged = false;
+        for (unmerged.items) |p| {
+            if (std.mem.eql(u8, p, clean_name)) {
+                is_unmerged = true;
+                break;
+            }
+        }
+        if (is_unmerged) continue;
 
         if (head_shas.get(clean_name)) |head_sha_val| {
             if (!std.mem.eql(u8, &entry.sha, &head_sha_val)) {
@@ -228,6 +250,18 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const in_index = findIndexEntry(&idx, clean_name) != null;
 
         if (in_head or in_index) {
+            // A conflicted path is reported as `UU` only. The working tree holds
+            // the conflict markers, so comparing it against the index would also
+            // list the same file as a plain modification.
+            var is_unmerged_path = false;
+            for (unmerged.items) |p| {
+                if (std.mem.eql(u8, p, clean_name)) {
+                    is_unmerged_path = true;
+                    break;
+                }
+            }
+            if (is_unmerged_path) continue;
+
             // The unstaged comparison is against the *index*, not against HEAD.
             // Comparing with HEAD meant:
             //  - a staged-new file that was then edited was skipped entirely
@@ -276,6 +310,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     // ── Machine-readable output ──
     if (porcelain == .v1) {
+        // `UU` marks a path with an unresolved conflict, which is distinct from
+        // a staged change.
+        for (unmerged.items) |name| try io.print("UU {s}\n", .{name});
+
         if (show_branch_header) {
             switch (head_info) {
                 .branch => |b| try io.print("## {s}\n", .{b.name.items}),
@@ -338,7 +376,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const n_unstaged = unstaged_modified.items.len + unstaged_deleted.items.len;
     const n_untracked = if (untracked_mode == .no) 0 else untracked_list.items.len;
 
-    if (n_staged == 0 and n_unstaged == 0 and n_untracked == 0) {
+    if (n_staged == 0 and n_unstaged == 0 and n_untracked == 0 and unmerged.items.len == 0) {
         try io.print("\n  \x1b[1;32m✓\x1b[0m \x1b[2mWorking tree clean\x1b[0m\n", .{});
         return;
     }
@@ -371,6 +409,17 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         for (unstaged_deleted.items) |name| {
             try io.print("    \x1b[31m-\x1b[0m \x1b[31m{s} (deleted)\x1b[0m\n", .{name});
         }
+        try io.print("\n", .{});
+    }
+
+    // ── Unmerged paths ──
+    if (unmerged.items.len > 0) {
+        try io.print("  \x1b[1;31mUnmerged paths\x1b[0m", .{});
+        try io.print(" \x1b[2m({d} file{s})\x1b[0m\n", .{ unmerged.items.len, if (unmerged.items.len == 1) "" else "s" });
+        for (unmerged.items) |name| {
+            try io.print("    \x1b[1;31mUU\x1b[0m {s}\n", .{name});
+        }
+        try io.print("\n  \x1b[2mgitz add <file>  (after resolving)\x1b[0m\n", .{});
         try io.print("\n", .{});
     }
 
