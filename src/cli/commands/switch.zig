@@ -4,6 +4,7 @@ const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
 const checkout = @import("../../core/checkout.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 /// gitz switch <branch>          -> change to an existing branch
 /// gitz switch -c <branch>       -> create the branch at HEAD and change to it
@@ -11,7 +12,11 @@ const errors = @import("../errors.zig");
 /// Unlike the old implementation (which only rewrote HEAD), this performs a
 /// real checkout: the index and working tree end up matching the target
 /// commit, and uncommitted work is never silently destroyed.
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var create = false;
     var name: ?[]const u8 = null;
 
@@ -32,8 +37,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         std.process.exit(1);
     };
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     if (!refs_mod.Refs.isValidRefName(branch_name)) {
         errors.errorf(io, "'{s}' is not a valid branch name", .{branch_name});
@@ -78,7 +83,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     // Safety: never clobber uncommitted changes.
-    var dirty = checkout.checkSafeToReplace(allocator, git_dir, io.io, store, target_sha) catch null;
+    var dirty = checkout.checkSafeToReplace(allocator, repo, io.io, store, target_sha) catch null;
     defer if (dirty) |*d| d.deinit(allocator);
     if (dirty) |d| {
         if (d.paths.len > 0) {
@@ -90,7 +95,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     // Real checkout: index + working tree match the target commit.
-    checkout.checkoutCommit(allocator, git_dir, io.io, store, target_sha) catch |err| {
+    checkout.checkoutCommit(allocator, repo, io.io, store, target_sha) catch |err| {
         try io.eprint("fatal: checkout failed: {}\n", .{err});
         std.process.exit(1);
     };

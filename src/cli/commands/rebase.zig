@@ -9,8 +9,12 @@ const checkout_mod = @import("../../core/checkout.zig");
 const index_mod = @import("../../core/index.zig");
 const config_cmd = @import("config.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     var abort_mode = false;
     var interactive = false;
     var continue_mode = false;
@@ -41,13 +45,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (abort_mode) {
-        try abortRebase(allocator, git_dir, io);
+        try abortRebase(allocator, repo.worktree_dir, io);
         return;
     }
     if (continue_mode) {
         // Previously always reported "No rebase in progress", so a conflicted
         // rebase could never be finished.
-        try continueRebase(allocator, git_dir, io);
+        try continueRebase(allocator, repo, io);
         return;
     }
 
@@ -56,8 +60,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         std.process.exit(1);
     };
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
         try io.eprint("fatal: not a gitz repository\n", .{});
@@ -142,11 +146,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (interactive) {
-        try interactiveRebase(allocator, git_dir, io, store, &refs_manager, &shas_to_replay, &commits_to_replay, onto_sha, &head_info);
+        try interactiveRebase(allocator, repo, io, store, &refs_manager, &shas_to_replay, &commits_to_replay, onto_sha, &head_info);
         return;
     }
 
-    try replayCommits(allocator, git_dir, io, store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
+    try replayCommits(allocator, repo, io, store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
     try io.print("Successfully rebased and updated refs/heads/{s}.\n", .{switch (head_info) {
         .branch => |b| b.name.items,
         .unborn => |u| u.name.items,
@@ -166,7 +170,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 /// every path, which is what a rebase is.
 fn replayCommits(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     store: storage_mod.StorageBackend,
     refs_manager: *const refs_mod.Refs,
@@ -194,7 +198,6 @@ fn replayCommits(
 
         var result = try replayOne(
             allocator,
-            git_dir,
             io,
             store,
             original_parent_tree,
@@ -214,9 +217,9 @@ fn replayCommits(
         const now_ts = std.Io.Timestamp.now(io.io, .real);
         const now: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
 
-        const committer_name = config_cmd.getUserName(allocator, git_dir, io);
+        const committer_name = config_cmd.getUserName(allocator, repo.common_dir, io);
         defer if (!std.mem.eql(u8, committer_name, "GitZ User")) allocator.free(committer_name);
-        const committer_email = config_cmd.getUserEmail(allocator, git_dir, io);
+        const committer_email = config_cmd.getUserEmail(allocator, repo.common_dir, io);
         defer if (!std.mem.eql(u8, committer_email, "user@gitz.dev")) allocator.free(committer_email);
 
         // The author and date of the original commit are preserved; the
@@ -238,11 +241,11 @@ fn replayCommits(
             // Stop where git stops, with the state on disk so `--continue` and
             // `--abort` work. Previously the conflict was never noticed and the
             // rebased branch was written as if it were clean.
-            try writeRebaseState(allocator, git_dir, io, new_base, current_parent, i);
+            try writeRebaseState(allocator, repo.worktree_dir, io, new_base, current_parent, i);
             // The index keeps the conflict stages, so `status` reports the path
             // as unmerged and `--continue` refuses until the user resolves it.
             // The branch ref is left alone until the rebase finishes.
-            try result.index.writeToFile(git_dir, allocator, io.io);
+            try result.index.writeToFile(repo.worktree_dir, allocator, io.io);
             for (result.conflicts) |c| {
                 try io.eprint("CONFLICT (content): Merge conflict in {s}\n", .{c.path});
                 if (std.fs.path.dirname(c.path)) |dir| {
@@ -258,7 +261,7 @@ fn replayCommits(
 
     // The worktree is brought to the new tip; without this HEAD and the working
     // tree disagreed after every rebase.
-    checkout_mod.checkoutCommit(allocator, git_dir, io.io, store, current_parent) catch
+    checkout_mod.checkoutCommit(allocator, repo, io.io, store, current_parent) catch
         errors.fatal(io, "could not check out the rebased tree", .{});
 
     switch (head_info.*) {
@@ -273,7 +276,7 @@ fn replayCommits(
             try refs_manager.write(allocator, io.io, ref_name, current_parent);
         },
         .detached => {
-            const head_path = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir});
+            const head_path = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{repo.worktree_dir});
             defer allocator.free(head_path);
             var hf = try std.Io.Dir.cwd().createFile(io.io, head_path, .{});
             defer hf.close(io.io);
@@ -305,7 +308,6 @@ const tree_merge_mod = @import("../../core/tree_merge.zig");
 /// `new_base`, path by path.
 fn replayOne(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
     io: Io,
     store: storage_mod.StorageBackend,
     old_parent: ?[20]u8,
@@ -489,7 +491,6 @@ fn replayOne(
         try idx.writeTree(store, allocator, io.io)
     else
         currentTreeOf(allocator, io, store, new_base) orelse [_]u8{0} ** 20;
-    _ = git_dir;
 
     return .{
         .tree = tree_sha,
@@ -646,7 +647,7 @@ fn writeRebaseState(
 /// Interactive rebase TUI with arrow key navigation
 fn interactiveRebase(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     store: storage_mod.StorageBackend,
     refs_manager: *const refs_mod.Refs,
@@ -774,7 +775,7 @@ fn interactiveRebase(
             try refs_manager.write(allocator, io.io, ref_name, current_parent);
         },
         .detached => {
-            const head_path = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir});
+            const head_path = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{repo.worktree_dir});
             defer allocator.free(head_path);
             var hf = try std.Io.Dir.cwd().createFile(io.io, head_path, .{});
             defer hf.close(io.io);
@@ -792,18 +793,18 @@ fn interactiveRebase(
 ///
 /// Everything the resolution staged is committed on top of the rewritten tip, and
 /// the branch is advanced to it.
-fn continueRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const rebase_merge = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{git_dir});
+fn continueRebase(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    const rebase_merge = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{repo.worktree_dir});
     defer allocator.free(rebase_merge);
 
     if (std.Io.Dir.cwd().access(io.io, rebase_merge, .{})) |_| {} else |_| {
         errors.fatal(io, "No rebase in progress?", .{});
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs_mod.Refs.init(repo);
 
-    var idx = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch
+    var idx = index_mod.Index.readFromFile(allocator, repo.worktree_dir, io.io) catch
         errors.fatal(io, "could not read the index", .{});
     defer idx.deinit(allocator);
 
@@ -820,7 +821,7 @@ fn continueRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !vo
 
     const tree_sha = try idx.writeTree(store, allocator, io.io);
 
-    const head_path = try std.fmt.allocPrint(allocator, "{s}/rebase-merge/orig-head", .{git_dir});
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/rebase-merge/orig-head", .{repo.worktree_dir});
     defer allocator.free(head_path);
     const head_content = io.readFileAlloc(head_path) catch "";
     defer if (head_content.len > 0) allocator.free(head_content);
@@ -839,8 +840,8 @@ fn continueRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !vo
 
     const now_ts = std.Io.Timestamp.now(io.io, .real);
     const now: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
-    const committer_name = config_cmd.getUserName(allocator, git_dir, io);
-    const committer_email = config_cmd.getUserEmail(allocator, git_dir, io);
+    const committer_name = config_cmd.getUserName(allocator, repo.common_dir, io);
+    const committer_email = config_cmd.getUserEmail(allocator, repo.common_dir, io);
 
     const resolved = object.Commit{
         .tree = tree_sha,
@@ -866,7 +867,7 @@ fn continueRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !vo
                 try refs_manager.write(allocator, io.io, ref_name, resolved_sha);
             },
             .detached => {
-                const hp = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir});
+                const hp = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{repo.worktree_dir});
                 defer allocator.free(hp);
                 const hex = Sha1.hex(resolved_sha);
                 try io.writeFile(hp, hex[0..]);
@@ -874,17 +875,17 @@ fn continueRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !vo
         }
     }
 
-    checkout_mod.checkoutCommit(allocator, git_dir, io.io, store, resolved_sha) catch {};
+    checkout_mod.checkoutCommit(allocator, repo, io.io, store, resolved_sha) catch {};
 
     std.Io.Dir.cwd().deleteTree(io.io, rebase_merge) catch {};
     const hex = Sha1.hex(resolved_sha);
     try io.print("Successfully rebased and updated {s}.\n", .{hex[0..7]});
 }
 
-fn abortRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const rebase_merge = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{git_dir});
+fn abortRebase(allocator: std.mem.Allocator, worktree_dir: []const u8, io: Io) !void {
+    const rebase_merge = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{worktree_dir});
     defer allocator.free(rebase_merge);
-    const rebase_apply = try std.fmt.allocPrint(allocator, "{s}/rebase-apply", .{git_dir});
+    const rebase_apply = try std.fmt.allocPrint(allocator, "{s}/rebase-apply", .{worktree_dir});
     defer allocator.free(rebase_apply);
 
     const has_merge = if (std.Io.Dir.cwd().access(io.io, rebase_merge, .{})) |_| true else |_| false;

@@ -9,6 +9,29 @@ const index_mod = @import("../../core/index.zig");
 const checkout_mod = @import("../../core/checkout.zig");
 const ignore_mod = @import("../../core/ignore.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
+
+/// Whether a `.gitz`/`.git` *file* at the worktree root records the admin
+/// directory of a linked worktree, which is how a worktree points back at the
+/// repository that owns it.
+fn isSelfAdminFile(io: Io, name: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return false;
+    const is_admin = std.mem.eql(u8, name, ".gitz") or std.mem.eql(u8, name, ".git");
+    return is_admin and io.isFileAt(".", name);
+}
+
+/// Whether `dir` is the checkout of a linked worktree, recognised by the
+/// `.gitz`/`.git` indirection file it contains. Git skips these for the same
+/// reason: their files are tracked by a different index.
+fn isLinkedWorktree(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+    for ([_][]const u8{ ".gitz", ".git" }) |name| {
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name }) catch return false;
+        defer allocator.free(path);
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+        if (stat.kind == .file) return true;
+    }
+    return false;
+}
 
 /// Whether stdout is a terminal.
 ///
@@ -29,7 +52,11 @@ const Porcelain = enum { human, v1, long };
 /// What to report about untracked files.
 const UntrackedMode = enum { normal, no, all };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io_in: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io_in: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var io = io_in;
     var porcelain: Porcelain = .human;
     var show_branch_header = false;
@@ -85,7 +112,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     if (porcelain == .v1) io.color = false;
     if (!isTerminal(io)) io.color = false;
 
-    const refs_manager = refs.Refs.init(git_dir);
+    const refs_manager = refs.Refs.init(repo);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
         try io.print("\x1b[1;33m⚠\x1b[0m \x1b[1mNo commits yet\x1b[0m\n", .{});
@@ -125,7 +152,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         head_shas.deinit();
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     var alts = try alternates_mod.Reader.init(allocator, io.io, git_dir);
     defer alts.deinit();
 
@@ -246,6 +273,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             wf.path[2..]
         else
             wf.path;
+
+        // A linked worktree's own indirection file is repository
+        // bookkeeping, not the user's work: without this every worktree
+        // reported `?? .gitz` forever.
+        if (isSelfAdminFile(io, clean_name)) continue;
 
         const in_head = head_shas.get(clean_name) != null;
         const in_index = findIndexEntry(&idx, clean_name) != null;
@@ -531,9 +563,14 @@ fn collectWorkingTree(allocator: std.mem.Allocator, io: std.Io, dir_path: []cons
             // reported every object, ref and index file as untracked, so a
             // repository that also had a git clone listed hundreds of entries
             // that are not the user's work.
+            //
+            // A directory holding a `.gitz`/`.git` *file* is a linked worktree
+            // of some repository. Its contents belong to that worktree, which
+            // has its own index, so the main worktree must not report them.
             if (ignore.isIgnored(full_path, true) or
                 std.mem.eql(u8, e.name, ".gitz") or
-                std.mem.eql(u8, e.name, ".git"))
+                std.mem.eql(u8, e.name, ".git") or
+                isLinkedWorktree(allocator, io, full_path))
             {
                 allocator.free(full_path);
                 continue;

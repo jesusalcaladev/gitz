@@ -8,8 +8,13 @@ const index_mod = @import("../../core/index.zig");
 const config_cmd = @import("config.zig");
 const merge_cmd = @import("merge.zig");
 const checkout_mod = @import("../../core/checkout.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var message: ?[]const u8 = null;
     var auto_stage = false;
     var amend = false;
@@ -61,18 +66,18 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     // Auto-stage if -a flag
     if (auto_stage) {
-        try autoStageAll(allocator, git_dir, io);
+        try autoStageAll(allocator, repo, io);
     }
 
-    var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
+    var idx = try index_mod.Index.readFromFile(allocator, repo.worktree_dir, io.io);
     if (idx.count() == 0) {
         try io.eprint("nothing to commit, working tree clean\n", .{});
         idx.deinit(allocator);
         std.process.exit(1);
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs_mod.Refs.init(repo);
 
     // A conflicted merge cannot be committed yet. The index holds three entries
     // per conflicted path (base/ours/theirs); writing a tree would have to pick
@@ -112,9 +117,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     // Get author info from config
-    const author_name = config_cmd.getUserName(allocator, git_dir, io);
+    const author_name = config_cmd.getUserName(allocator, repo.common_dir, io);
     defer if (!std.mem.eql(u8, author_name, "GitZ User")) allocator.free(author_name);
-    const author_email = config_cmd.getUserEmail(allocator, git_dir, io);
+    const author_email = config_cmd.getUserEmail(allocator, repo.common_dir, io);
     defer if (!std.mem.eql(u8, author_email, "user@gitz.dev")) allocator.free(author_email);
 
     // Get parent commit
@@ -230,7 +235,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     idx.deinit(allocator);
     idx = index_mod.Index.init(allocator);
     rebuildIndexFromTree(&idx, store, allocator, io.io, tree_sha, "");
-    try idx.writeToFile(git_dir, allocator, io.io);
+    try idx.writeToFile(repo.worktree_dir, allocator, io.io);
     idx.deinit(allocator);
 
     // The merge is finished: drop the in-progress state so the next `gitz
@@ -307,11 +312,11 @@ fn rebuildIndexFromTree(idx: *index_mod.Index, store: storage_mod.StorageBackend
     }
 }
 
-fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
+fn autoStageAll(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    var idx = try index_mod.Index.readFromFile(allocator, repo.worktree_dir, io.io);
     defer idx.deinit(allocator);
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     var modified = false;
 
     // Only update entries that have actually changed
@@ -365,6 +370,6 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
 
     // Only write if something actually changed
     if (modified) {
-        try idx.writeToFile(git_dir, allocator, io.io);
+        try idx.writeToFile(repo.worktree_dir, allocator, io.io);
     }
 }

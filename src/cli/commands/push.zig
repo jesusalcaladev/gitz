@@ -7,8 +7,13 @@ const ssh_cmd = @import("../../transport/ssh_cmd.zig");
 const ssh_mod = @import("../../transport/ssh.zig");
 const remote_cmd = @import("remote.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var remote_name: ?[]const u8 = null;
     var refspec: ?[]const u8 = null;
     var force = false;
@@ -33,7 +38,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const name = remote_name orelse "origin";
     const ref = refspec orelse refspec: {
         // Get current branch name
-        const refs_manager = refs_mod.Refs.init(git_dir);
+        const refs_manager = refs_mod.Refs.init(repo);
         var head_info = refs_manager.head(allocator, io.io) catch {
             errors.fatal(io, "not a gitz repository", .{});
         };
@@ -57,7 +62,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     // Get the commit SHA to push
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
     const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{ref});
     defer allocator.free(ref_name);
 
@@ -99,7 +104,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             }
         }
 
-        ssh_transport.push(git_dir, ref, push_sha, old_sha) catch {
+        ssh_transport.push(repo, ref, push_sha, old_sha) catch {
             try io.print("Note: SSH push failed, falling back to git\n", .{});
             try pushViaGit(allocator, git_dir, name, ref, force, io);
             return;
@@ -113,7 +118,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         };
         defer transport.deinit();
 
-        transport.push(git_dir, ref, push_sha) catch {
+        transport.push(repo, ref, push_sha) catch {
             try io.print("Note: HTTP push failed, falling back to git\n", .{});
             try pushViaGit(allocator, git_dir, name, ref, force, io);
             return;

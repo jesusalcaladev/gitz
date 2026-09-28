@@ -4,6 +4,7 @@ const object = @import("object.zig");
 const zlib_mod = @import("zlib.zig");
 const loose_mod = @import("loose.zig");
 const shard_mod = @import("shard_store.zig");
+const Repo = @import("repo.zig").Repo;
 
 const GitObject = object.GitObject;
 const ObjectType = object.ObjectType;
@@ -27,6 +28,11 @@ pub const Alternates = struct {
 
     pub fn init(git_dir: []const u8) Alternates {
         return .{ .git_dir = git_dir };
+    }
+
+    /// Alternates belong to the object store, so this is the *common* dir.
+    pub fn forRepo(repo: Repo) Alternates {
+        return .{ .git_dir = repo.common_dir };
     }
 
     /// Path to the alternates file: git_dir/objects/info/alternates

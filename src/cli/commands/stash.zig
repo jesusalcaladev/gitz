@@ -6,12 +6,16 @@ const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 const ignore_mod = @import("../../core/ignore.zig");
 const checkout_mod = @import("../../core/checkout.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 const StashInfo = struct { sha: [20]u8, message: []const u8 };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     if (args.len == 0) {
-        try stashSave(allocator, git_dir, null, false, io);
+        try stashSave(allocator, repo, null, false, io);
         return;
     }
 
@@ -33,21 +37,21 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                 if (message == null) message = args[i];
             }
         }
-        try stashSave(allocator, git_dir, message, include_untracked, io);
+        try stashSave(allocator, repo, message, include_untracked, io);
     } else if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "ls")) {
-        try stashList(allocator, git_dir, io);
+        try stashList(allocator, repo, io);
     } else if (std.mem.eql(u8, subcmd, "pop")) {
         var index: u32 = 0;
         if (args.len > 1) index = std.fmt.parseInt(u32, args[1], 10) catch 0;
-        try stashApply(allocator, git_dir, index, true, io);
+        try stashApply(allocator, repo, index, true, io);
     } else if (std.mem.eql(u8, subcmd, "apply")) {
         var index: u32 = 0;
         if (args.len > 1) index = std.fmt.parseInt(u32, args[1], 10) catch 0;
-        try stashApply(allocator, git_dir, index, false, io);
+        try stashApply(allocator, repo, index, false, io);
     } else if (std.mem.eql(u8, subcmd, "drop")) {
         var index: u32 = 0;
         if (args.len > 1) index = std.fmt.parseInt(u32, args[1], 10) catch 0;
-        try stashDrop(allocator, git_dir, index, io);
+        try stashDrop(allocator, repo, index, io);
     } else if (std.mem.eql(u8, subcmd, "show")) {
         var show_patch = false;
         var index: u32 = 0;
@@ -59,9 +63,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                 index = std.fmt.parseInt(u32, args[i], 10) catch 0;
             }
         }
-        try stashShow(allocator, git_dir, index, show_patch, io);
+        try stashShow(allocator, repo, index, show_patch, io);
     } else if (std.mem.eql(u8, subcmd, "clear")) {
-        try stashClear(allocator, git_dir, io);
+        try stashClear(allocator, repo, io);
     } else {
         try io.eprint("usage: gitz stash [push|save|list|pop|apply|drop|show|clear]\n", .{});
     }
@@ -71,9 +75,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 ///
 /// `include_untracked` mirrors git's `-u`. Without it only tracked
 /// modifications are stashed.
-fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]const u8, include_untracked: bool, io: Io) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs_mod.Refs.init(git_dir);
+fn stashSave(allocator: std.mem.Allocator, repo: Repo, message: ?[]const u8, include_untracked: bool, io: Io) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs_mod.Refs.init(repo);
 
     // Get HEAD tree to know which files are tracked
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
@@ -144,7 +148,7 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
     }
 
     if (include_untracked) {
-        try collectUntrackedFiles(allocator, git_dir, io.io, "", &tracked_files, &untracked_entries);
+        try collectUntrackedFiles(allocator, repo, io.io, "", &tracked_files, &untracked_entries);
     }
 
     // Merge tracked modified + untracked into one tree
@@ -193,7 +197,7 @@ fn stashSave(allocator: std.mem.Allocator, git_dir: []const u8, message: ?[]cons
     const stash_sha = try store.write(allocator, io.io, object.GitObject{ .commit = commit });
 
     // Append to refs/stash chain
-    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{git_dir});
+    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{repo.common_dir});
     defer allocator.free(stash_path);
 
     // Read existing stash chain
@@ -280,7 +284,7 @@ fn collectTrackedFiles(
 /// Collect untracked files (not in HEAD tree, not in .gitz)
 fn collectUntrackedFiles(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: std.Io,
     prefix: []const u8,
     tracked: *const std.StringHashMap(object.TreeEntry),
@@ -307,7 +311,7 @@ fn collectUntrackedFiles(
     var ignore_stack = ignore_mod.IgnoreStack.init(allocator);
     defer ignore_stack.deinit();
     ignore_stack.loadFile(io, ".gitignore") catch {};
-    const exclude_path = try std.fmt.allocPrint(allocator, "{s}/info/exclude", .{git_dir});
+    const exclude_path = try std.fmt.allocPrint(allocator, "{s}/info/exclude", .{repo.common_dir});
     defer allocator.free(exclude_path);
     ignore_stack.loadFile(io, exclude_path) catch {};
 
@@ -382,7 +386,7 @@ fn collectUntrackedFiles(
                             };
                             defer allocator.free(file_content);
 
-                            const store_obj = storage_mod.StorageBackend.fromRepoConfig(allocator, io, git_dir);
+                            const store_obj = storage_mod.StorageBackend.fromRepoConfig(allocator, io, repo);
                             const blob = object.GitObject{ .blob = .{ .content = file_content } };
                             const sha = try store_obj.write(allocator, io, blob);
 
@@ -402,8 +406,8 @@ fn collectUntrackedFiles(
 }
 
 /// List stash entries
-fn stashList(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{git_dir});
+fn stashList(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{repo.common_dir});
     defer allocator.free(stash_path);
 
     const content = std.Io.Dir.cwd().readFileAlloc(io.io, stash_path, allocator, .unlimited) catch {
@@ -424,8 +428,8 @@ fn stashList(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
 }
 
 /// Apply stash to working tree
-fn stashApply(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, remove_after: bool, io: Io) !void {
-    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{git_dir});
+fn stashApply(allocator: std.mem.Allocator, repo: Repo, index: u32, remove_after: bool, io: Io) !void {
+    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{repo.common_dir});
     defer allocator.free(stash_path);
 
     const content = std.Io.Dir.cwd().readFileAlloc(io.io, stash_path, allocator, .unlimited) catch {
@@ -455,7 +459,7 @@ fn stashApply(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, rem
     }
 
     // Read the stash commit
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     const stash_sha = entries.items[index].sha;
 
     const obj = store.read(allocator, io.io, stash_sha) catch {
@@ -476,13 +480,13 @@ fn stashApply(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, rem
 
     // Remove from stash if pop
     if (remove_after) {
-        try stashDrop(allocator, git_dir, index, io);
+        try stashDrop(allocator, repo, index, io);
     }
 }
 
 /// Drop a stash entry
-fn stashDrop(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, io: Io) !void {
-    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{git_dir});
+fn stashDrop(allocator: std.mem.Allocator, repo: Repo, index: u32, io: Io) !void {
+    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{repo.common_dir});
     defer allocator.free(stash_path);
 
     const content = std.Io.Dir.cwd().readFileAlloc(io.io, stash_path, allocator, .unlimited) catch {
@@ -510,8 +514,8 @@ fn stashDrop(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, io: 
 }
 
 /// Show stash info or diff
-fn stashShow(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, show_patch: bool, io: Io) !void {
-    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{git_dir});
+fn stashShow(allocator: std.mem.Allocator, repo: Repo, index: u32, show_patch: bool, io: Io) !void {
+    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{repo.common_dir});
     defer allocator.free(stash_path);
 
     const content = std.Io.Dir.cwd().readFileAlloc(io.io, stash_path, allocator, .unlimited) catch {
@@ -541,8 +545,8 @@ fn stashShow(allocator: std.mem.Allocator, git_dir: []const u8, index: u32, show
 }
 
 /// Clear all stash entries
-fn stashClear(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{git_dir});
+fn stashClear(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    const stash_path = try std.fmt.allocPrint(allocator, "{s}/refs/stash", .{repo.common_dir});
     defer allocator.free(stash_path);
     std.Io.Dir.cwd().deleteFile(io.io, stash_path) catch {};
     try io.print("Stash cleared.\n", .{});

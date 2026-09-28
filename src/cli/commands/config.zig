@@ -2,10 +2,14 @@ const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const repo_config = @import("../../core/config.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 const Action = enum { set, get, get_all, add, unset, unset_all, list, remove_section, rename_section, edit, none };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     var global = false;
     var action: Action = .set;
     var action_given = false;
@@ -73,14 +77,14 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (action == .list or (action == .set and !action_given and positional.items.len == 0)) {
-        try listConfig(allocator, git_dir, global, io);
+        try listConfig(allocator, repo.common_dir, global, io);
         return;
     }
 
     if (action == .remove_section or action == .rename_section) {
         if (positional.items.len < 1) errors.errorf(io, "a section name is required", .{});
         const section = positional.items[0];
-        var cfg = try loadConfig(allocator, git_dir, global, io);
+        var cfg = try loadConfig(allocator, repo.common_dir, global, io);
         defer cfg.deinit();
 
         if (action == .remove_section) {
@@ -97,7 +101,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             const moved = cfg.sections.fetchRemove(section).?.value;
             cfg.sections.put(new_name, moved) catch {};
         }
-        try saveConfig(allocator, git_dir, global, io, &cfg);
+        try saveConfig(allocator, repo.common_dir, global, io, &cfg);
         return;
     }
 
@@ -118,7 +122,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     if (read_only and positional.items.len < 2) {
         switch (action) {
             .get, .get_all => {
-                const val = getConfigValue(allocator, git_dir, k, global, io);
+                const val = getConfigValue(allocator, repo.common_dir, k, global, io);
                 defer if (val) |vv| allocator.free(vv);
                 if (val) |vv| {
                     try io.print("{s}\n", .{vv});
@@ -130,7 +134,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                 }
             },
             .unset, .unset_all => {
-                try unsetConfigValue(allocator, git_dir, k, global, io);
+                try unsetConfigValue(allocator, repo.common_dir, k, global, io);
             },
             else => unreachable,
         }
@@ -139,7 +143,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     if (positional.items.len < 2) {
         // A bare key with no action is a read, matching git.
-        const val = getConfigValue(allocator, git_dir, k, global, io);
+        const val = getConfigValue(allocator, repo.common_dir, k, global, io);
         defer if (val) |vv| allocator.free(vv);
         if (val) |vv| {
             try io.print("{s}\n", .{vv});
@@ -151,7 +155,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     const v = positional.items[1];
-    try setConfigValue(allocator, git_dir, k, v, global, io);
+    try setConfigValue(allocator, repo.common_dir, k, v, global, io);
 }
 
 /// Read env var from /proc/self/environ (Linux, no libc needed)

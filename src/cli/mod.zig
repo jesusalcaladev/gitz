@@ -29,6 +29,8 @@ const review_cmd = @import("commands/review.zig");
 const sync_cmd = @import("commands/sync.zig");
 const lfs_cmd = @import("commands/lfs.zig");
 const completions_cmd = @import("commands/completions.zig");
+const worktree_cmd = @import("commands/worktree.zig");
+const Repo = @import("../core/repo.zig").Repo;
 
 const VERSION = "0.4.0";
 
@@ -63,6 +65,7 @@ pub fn printHelp(io: Io) !void {
         \\      blame       Show what revision and author last modified each line
         \\      gc          Clean up unreachable objects
         \\      config      Get and set repository options
+        \\      worktree    Manage multiple working trees (one HEAD each)
         \\      search      Search commit messages and file contents
         \\      review      Code review (diff between branches/commits)
         \\      sync        Fetch and rebase onto remote branch
@@ -127,63 +130,70 @@ pub fn dispatch(allocator: std.mem.Allocator, command: []const u8, args: []const
         return;
     }
 
-    // Find git_dir. This also moves the process to the worktree root, so the
-    // command below needs a mutable `io` to record the subdirectory prefix.
-    const git_dir = findGitDir(allocator, &io) catch {
+    // Find the repository. This also moves the process to the worktree root, so
+    // the command below needs a mutable `io` to record the subdirectory prefix.
+    //
+    // `git_dir` is handed to the commands unchanged: for a repository with no
+    // worktrees the common dir, the worktree dir and the worktree path are the
+    // same directory, so the existing `{git_dir}/...` path building stays
+    // correct. Worktree-aware commands take the whole `Repo`.
+    const repo = Repo.open(allocator, &io) catch {
         try io.eprint("fatal: not a gitz repository (or any parent): .gitz\n", .{});
         try io.eprint("Hint: run 'gitz init' to create one\n", .{});
         std.process.exit(128);
     };
-    defer allocator.free(git_dir);
+    defer repo.deinit(allocator);
 
-    if (std.mem.eql(u8, command, "add")) {
-        try add_cmd.execute(allocator, git_dir, args, io);
+    if (std.mem.eql(u8, command, "worktree")) {
+        try worktree_cmd.execute(allocator, repo, args, io);
+    } else if (std.mem.eql(u8, command, "add")) {
+        try add_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "commit")) {
-        try commit_cmd.execute(allocator, git_dir, args, io);
+        try commit_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "status")) {
-        try status_cmd.execute(allocator, git_dir, args, io);
+        try status_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "log")) {
-        try log_cmd.execute(allocator, git_dir, args, io);
+        try log_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "branch")) {
-        try branch_cmd.execute(allocator, git_dir, args, io);
+        try branch_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "switch")) {
-        try switch_cmd.execute(allocator, git_dir, args, io);
+        try switch_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "diff")) {
-        try diff_cmd.execute(allocator, git_dir, args, io);
+        try diff_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "stash")) {
-        try stash_cmd.execute(allocator, git_dir, args, io);
+        try stash_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "tag")) {
-        try tag_cmd.execute(allocator, git_dir, args, io);
+        try tag_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "reset")) {
-        try reset_cmd.execute(allocator, git_dir, args, io);
+        try reset_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "merge")) {
-        try merge_cmd.execute(allocator, git_dir, args, io);
+        try merge_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "rebase")) {
-        try rebase_cmd.execute(allocator, git_dir, args, io);
+        try rebase_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "undo")) {
-        try undo_cmd.execute(allocator, git_dir, args, io);
+        try undo_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "blame")) {
-        try blame_cmd.execute(allocator, git_dir, args, io);
+        try blame_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "gc")) {
-        try gc_cmd.execute(allocator, git_dir, args, io);
+        try gc_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "remote")) {
-        try remote_cmd.execute(allocator, git_dir, args, io);
+        try remote_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "fetch")) {
-        try fetch_cmd.execute(allocator, git_dir, args, io);
+        try fetch_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "push")) {
-        try push_cmd.execute(allocator, git_dir, args, io);
+        try push_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "pull")) {
-        try pull_cmd.execute(allocator, git_dir, args, io);
+        try pull_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "config")) {
-        try config_cmd.execute(allocator, git_dir, args, io);
+        try config_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "search")) {
-        try search_cmd.execute(allocator, git_dir, args, io);
+        try search_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "review")) {
-        try review_cmd.execute(allocator, git_dir, args, io);
+        try review_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "sync")) {
-        try sync_cmd.execute(allocator, git_dir, args, io);
+        try sync_cmd.execute(allocator, repo, args, io);
     } else if (std.mem.eql(u8, command, "lfs")) {
-        try lfs_cmd.execute(allocator, git_dir, args, io);
+        try lfs_cmd.execute(allocator, repo, args, io);
     } else {
         unknownCommand(command, io);
     }
@@ -195,7 +205,7 @@ pub fn isKnownCommand(command: []const u8) bool {
         "branch", "switch", "merge",  "rebase",      "stash",  "tag",
         "reset",  "undo",   "blame",  "gc",          "config", "search",
         "review", "sync",   "lfs",    "clone",       "fetch",  "push",
-        "pull",   "remote", "update", "completions",
+        "pull",   "remote", "update", "completions", "worktree",
     };
     for (commands) |known| {
         if (std.mem.eql(u8, command, known)) return true;

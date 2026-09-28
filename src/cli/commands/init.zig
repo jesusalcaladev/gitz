@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 pub fn execute(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     var bare = false;

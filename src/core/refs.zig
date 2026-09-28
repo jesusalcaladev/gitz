@@ -1,5 +1,6 @@
 const std = @import("std");
 const Sha1 = @import("sha1.zig").Sha1;
+const Repo = @import("repo.zig").Repo;
 
 pub const HeadInfo = union(enum) {
     /// A branch that exists and has commits.
@@ -51,10 +52,39 @@ pub const HeadInfo = union(enum) {
 };
 
 pub const Refs = struct {
-    git_dir: []const u8,
+    repo: Repo,
 
-    pub fn init(git_dir: []const u8) Refs {
-        return .{ .git_dir = git_dir };
+    pub fn init(repo: Repo) Refs {
+        return .{ .repo = repo };
+    }
+
+    /// Whether a ref belongs to the worktree rather than the shared store.
+    ///
+    /// `HEAD` and the pseudo-refs beside it are what two worktrees must not
+    /// share: that is the whole reason a worktree has its own checkout. Every
+    /// other ref -- `refs/heads/*`, `refs/tags/*`, `refs/remotes/*` -- is
+    /// shared, so a commit made in one worktree is visible from the others.
+    fn isPerWorktree(refname: []const u8) bool {
+        if (std.mem.eql(u8, refname, "HEAD")) return true;
+        for ([_][]const u8{
+            "ORIG_HEAD",    "FETCH_HEAD",     "MERGE_HEAD",      "MERGE_AUTOSTASH",
+            "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_HEAD",     "AUTO_MERGE",
+        }) |name| {
+            if (std.mem.eql(u8, refname, name)) return true;
+        }
+        // Bisect state is per worktree too, so two agents can bisect
+        // independently without overwriting each other.
+        if (std.mem.startsWith(u8, refname, "refs/bisect/")) return true;
+        return false;
+    }
+
+    /// The directory a ref is stored in.
+    fn dirFor(self: Refs, allocator: std.mem.Allocator, refname: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ if (isPerWorktree(refname)) self.repo.worktree_dir else self.repo.common_dir, refname },
+        );
     }
 
     /// Whether a ref name is safe to turn into a path inside the git dir.
@@ -84,7 +114,7 @@ pub const Refs = struct {
     }
 
     fn readFileContent(self: Refs, allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) ![]u8 {
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, sub_path });
+        const full_path = try self.dirFor(allocator, sub_path);
         defer allocator.free(full_path);
         return std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited);
     }
@@ -106,18 +136,24 @@ pub const Refs = struct {
         return Sha1.fromHex(trimmed);
     }
 
+    /// The raw contents of a ref file, without resolving symrefs or parsing a
+    /// SHA. `refs/stash` is a log whose lines are `<sha> <message>`, so `read`
+    /// rejects it and the reachability walk needs the first token instead.
+    pub fn readRaw(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) ![]u8 {
+        return self.readFileContent(allocator, io, refname);
+    }
+
     pub fn write(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8, sha: [20]u8) !void {
         // Refuse to write outside the git dir. Without this, a name containing
         // `..` created or overwrote files anywhere on the filesystem.
         if (!isValidRefName(refname)) return error.InvalidRefName;
 
-        const dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, std.fs.path.dirname(refname) orelse "." });
-        defer allocator.free(dir_path);
-
-        try std.Io.Dir.cwd().createDirPath(io, dir_path);
-
-        const ref_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, refname });
+        const ref_path = try self.dirFor(allocator, refname);
         defer allocator.free(ref_path);
+
+        if (std.fs.path.dirname(ref_path)) |parent| {
+            try std.Io.Dir.cwd().createDirPath(io, parent);
+        }
 
         var f = try std.Io.Dir.cwd().createFile(io, ref_path, .{});
         defer f.close(io);
@@ -130,7 +166,7 @@ pub const Refs = struct {
     pub fn writeSymbolic(self: Refs, allocator: std.mem.Allocator, io: std.Io, name: []const u8, target: []const u8) !void {
         if (!isValidRefName(name) or !isValidRefName(target)) return error.InvalidRefName;
 
-        const ref_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, name });
+        const ref_path = try self.dirFor(allocator, name);
         defer allocator.free(ref_path);
 
         var f = try std.Io.Dir.cwd().createFile(io, ref_path, .{});
@@ -144,7 +180,7 @@ pub const Refs = struct {
     pub fn delete(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) !void {
         if (!isValidRefName(refname)) return error.InvalidRefName;
 
-        const ref_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, refname });
+        const ref_path = try self.dirFor(allocator, refname);
         defer allocator.free(ref_path);
         try std.Io.Dir.cwd().deleteFile(io, ref_path);
     }
@@ -193,7 +229,7 @@ pub const Refs = struct {
     /// hiding `feature/login` from `gitz branch`, `log --all` and reachability
     /// walks in `gc`.
     pub fn list(self: Refs, allocator: std.mem.Allocator, io: std.Io, subcategory: []const u8) ![][]const u8 {
-        const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/{s}", .{ self.git_dir, subcategory });
+        const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/{s}", .{ self.repo.common_dir, subcategory });
         defer allocator.free(dir_path);
 
         const prefix = try std.fmt.allocPrint(allocator, "refs/{s}", .{subcategory});
@@ -205,10 +241,21 @@ pub const Refs = struct {
     /// List every ref in the repository, regardless of namespace
     /// (`refs/heads`, `refs/tags`, `refs/remotes`, `refs/stash`, ...).
     pub fn listAll(self: Refs, allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
-        const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs", .{self.git_dir});
+        const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs", .{self.repo.common_dir});
         defer allocator.free(dir_path);
 
         return listDirRaw(allocator, io, dir_path, "refs", 0) catch &.{};
+    }
+
+    /// The `worktrees/` admin directory, where linked worktrees keep their
+    /// per-worktree HEAD, index and `commondir` pointer.
+    pub fn worktreesDir(self: Refs, allocator: std.mem.Allocator) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "{s}/worktrees", .{self.repo.common_dir});
+    }
+
+    /// Path of one worktree's admin directory.
+    pub fn worktreeAdminDir(self: Refs, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{ self.repo.common_dir, name });
     }
 
     /// Maximum directory depth walked by `listDirRaw`. Refs nest one directory

@@ -6,6 +6,7 @@ const refs_mod = @import("../core/refs.zig");
 const zlib_mod = @import("../core/zlib.zig");
 const packfile_mod = @import("../core/packfile.zig");
 const storage_mod = @import("../core/storage.zig");
+const Repo = @import("../core/repo.zig").Repo;
 
 const Allocator = std.mem.Allocator;
 
@@ -88,7 +89,7 @@ pub const HttpTransport = struct {
     }
 
     /// Fetch objects from remote
-    pub fn fetch(self: *HttpTransport, git_dir: []const u8, refs: []RemoteRef, have_shas: []const [20]u8) !void {
+    pub fn fetch(self: *HttpTransport, repo: Repo, refs: []RemoteRef, have_shas: []const [20]u8) !void {
         _ = have_shas;
 
         // Build the upload-pack request body
@@ -118,11 +119,11 @@ pub const HttpTransport = struct {
         defer self.allocator.free(response);
 
         // Parse the packfile from response
-        try self.parsePackfile(git_dir, response);
+        try self.parsePackfile(repo, response);
     }
 
     /// Parse a packfile response and write objects to loose store
-    fn parsePackfile(self: *HttpTransport, git_dir: []const u8, data: []const u8) !void {
+    fn parsePackfile(self: *HttpTransport, repo: Repo, data: []const u8) !void {
         // Find PACK header
         var pos: usize = 0;
         while (pos + 4 <= data.len) {
@@ -185,7 +186,7 @@ pub const HttpTransport = struct {
                     pos += result.consumed;
 
                     const obj_type: packfile_mod.ObjectType = @enumFromInt(obj_type_num);
-                    try self.writeObjectAsLoose(git_dir, obj_type, result.data);
+                    try self.writeObjectAsLoose(repo, obj_type, result.data);
                 },
                 6 => {
                     // OFS_DELTA: base is at (current_offset - negative_offset)
@@ -207,7 +208,7 @@ pub const HttpTransport = struct {
                     };
 
                     // Resolve delta
-                    const base_obj = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir).read(self.allocator, self.io, base_sha) catch continue;
+                    const base_obj = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo).read(self.allocator, self.io, base_sha) catch continue;
                     _ = base_obj;
                 },
                 7 => {
@@ -232,7 +233,7 @@ pub const HttpTransport = struct {
         }
     }
 
-    fn writeObjectAsLoose(self: *HttpTransport, git_dir: []const u8, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
+    fn writeObjectAsLoose(self: *HttpTransport, repo: Repo, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
         const type_str: []const u8 = switch (obj_type) {
             .commit => "commit",
             .tree => "tree",
@@ -254,7 +255,7 @@ pub const HttpTransport = struct {
         // This is the critical path where packfile objects are unpacked and stored
         // individually. By routing through StorageBackend, sharded repos get
         // objects distributed to the correct shard automatically.
-        const backend = storage_mod.StorageBackend.fromConfig(git_dir, null);
+        const backend = storage_mod.StorageBackend.fromConfig(repo.common_dir, null);
         const obj_type_enum: object.ObjectType = switch (obj_type) {
             .commit => .commit,
             .tree => .tree,
@@ -289,7 +290,7 @@ pub const HttpTransport = struct {
     }
 
     /// Push objects to remote
-    pub fn push(self: *HttpTransport, git_dir: []const u8, ref_name: []const u8, sha: [20]u8) !void {
+    pub fn push(self: *HttpTransport, repo: Repo, ref_name: []const u8, sha: [20]u8) !void {
         // 1. Discover refs via GET /info/refs?service=git-receive-pack
         var push_url: [1024]u8 = undefined;
         const info_url = try std.fmt.bufPrint(&push_url, "{s}/info/refs?service=git-receive-pack", .{self.url});
@@ -322,7 +323,7 @@ pub const HttpTransport = struct {
         }
 
         // 2. Collect all objects reachable from new SHA but not from old SHA
-        const objects_to_send = try self.collectPushObjects(git_dir, sha, old_sha);
+        const objects_to_send = try self.collectPushObjects(repo, sha, old_sha);
         defer self.allocator.free(objects_to_send);
 
         if (objects_to_send.len == 0) return; // nothing to push
@@ -332,7 +333,7 @@ pub const HttpTransport = struct {
         defer pw.deinit();
         try pw.writeHeader(2, @intCast(objects_to_send.len));
 
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo);
         for (objects_to_send) |obj_sha| {
             const obj = store.read(self.allocator, self.io, obj_sha) catch continue;
             const serialized = try obj.serialize(self.allocator);
@@ -382,8 +383,8 @@ pub const HttpTransport = struct {
     }
 
     /// Collect all objects reachable from `new_sha` that are not reachable from `old_sha`.
-    fn collectPushObjects(self: *HttpTransport, git_dir: []const u8, new_sha: [20]u8, old_sha: ?[20]u8) ![][20]u8 {
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+    fn collectPushObjects(self: *HttpTransport, repo: Repo, new_sha: [20]u8, old_sha: ?[20]u8) ![][20]u8 {
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo);
 
         var visited = std.AutoHashMap([20]u8, void).init(self.allocator);
         defer visited.deinit();
@@ -566,7 +567,7 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
     const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dest});
     defer allocator.free(git_dir_path);
 
-    const refs_manager = refs_mod.Refs.init(git_dir_path);
+    const refs_manager = refs_mod.Refs.init(Repo.flat(git_dir_path));
     for (refs) |ref| {
         if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
             // Write local branch ref
@@ -596,12 +597,12 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
     const fetch_git_dir = try std.fmt.allocPrint(allocator, "{s}/.gitz", .{dest});
     defer allocator.free(fetch_git_dir);
 
-    try transport.fetch(fetch_git_dir, refs, &.{});
+    try transport.fetch(Repo.flat(fetch_git_dir), refs, &.{});
 
     // Checkout files
     const checkout_ref = default_branch orelse refs[0].name;
     const checkout_sha = try refs_manager.read(allocator, io, checkout_ref);
-    try checkoutFiles(allocator, io, fetch_git_dir, checkout_sha, dest);
+    try checkoutFiles(allocator, io, Repo.flat(fetch_git_dir), checkout_sha, dest);
 
     // Print success message via stdout
     const stdout = std.Io.File.stdout();
@@ -611,8 +612,8 @@ pub fn clone(allocator: Allocator, io: std.Io, url: []const u8, dest: []const u8
 }
 
 /// Checkout files from a commit into a directory
-fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io, git_dir);
+fn checkoutFiles(allocator: std.mem.Allocator, io: std.Io, repo: Repo, commit_sha: [20]u8, dest: []const u8) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io, repo);
 
     const commit_obj = try store.read(allocator, io, commit_sha);
     const commit = switch (commit_obj) {

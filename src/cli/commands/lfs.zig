@@ -1,10 +1,15 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Sha256 = @import("../../core/sha256.zig").Sha256;
+const Repo = @import("../../core/repo.zig").Repo;
 
 const LFS_POINTER_VERSION = "https://git-lfs.github.com/spec/v1";
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     if (args.len == 0) {
         try printHelp(io);
         return;

@@ -7,8 +7,13 @@ const object = @import("../../core/object.zig");
 const storage_mod = @import("../../core/storage.zig");
 const ignore_mod = @import("../../core/ignore.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     // `-A` and `add .` stage the whole worktree, new files included.
     // `-u`/`--update` stages only what is already tracked, which is a
     // different operation: it was aliased to `-A`, so `gitz add -u newfile`
@@ -86,9 +91,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             continue;
         }
         if (isDirectory(path, io)) {
-            try addDirectory(allocator, git_dir, &idx, path, io, &ignore_stack);
+            try addDirectory(allocator, repo, &idx, path, io, &ignore_stack);
         } else {
-            addFile(allocator, git_dir, &idx, path, io) catch {
+            addFile(allocator, repo, &idx, path, io) catch {
                 // A pathspec that no longer exists may be a deletion rather
                 // than a typo; only complain when it is in the index nowhere.
                 if (!removeIfTracked(allocator, &idx, path)) {
@@ -100,7 +105,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (stage_all) {
-        try addDirectory(allocator, git_dir, &idx, ".", io, &ignore_stack);
+        try addDirectory(allocator, repo, &idx, ".", io, &ignore_stack);
         stageDeletions(allocator, &idx, io);
     } else if (update_only) {
         // Only what is already tracked: re-stat each entry and drop the ones
@@ -146,7 +151,7 @@ fn removeIfTracked(allocator: std.mem.Allocator, idx: *index_mod.Index, path: []
     return false;
 }
 
-fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.Index, path: []const u8, io: Io) !void {
+fn addFile(allocator: std.mem.Allocator, repo: Repo, idx: *index_mod.Index, path: []const u8, io: Io) !void {
     // The link is not followed. `statFile` follows by default, so a symlink was
     // seen as an ordinary file: it was stored as mode 100644 holding a *copy* of
     // the target's bytes. git records mode 120000 with the link target path as
@@ -168,7 +173,7 @@ fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.In
     defer allocator.free(content);
 
     // Write blob to object store
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     const blob = object.GitObject{ .blob = .{ .content = content } };
     const sha = try store.write(allocator, io.io, blob);
 
@@ -208,7 +213,7 @@ fn readLink(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
 
 fn addDirectory(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     idx: *index_mod.Index,
     dir_path: []const u8,
     io: Io,
@@ -223,7 +228,7 @@ fn addDirectory(
     try collectFiles(allocator, dir_path, &entries, ignore, io);
 
     for (entries.items) |entry| {
-        try addFile(allocator, git_dir, idx, entry, io);
+        try addFile(allocator, repo, idx, entry, io);
     }
 }
 
@@ -273,6 +278,14 @@ fn collectFiles(
             }
 
             if (is_dir) {
+                // A directory holding a `.gitz`/`.git` file is a linked
+                // worktree, with its own index. Staging its files from here
+                // would put another worktree's checkout into this repository's
+                // index, so the whole directory is left alone.
+                if (io.isFileAt(full_path, ".gitz") or io.isFileAt(full_path, ".git")) {
+                    allocator.free(full_path);
+                    continue;
+                }
                 try dirs_to_visit.append(allocator, full_path);
             } else {
                 try entries.append(allocator, full_path);

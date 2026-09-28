@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const Repo = @import("../../core/repo.zig").Repo;
 
 const GITHUB_REPO = "jesusalcaladev/gitz";
 const VERSION = "0.4.0";

@@ -15,6 +15,7 @@ const config_mod = @import("../../core/config.zig");
 const checkout_mod = @import("../../core/checkout.zig");
 const index_mod = @import("../../core/index.zig");
 const safety = @import("../../util/clone_safety.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 /// How the objects of a clone are obtained.
 const Transport = enum {
@@ -123,6 +124,14 @@ fn removePartialDest(dest: []const u8, io: Io) void {
 }
 
 /// Resolve `path` against the current directory when it is relative.
+/// A repository with no worktrees, where all three directories are the same.
+///
+/// `gitz clone` builds a fresh repository from scratch, so there is nothing to
+/// resolve and no worktree indirection to follow.
+fn flat(dir: []const u8) Repo {
+    return .{ .common_dir = dir, .worktree_dir = dir, .worktree_path = dir };
+}
+
 fn absolutePath(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
     if (path.len > 0 and path[0] == '/') return try allocator.dupe(u8, path);
     const cwd = try std.process.currentPathAlloc(io.io, allocator);
@@ -214,7 +223,7 @@ fn cloneOverHttp(
         default_branch = remote_refs[0].name;
     }
 
-    const refs_manager = refs_mod.Refs.init(gitz_dir);
+    const refs_manager = refs_mod.Refs.init(flat(gitz_dir));
     for (remote_refs) |ref| {
         if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
             refs_manager.write(allocator, io.io, ref.name, ref.sha) catch continue;
@@ -233,10 +242,10 @@ fn cloneOverHttp(
         allocator.free(symbolic);
     }
 
-    transport.fetch(gitz_dir, remote_refs, &.{}) catch return error.FetchFailed;
+    transport.fetch(flat(gitz_dir), remote_refs, &.{}) catch return error.FetchFailed;
 
     if (head_sha) |sha| {
-        checkoutFiles(allocator, io, gitz_dir, sha, dest) catch return error.CheckoutFailed;
+        checkoutFiles(allocator, io, flat(gitz_dir), sha, dest) catch return error.CheckoutFailed;
     }
 
     for (remote_refs) |r| allocator.free(r.name);
@@ -258,7 +267,7 @@ fn cloneOverSsh(
     const refs = ssh.discoverRefs() catch return error.ReadFailed;
     if (refs.len == 0) return error.NoRefs;
 
-    const refs_manager = refs_mod.Refs.init(gitz_dir);
+    const refs_manager = refs_mod.Refs.init(flat(gitz_dir));
     var head_sha: ?[20]u8 = null;
     var default_branch: ?[]const u8 = null;
 
@@ -281,10 +290,10 @@ fn cloneOverSsh(
         allocator.free(symbolic);
     }
 
-    ssh.fetch(gitz_dir, refs, &.{}) catch return error.FetchFailed;
+    ssh.fetch(flat(gitz_dir), refs, &.{}) catch return error.FetchFailed;
 
     if (head_sha) |sha| {
-        checkoutFiles(allocator, io, gitz_dir, sha, dest) catch return error.CheckoutFailed;
+        checkoutFiles(allocator, io, flat(gitz_dir), sha, dest) catch return error.CheckoutFailed;
     }
 }
 
@@ -335,8 +344,8 @@ fn cloneLocal(
     copyTree(allocator, io, src_objects, dst_objects) catch {};
 
     // Copy refs and point HEAD at the same branch the source is on.
-    const src_refs = refs_mod.Refs.init(source_git);
-    const dst_refs = refs_mod.Refs.init(gitz_dir);
+    const src_refs = refs_mod.Refs.init(flat(source_git));
+    const dst_refs = refs_mod.Refs.init(flat(gitz_dir));
     var ref_count: u32 = 0;
 
     for ([_][]const u8{ "heads", "tags" }) |kind| {
@@ -373,7 +382,7 @@ fn cloneLocal(
             dst_refs.write(allocator, io.io, "HEAD", head_sha) catch {};
         }
 
-        checkoutFiles(allocator, io, gitz_dir, head_sha, dest) catch {
+        checkoutFiles(allocator, io, flat(gitz_dir), head_sha, dest) catch {
             removePartialDest(dest, io);
             errors.fatal(io, "could not check out '{s}'", .{source});
         };
@@ -606,9 +615,11 @@ fn cloneShared(allocator: std.mem.Allocator, args: []const []const u8, io: Io, s
     const alts = alternates_mod.Alternates.init(gitz_dir);
     try alts.write(allocator, io.io, &.{source_objects});
 
-    // Copy refs from the source repo (heads and tags).
-    const src_refs = refs_mod.Refs.init(source_git);
-    const dst_refs = refs_mod.Refs.init(gitz_dir);
+    // Copy refs from the source repo (heads and tags). Both sides are plain
+    // repositories here, so the common, worktree and path roles collapse to a
+    // single directory.
+    const src_refs = refs_mod.Refs.init(flat(source_git));
+    const dst_refs = refs_mod.Refs.init(flat(gitz_dir));
     var ref_count: u32 = 0;
 
     const heads = try src_refs.list(allocator, io.io, "heads");
@@ -637,7 +648,7 @@ fn cloneShared(allocator: std.mem.Allocator, args: []const []const u8, io: Io, s
     // index as it walks, resolving blobs through the alternates, so the clone
     // reports a clean tree instead of every file as untracked.
     if (src_refs.read(allocator, io.io, "HEAD")) |head_sha| {
-        checkoutFiles(allocator, io, gitz_dir, head_sha, dest) catch {
+        checkoutFiles(allocator, io, flat(gitz_dir), head_sha, dest) catch {
             removePartialDest(dest, io);
             errors.fatal(io, "could not check out '{s}'", .{source_repo});
         };
@@ -651,9 +662,9 @@ fn cloneShared(allocator: std.mem.Allocator, args: []const []const u8, io: Io, s
 /// through the alternates in a shared clone, so rebuilding the index from the
 /// clone's own object store afterwards would find nothing and report every file
 /// as untracked.
-fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, commit_sha: [20]u8, dest: []const u8) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    var alts = try alternates_mod.Reader.init(allocator, io.io, git_dir);
+fn checkoutFiles(allocator: std.mem.Allocator, io: Io, repo: Repo, commit_sha: [20]u8, dest: []const u8) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    var alts = try alternates_mod.Reader.init(allocator, io.io, repo.common_dir);
     defer alts.deinit();
 
     const obj = try readWithAlternates(allocator, io, &store, &alts, commit_sha);
@@ -675,7 +686,7 @@ fn checkoutFiles(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, comm
     for (tree.entries) |entry| {
         try checkoutTreeEntry(allocator, io, &store, &alts, entry, dest, "", &idx);
     }
-    try idx.writeToFile(git_dir, allocator, io.io);
+    try idx.writeToFile(repo.worktree_dir, allocator, io.io);
 }
 
 /// Read an object from the local store, falling back to the alternates object

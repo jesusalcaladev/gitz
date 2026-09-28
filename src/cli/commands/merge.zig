@@ -9,6 +9,7 @@ const tree_merge = @import("../../core/tree_merge.zig");
 const checkout = @import("../../core/checkout.zig");
 const config_cmd = @import("config.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 /// State written by a conflicted merge so a later `gitz commit` can finish it,
 /// mirroring git's MERGE_HEAD / MERGE_MSG.
@@ -18,7 +19,11 @@ const MERGE_MSG = "MERGE_MSG";
 /// How `-X ours` / `-X theirs` resolves a conflict.
 const ConflictStrategy = enum { ours, theirs };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var no_ff = false;
     var ff_only = false;
     var abort = false;
@@ -75,7 +80,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (abort) {
-        try abortMerge(allocator, git_dir, io);
+        try abortMerge(allocator, repo, io);
         return;
     }
 
@@ -84,8 +89,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         std.process.exit(errors.ExitFailure);
     };
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
         errors.fatal(io, "not a gitz repository", .{});
@@ -103,7 +108,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                 errors.errorf(io, "branch '{s}' not found", .{name});
             };
             try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, target_ub);
-            checkout.checkoutCommit(allocator, git_dir, io.io, store, target_ub) catch
+            checkout.checkoutCommit(allocator, repo, io.io, store, target_ub) catch
                 errors.fatal(io, "could not check out the merged tree", .{});
             try io.print("Fast-forward\n", .{});
             return;
@@ -129,11 +134,11 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const is_ff = isAncestor(allocator, io.io, store, target_sha, current_sha);
 
     if (is_ff and !no_ff) {
-        if (try wouldLoseWork(allocator, git_dir, io, store, target_sha)) {
+        if (try wouldLoseWork(allocator, repo, io, store, target_sha)) {
             errors.errorf(io, "Your local changes would be overwritten by merge. Commit or stash them first.", .{});
         }
         try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, target_sha);
-        checkout.checkoutCommit(allocator, git_dir, io.io, store, target_sha) catch
+        checkout.checkoutCommit(allocator, repo, io.io, store, target_sha) catch
             errors.fatal(io, "could not check out the merged tree", .{});
 
         const hex = Sha1.hex(target_sha);
@@ -196,7 +201,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     if (conflicts > 0) {
-        try reportConflicts(allocator, git_dir, io, store, &merged, target_sha, name, merge_msg);
+        try reportConflicts(allocator, repo, io, store, &merged, target_sha, name, merge_msg);
         // A conflicted merge must not move HEAD: git leaves the merge in
         // progress so the user can resolve and commit.
         errors.exitWith(io, errors.ExitFailure, "Automatic merge failed; fix conflicts and then commit the result.", .{});
@@ -206,12 +211,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // refresh both the working tree and the index so the repository stays
     // self-consistent.
     const tree_sha = try writeMergedTree(allocator, io, store, &merged);
-    try writeWorktree(allocator, git_dir, io, store, &merged);
+    try writeWorktree(allocator, repo, io, store, &merged);
 
     var idx = index_mod.Index.init(allocator);
     defer idx.deinit(allocator);
     try indexFromMerged(allocator, &idx, &merged);
-    try idx.writeToFile(git_dir, allocator, io.io);
+    try idx.writeToFile(repo.worktree_dir, allocator, io.io);
 
     // `--squash` and `--no-commit` both stop before the merge commit: the result
     // is staged and MERGE_HEAD/MERGE_MSG are left for `gitz commit` to consume.
@@ -221,12 +226,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         // `--squash` deliberately leaves no MERGE_HEAD: `gitz commit` reads that
         // file to add a second parent, and a squash must produce a single-parent
         // commit. Its message goes to SQUASH_MSG instead.
-        try writeMergeState(allocator, git_dir, io, target_sha, name, merge_msg, squash);
+        try writeMergeState(allocator, repo, io, target_sha, name, merge_msg, squash);
         try io.print("Automatic merge went well; stopped before committing as requested\n", .{});
         return;
     }
 
-    const merge_sha = try writeMergeCommit(allocator, git_dir, io, store, tree_sha, current_sha, target_sha, merge_msg, name);
+    const merge_sha = try writeMergeCommit(allocator, repo, io, store, tree_sha, current_sha, target_sha, merge_msg, name);
     try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, merge_sha);
 
     const hex = Sha1.hex(merge_sha);
@@ -237,7 +242,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 /// Record the pending-merge state so `gitz commit` finishes the work.
 fn writeMergeState(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     target_sha: [20]u8,
     name: []const u8,
@@ -248,13 +253,13 @@ fn writeMergeState(
     defer if (merge_msg == null) allocator.free(msg);
 
     if (squash) {
-        const squash_path = try std.fmt.allocPrint(allocator, "{s}/SQUASH_MSG", .{git_dir});
+        const squash_path = try std.fmt.allocPrint(allocator, "{s}/SQUASH_MSG", .{repo.worktree_dir});
         defer allocator.free(squash_path);
         try io.writeFile(squash_path, msg);
         return;
     }
 
-    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_HEAD });
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo.worktree_dir, MERGE_HEAD });
     defer allocator.free(head_path);
 
     const hex = Sha1.hex(target_sha);
@@ -264,7 +269,7 @@ fn writeMergeState(
     defer hf.close(io.io);
     try std.Io.File.writeStreamingAll(hf, io.io, line);
 
-    const msg_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_MSG });
+    const msg_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo.worktree_dir, MERGE_MSG });
     defer allocator.free(msg_path);
     try io.writeFile(msg_path, msg);
 }
@@ -312,7 +317,7 @@ fn stageBlob(merged: *const tree_merge.TreeMergeResult, path: []const u8, stage:
 
 fn writeMergeCommit(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     store: storage_mod.StorageBackend,
     tree_sha: [20]u8,
@@ -333,9 +338,9 @@ fn writeMergeCommit(
 
     const now = currentTimestamp(io);
 
-    const author_name = config_cmd.getUserName(allocator, git_dir, io);
+    const author_name = config_cmd.getUserName(allocator, repo.common_dir, io);
     defer if (!std.mem.eql(u8, author_name, "GitZ User")) allocator.free(author_name);
-    const author_email = config_cmd.getUserEmail(allocator, git_dir, io);
+    const author_email = config_cmd.getUserEmail(allocator, repo.common_dir, io);
     defer if (!std.mem.eql(u8, author_email, "user@gitz.dev")) allocator.free(author_email);
 
     const commit = object.Commit{
@@ -357,14 +362,14 @@ fn currentTimestamp(io: Io) i64 {
 /// are deleted so the checkout matches the merge commit.
 fn writeWorktree(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     store: storage_mod.StorageBackend,
     merged: *const tree_merge.TreeMergeResult,
 ) !void {
     // Remember which paths the pre-merge index tracked so removals can be
     // detected.
-    var old_index = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch null;
+    var old_index = index_mod.Index.readFromFile(allocator, repo.worktree_dir, io.io) catch null;
     defer if (old_index) |*oi| oi.deinit(allocator);
 
     // Only paths the merge actually changed are written. Writing every entry of
@@ -373,7 +378,7 @@ fn writeWorktree(
     var head_files = checkout.FileMap.init(allocator);
     defer checkout.freeMap(allocator, &head_files);
     {
-        const refs_manager = refs_mod.Refs.init(git_dir);
+        const refs_manager = refs_mod.Refs.init(repo);
         if (refs_manager.read(allocator, io.io, "HEAD")) |hs| {
             if (store.read(allocator, io.io, hs)) |obj| {
                 var o = obj;
@@ -430,12 +435,12 @@ fn writeWorktree(
 /// would replace.
 fn wouldLoseWork(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     store: storage_mod.StorageBackend,
     target_sha: [20]u8,
 ) !bool {
-    const report = checkout.checkSafeToReplace(allocator, git_dir, io.io, store, target_sha) catch
+    const report = checkout.checkSafeToReplace(allocator, repo, io.io, store, target_sha) catch
         return false;
     var r = report;
     defer r.deinit(allocator);
@@ -561,7 +566,7 @@ fn indexShaOf(idx: *const index_mod.Index, path: []const u8) ?[20]u8 {
 /// can resolve and `gitz commit`.
 fn reportConflicts(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     store: storage_mod.StorageBackend,
     merged: *const tree_merge.TreeMergeResult,
@@ -578,7 +583,7 @@ fn reportConflicts(
     var head_files = checkout.FileMap.init(allocator);
     defer checkout.freeMap(allocator, &head_files);
     {
-        const refs_manager = refs_mod.Refs.init(git_dir);
+        const refs_manager = refs_mod.Refs.init(repo);
         if (refs_manager.read(allocator, io.io, "HEAD")) |hs| {
             if (store.read(allocator, io.io, hs)) |obj| {
                 var o = obj;
@@ -636,10 +641,10 @@ fn reportConflicts(
         }
     }
 
-    try idx.writeToFile(git_dir, allocator, io.io);
+    try idx.writeToFile(repo.worktree_dir, allocator, io.io);
 
     // Leave the merge in progress, exactly like git.
-    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_HEAD });
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo.worktree_dir, MERGE_HEAD });
     defer allocator.free(head_path);
     {
         const hex = Sha1.hex(target_sha);
@@ -649,7 +654,7 @@ fn reportConflicts(
         try std.Io.File.writeStreamingAll(hf, io.io, try std.fmt.bufPrint(&wbuf, "{s}\n", .{&hex}));
     }
 
-    const msg_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_MSG });
+    const msg_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo.worktree_dir, MERGE_MSG });
     defer allocator.free(msg_path);
     {
         var msg_buf: [256]u8 = undefined;
@@ -658,8 +663,8 @@ fn reportConflicts(
     }
 }
 
-fn abortMerge(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_HEAD });
+fn abortMerge(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo.worktree_dir, MERGE_HEAD });
     defer allocator.free(head_path);
     // git exits 128 here; printing and returning 0 made a scripted
     // `gitz merge --abort` look like it had undone a merge.
@@ -667,7 +672,7 @@ fn abortMerge(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
         errors.fatal(io, "There is no merge to abort (MERGE_HEAD missing)", .{});
     }
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
     var head_info = refs_manager.head(allocator, io.io) catch {
         errors.fatal(io, "not a gitz repository", .{});
     };
@@ -679,27 +684,27 @@ fn abortMerge(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
         .unborn => errors.fatal(io, "There is no merge to abort (MERGE_HEAD missing)", .{}),
     };
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    checkout.checkoutCommit(allocator, git_dir, io.io, store, current_sha) catch
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    checkout.checkoutCommit(allocator, repo, io.io, store, current_sha) catch
         errors.fatal(io, "could not restore the working tree", .{});
 
-    try clearMergeState(allocator, git_dir, io);
+    try clearMergeState(allocator, repo.worktree_dir, io);
     try io.print("Merge aborted; restored HEAD to the pre-merge state.\n", .{});
 }
 
-pub fn clearMergeState(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
+pub fn clearMergeState(allocator: std.mem.Allocator, worktree_dir: []const u8, io: Io) !void {
     // SQUASH_MSG is cleared too: `merge --squash` writes it instead of
     // MERGE_HEAD, so `commit` kept picking up a stale message afterwards.
     for ([_][]const u8{ MERGE_HEAD, MERGE_MSG, "SQUASH_MSG" }) |name| {
-        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, name });
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_dir, name });
         defer allocator.free(p);
         std.Io.Dir.cwd().deleteFile(io.io, p) catch {};
     }
 }
 
 /// Read MERGE_HEAD if a merge is in progress.
-pub fn pendingMergeHead(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) ?[20]u8 {
-    const p = std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_HEAD }) catch return null;
+pub fn pendingMergeHead(allocator: std.mem.Allocator, worktree_dir: []const u8, io: Io) ?[20]u8 {
+    const p = std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_dir, MERGE_HEAD }) catch return null;
     defer allocator.free(p);
     const content = io.readFileAlloc(p) catch return null;
     defer allocator.free(content);

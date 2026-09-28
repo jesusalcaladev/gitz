@@ -6,11 +6,17 @@ const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 const checkout = @import("../../core/checkout.zig");
 const index_mod = @import("../../core/index.zig");
+const reset_mod = @import("reset.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 const Mode = enum { soft, mixed, hard };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     // `--hard` is the default: the commit being undone is one the user has
     // already decided to abandon, and leaving its changes staged behind made
     // `gitz undo` look like it had done nothing.
@@ -33,8 +39,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     const current_sha = refs_manager.read(allocator, io.io, "HEAD") catch
         errors.fatal(io, "no commits yet", .{});
@@ -68,6 +74,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         else => errors.fatal(io, "target is not a commit", .{}),
     };
 
+    // Record where HEAD is before it moves, so `gitz gc` keeps the undone commit
+    // reachable and it can be recovered. GitZ has no reflog, so ORIG_HEAD is the
+    // only breadcrumb left after a reset or an undo. It is a per-worktree
+    // pseudo-ref and lives next to HEAD.
+    reset_mod.writeOrigHead(allocator, git_dir, io, current_sha) catch {};
+
     // The index and the working tree move *before* the ref does. `checkoutCommit`
     // compares the target against HEAD to decide which local edits to carry
     // over, so moving the ref first made every undone file look unchanged and
@@ -87,7 +99,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try idx.writeToFile(git_dir, allocator, io.io);
         },
         .hard => {
-            checkout.checkoutCommit(allocator, git_dir, io.io, store, target_sha) catch
+            checkout.checkoutCommit(allocator, repo, io.io, store, target_sha) catch
                 errors.fatal(io, "could not restore the working tree", .{});
         },
     }

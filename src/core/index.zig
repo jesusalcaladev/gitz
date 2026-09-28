@@ -253,8 +253,15 @@ pub const Index = struct {
         return try store.write(allocator, io, object.GitObject{ .tree = tree });
     }
 
-    pub fn writeToFile(self: Index, git_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !void {
-        const index_path = try std.fmt.allocPrint(allocator, "{s}/index", .{git_dir});
+    /// Write the index of one worktree.
+    ///
+    /// The index is per worktree, not shared: it records what is staged *in
+    /// this checkout*. Two agents in separate worktrees stage unrelated files at
+    /// the same time, and the worktree dir is what keeps them apart. The
+    /// on-disk encoding is untouched, because real git has to be able to read
+    /// what is written here.
+    pub fn writeToFile(self: Index, worktree_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !void {
+        const index_path = try std.fmt.allocPrint(allocator, "{s}/index", .{worktree_dir});
         defer allocator.free(index_path);
 
         var f = try std.Io.Dir.cwd().createFile(io, index_path, .{});
@@ -326,8 +333,8 @@ pub const Index = struct {
         try std.Io.File.writeStreamingAll(f, io, &trailer);
     }
 
-    pub fn readFromFile(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io) !Index {
-        const index_path = try std.fmt.allocPrint(allocator, "{s}/index", .{git_dir});
+    pub fn readFromFile(allocator: std.mem.Allocator, worktree_dir: []const u8, io: std.Io) !Index {
+        const index_path = try std.fmt.allocPrint(allocator, "{s}/index", .{worktree_dir});
         defer allocator.free(index_path);
 
         var idx = Index.init(allocator);

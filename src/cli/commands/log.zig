@@ -7,8 +7,12 @@ const alternates_mod = @import("../../core/alternates.zig");
 const checkout_mod = @import("../../core/checkout.zig");
 const errors = @import("../errors.zig");
 const refs_mod = @import("../../core/refs.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     var oneline = false;
     var graph = false;
     var show_all = false;
@@ -115,7 +119,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // A single positional may be a revision to log, or a path to filter by.
     if (pathspecs.items.len == 1) {
         const only = pathspecs.items[0];
-        if (show_all or isRevisionLike(allocator, io, git_dir, only)) {
+        if (show_all or isRevisionLike(allocator, io, repo, only)) {
             show_commit = only;
             allocator.free(only);
             pathspecs.items = &.{};
@@ -127,17 +131,17 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // Several pathspecs restrict the walk to their union.
     const multi_pathspecs: []const []const u8 = if (pathspecs.items.len > 1) pathspecs.items else &.{};
 
-    var alts = try alternates_mod.Reader.init(allocator, io.io, git_dir);
+    var alts = try alternates_mod.Reader.init(allocator, io.io, repo.common_dir);
     defer alts.deinit();
 
     // Show a specific commit
     if (show_commit) |sha_str| {
-        try showSpecificCommit(allocator, git_dir, sha_str, io, &alts);
+        try showSpecificCommit(allocator, repo, sha_str, io, &alts);
         return;
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs_mod.Refs.init(repo);
 
     if (show_all) {
         // Show all branches
@@ -307,26 +311,26 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const item = collected.items[if (reverse) total - 1 - idx else idx];
         try printCommit(allocator, io, item.sha, item.commit, oneline, graph);
         if (decorate) {
-            try printDecoration(allocator, git_dir, io, item.sha);
+            try printDecoration(allocator, repo, io, item.sha);
         }
         if (show_diff) {
-            try printCommitDiff(allocator, git_dir, io, item.sha, item.commit, stat_only, name_only);
+            try printCommitDiff(allocator, repo, io, item.sha, item.commit, stat_only, name_only);
         }
     }
 }
 
 /// Whether `name` looks like a revision rather than a path.
 /// Whether `namespace/name` resolves to a ref.
-fn tryRevExists(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, namespace: []const u8, name: []const u8) bool {
+fn tryRevExists(allocator: std.mem.Allocator, io: Io, repo: Repo, namespace: []const u8, name: []const u8) bool {
     const full = std.fmt.allocPrint(allocator, "{s}/{s}", .{ namespace, name }) catch return false;
     defer allocator.free(full);
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
     _ = refs_manager.read(allocator, io.io, full) catch return false;
     return true;
 }
 
 /// Whether `name` names a revision rather than a path.
-fn isRevisionLike(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, name: []const u8) bool {
+fn isRevisionLike(allocator: std.mem.Allocator, io: Io, repo: Repo, name: []const u8) bool {
     if (Sha1.fromHex(name)) |_| {
         return true;
     } else |_| {}
@@ -335,13 +339,13 @@ fn isRevisionLike(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, nam
     // A name that exists on disk is a path, whatever it looks like.
     if (io.fileExists(name)) return false;
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
     if (refs_manager.read(allocator, io.io, name)) |_| {
         return true;
     } else |_| {}
 
-    if (tryRevExists(allocator, io, git_dir, "refs/heads", name)) return true;
-    if (tryRevExists(allocator, io, git_dir, "refs/tags", name)) return true;
+    if (tryRevExists(allocator, io, repo, "refs/heads", name)) return true;
+    if (tryRevExists(allocator, io, repo, "refs/tags", name)) return true;
 
     // `origin/main` and friends.
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
@@ -355,8 +359,8 @@ fn isRevisionLike(allocator: std.mem.Allocator, io: Io, git_dir: []const u8, nam
 }
 
 /// Print the refs pointing at a commit, for `--decorate`.
-fn printDecoration(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, sha: [20]u8) !void {
-    const refs_manager = refs_mod.Refs.init(git_dir);
+fn printDecoration(allocator: std.mem.Allocator, repo: Repo, io: Io, sha: [20]u8) !void {
+    const refs_manager = refs_mod.Refs.init(repo);
 
     const all = try refs_manager.listAll(allocator, io.io);
     defer {
@@ -480,16 +484,16 @@ fn formatDate(buf: []u8, timestamp: i64, timezone: []const u8) ![]const u8 {
 /// ignored, so `gitz log -p` printed commit headers with no diff at all.
 fn printCommitDiff(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     sha: [20]u8,
     commit: object.Commit,
     stat_only: bool,
     name_only: bool,
 ) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
-    var alts = try alternates_mod.Reader.init(allocator, io.io, git_dir);
+    var alts = try alternates_mod.Reader.init(allocator, io.io, repo.common_dir);
     defer alts.deinit();
 
     var current = checkout_mod.FileMap.init(allocator);
@@ -603,13 +607,13 @@ fn readWithAlternates(
     };
 }
 
-fn showSpecificCommit(allocator: std.mem.Allocator, git_dir: []const u8, sha_str: []const u8, io: Io, alts: *const alternates_mod.Reader) !void {
+fn showSpecificCommit(allocator: std.mem.Allocator, repo: Repo, sha_str: []const u8, io: Io, alts: *const alternates_mod.Reader) !void {
     const sha = Sha1.fromHex(sha_str) catch {
         try io.eprint("fatal: invalid commit SHA '{s}'\n", .{sha_str});
         return;
     };
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     const obj = readWithAlternates(allocator, io.io, store, alts, sha) catch {
         try io.eprint("fatal: not a commit object '{s}'\n", .{sha_str});
         return;

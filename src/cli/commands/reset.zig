@@ -7,10 +7,15 @@ const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
 const checkout_mod = @import("../../core/checkout.zig");
 const safety = @import("../../util/clone_safety.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 pub const ResetMode = enum { soft, mixed, hard };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var mode: ResetMode = .mixed;
     var target: ?[]const u8 = null;
 
@@ -47,8 +52,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     // Resolve target commit
     const commit_sha = resolveCommit(allocator, io.io, refs_manager, store, target.?) catch {
@@ -61,6 +66,16 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         try io.eprint("fatal: no commits yet\n", .{});
         return;
     };
+
+    // Record where HEAD was before it moves. GitZ wrote no ORIG_HEAD and no
+    // reflog anywhere, so after a reset the previous commit became unreachable
+    // and `gitz gc` deleted it with nothing left to recover from. `gc` already
+    // lists ORIG_HEAD as a reachability root, so writing it here is what makes
+    // that root real. It goes in the worktree dir, like HEAD itself.
+    //
+    // A failure here is not worth aborting the reset over: the worst case is the
+    // pre-existing behaviour.
+    writeOrigHead(allocator, git_dir, io, current_sha) catch {};
 
     // Update HEAD ref
     var head_file = std.Io.Dir.cwd().openFile(io.io,
@@ -115,7 +130,23 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try io.print("HEAD is now at {s}\n", .{hex[0..7]});
         },
     }
-    _ = current_sha;
+}
+
+/// Write `<git_dir>/ORIG_HEAD` as the commit HEAD pointed at before it moved.
+///
+/// ORIG_HEAD is a per-worktree pseudo-ref, so it belongs next to HEAD and index,
+/// not in the shared ref store. Git keeps it as a plain (unsymbolic) SHA file,
+/// and so does this.
+pub fn writeOrigHead(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, sha: [20]u8) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/ORIG_HEAD", .{git_dir});
+    defer allocator.free(path);
+
+    var f = try std.Io.Dir.cwd().createFile(io.io, path, .{});
+    defer f.close(io.io);
+
+    const hex = Sha1.hex(sha);
+    var buf: [42]u8 = undefined;
+    try std.Io.File.writeStreamingAll(f, io.io, try std.fmt.bufPrint(&buf, "{s}\n", .{&hex}));
 }
 
 /// Reset index to match the given commit's tree (recursive)

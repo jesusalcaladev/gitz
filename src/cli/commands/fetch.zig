@@ -7,8 +7,13 @@ const ssh_cmd = @import("../../transport/ssh_cmd.zig");
 const ssh_mod = @import("../../transport/ssh.zig");
 const remote_cmd = @import("remote.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var remote_name: ?[]const u8 = null;
     var refspec: ?[]const u8 = null;
     var use_git = false;
@@ -56,7 +61,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         defer ssh_transport.deinit();
 
         // Get local HEAD for have lines
-        const refs_manager = refs_mod.Refs.init(git_dir);
+        const refs_manager = refs_mod.Refs.init(repo);
         const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
 
         var have_list: [1][20]u8 = undefined;
@@ -77,7 +82,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             allocator.free(refs);
         }
 
-        ssh_transport.fetch(git_dir, refs, have_slice) catch {
+        ssh_transport.fetch(repo, refs, have_slice) catch {
             try io.print("Note: SSH fetch failed, falling back to git\n", .{});
             try fetchViaGit(allocator, git_dir, name, io);
             return;
@@ -88,7 +93,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
                 const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ name, ref.name[11..] });
                 defer allocator.free(remote_ref);
-                const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ git_dir, name });
+                const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ repo.common_dir, name });
                 defer allocator.free(dir_path);
                 std.Io.Dir.cwd().createDirPath(io.io, dir_path) catch {};
                 try refs_manager.write(allocator, io.io, remote_ref, ref.sha);
@@ -122,7 +127,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             allocator.free(refs);
         }
 
-        const refs_manager = refs_mod.Refs.init(git_dir);
+        const refs_manager = refs_mod.Refs.init(repo);
         const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
 
         var have_list: [1][20]u8 = undefined;
@@ -143,7 +148,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             filtered_refs = try temp.toOwnedSlice(allocator);
         }
 
-        transport.fetch(git_dir, filtered_refs, have_slice) catch {
+        transport.fetch(repo, filtered_refs, have_slice) catch {
             try io.print("Note: HTTP fetch failed, falling back to git\n", .{});
             try fetchViaGit(allocator, git_dir, name, io);
             return;
@@ -153,7 +158,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             if (std.mem.startsWith(u8, ref.name, "refs/heads/")) {
                 const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ name, ref.name[11..] });
                 defer allocator.free(remote_ref);
-                const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ git_dir, name });
+                const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/remotes/{s}", .{ repo.common_dir, name });
                 defer allocator.free(dir_path);
                 std.Io.Dir.cwd().createDirPath(io.io, dir_path) catch {};
                 try refs_manager.write(allocator, io.io, remote_ref, ref.sha);

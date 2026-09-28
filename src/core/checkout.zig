@@ -5,6 +5,7 @@ const index_mod = @import("index.zig");
 const object = @import("object.zig");
 const safety = @import("../util/clone_safety.zig");
 const refs_mod = @import("refs.zig");
+const Repo = @import("repo.zig").Repo;
 
 /// Flat map of repository path -> blob SHA (plus mode).
 pub const FileEntry = struct {
@@ -114,7 +115,7 @@ fn appendTreeEntries(
 /// Rebuild the index so it matches the given commit's tree exactly.
 pub fn writeIndexForCommit(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: std.Io,
     store: storage_mod.StorageBackend,
     commit_sha: [20]u8,
@@ -130,7 +131,7 @@ pub fn writeIndexForCommit(
     defer idx.deinit(allocator);
 
     try appendTreeEntries(&idx, store, allocator, io, commit.tree, "");
-    try idx.writeToFile(git_dir, allocator, io);
+    try idx.writeToFile(repo.worktree_dir, allocator, io);
 }
 
 /// Recursively write every file of a tree into the working directory
@@ -235,7 +236,7 @@ pub const DirtyReport = struct {
 /// would destroy uncommitted work. Returns the offending paths (empty == safe).
 pub fn checkSafeToReplace(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: std.Io,
     store: storage_mod.StorageBackend,
     target_commit: [20]u8,
@@ -258,7 +259,7 @@ pub fn checkSafeToReplace(
     defer freeMap(allocator, &target);
     try flattenTree(allocator, io, store, commit.tree, "", &target);
 
-    var idx = try index_mod.Index.readFromFile(allocator, git_dir, io);
+    var idx = try index_mod.Index.readFromFile(allocator, repo.worktree_dir, io);
     defer idx.deinit(allocator);
 
     // 1) Files of the target tree that already exist on disk must be either
@@ -306,7 +307,7 @@ fn findIndexSha(idx: *const index_mod.Index, name: []const u8) ?[20]u8 {
 /// should run `checkSafeToReplace` first when uncommitted work must be kept.
 pub fn checkoutCommit(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: std.Io,
     store: storage_mod.StorageBackend,
     commit_sha: [20]u8,
@@ -323,7 +324,7 @@ pub fn checkoutCommit(
     defer freeMap(allocator, &target);
     try flattenTree(allocator, io, store, commit.tree, "", &target);
 
-    var old_index = try index_mod.Index.readFromFile(allocator, git_dir, io);
+    var old_index = try index_mod.Index.readFromFile(allocator, repo.worktree_dir, io);
     defer old_index.deinit(allocator);
     const stale = try stalePaths(allocator, io, &old_index, &target);
     defer {
@@ -346,7 +347,7 @@ pub fn checkoutCommit(
         // not change can be recognised.
         var head_files: FileMap = .init(allocator);
         defer freeMap(allocator, &head_files);
-        if (refs_mod.Refs.init(git_dir).read(allocator, io, "HEAD")) |head_sha| {
+        if (refs_mod.Refs.init(repo).read(allocator, io, "HEAD")) |head_sha| {
             if (store.read(allocator, io, head_sha)) |o| {
                 var head_obj = o;
                 defer head_obj.deinit(allocator);
@@ -379,7 +380,7 @@ pub fn checkoutCommit(
     }
 
     // 1) index matches the target tree
-    try writeIndexForCommit(allocator, git_dir, io, store, commit_sha);
+    try writeIndexForCommit(allocator, repo, io, store, commit_sha);
     // 2) files come from the target tree
     restoreTreeKeeping(allocator, io, store, commit.tree, "", &keep);
     // 3) files the target tree no longer has are removed

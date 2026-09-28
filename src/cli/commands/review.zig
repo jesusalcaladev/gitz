@@ -6,8 +6,12 @@ const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 const diff_mod = @import("../../core/diff.zig");
 const checkout_mod = @import("../../core/checkout.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     var base_ref: ?[]const u8 = null;
     var head_ref: ?[]const u8 = null;
     var show_stats = true;
@@ -33,8 +37,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs_mod.Refs.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs_mod.Refs.init(repo);
 
     // Resolve base (default: main/master)
     const base_sha = if (base_ref) |br|

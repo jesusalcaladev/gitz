@@ -6,6 +6,7 @@ const object = @import("../../core/object.zig");
 const storage_mod = @import("../../core/storage.zig");
 const config_cmd = @import("config.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 /// Everything `gitz tag` can be asked to do.
 const Mode = enum {
@@ -21,7 +22,10 @@ const Mode = enum {
     verify,
 };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     var mode: Mode = .create;
     var annotated = false;
     var force = false;
@@ -120,20 +124,20 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     switch (mode) {
-        .list => try listTags(allocator, git_dir, io),
-        .remove => try removeTag(allocator, git_dir, io, positional.items),
-        .show => try showTags(allocator, git_dir, io, positional.items, show_lines),
-        .verify => try verifyTags(allocator, git_dir, io),
+        .list => try listTags(allocator, repo, io),
+        .remove => try removeTag(allocator, repo, io, positional.items),
+        .show => try showTags(allocator, repo, io, positional.items, show_lines),
+        .verify => try verifyTags(allocator, repo, io),
         .create => {
             if (positional.items.len == 0) return;
             const target = if (positional.items.len >= 2) positional.items[1] else null;
-            try createTag(allocator, git_dir, io, positional.items[0], message, annotated, force, target);
+            try createTag(allocator, repo, io, positional.items[0], message, annotated, force, target);
         },
     }
 }
 
-fn listTags(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const refs_manager = refs_mod.Refs.init(git_dir);
+fn listTags(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    const refs_manager = refs_mod.Refs.init(repo);
 
     const tags = try refs_manager.list(allocator, io.io, "tags");
     defer {
@@ -154,8 +158,8 @@ fn listTags(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
     }
 }
 
-fn removeTag(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, positional: []const []const u8) !void {
-    const refs_manager = refs_mod.Refs.init(git_dir);
+fn removeTag(allocator: std.mem.Allocator, repo: Repo, io: Io, positional: []const []const u8) !void {
+    const refs_manager = refs_mod.Refs.init(repo);
 
     const name = positional[0];
     if (!refs_mod.Refs.isValidRefName(name)) {
@@ -177,14 +181,14 @@ fn removeTag(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, position
 /// Print each tag with the commit it points at.
 fn showTags(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     positional: []const []const u8,
     show_lines: usize,
 ) !void {
     _ = show_lines;
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     // `<commit>` as the only argument lists the tags that reach it.
     const only: ?[]const u8 = if (positional.len >= 1) positional[0] else null;
@@ -223,9 +227,9 @@ fn showTags(
     }
 }
 
-fn verifyTags(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+fn verifyTags(allocator: std.mem.Allocator, repo: Repo, io: Io) !void {
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     const tags = try refs_manager.list(allocator, io.io, "tags");
     defer {
@@ -246,7 +250,7 @@ fn verifyTags(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
 
 fn createTag(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     name: []const u8,
     message: ?[]const u8,
@@ -258,8 +262,8 @@ fn createTag(
         errors.errorf(io, "'{s}' is not a valid tag name", .{name});
     }
 
-    const refs_manager = refs_mod.Refs.init(git_dir);
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(repo);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     const ref_name = try std.fmt.allocPrint(allocator, "refs/tags/{s}", .{name});
     defer allocator.free(ref_name);
@@ -285,7 +289,7 @@ fn createTag(
         // git requires a message for an annotated tag; an empty one was
         // silently accepted.
         const msg = message orelse errors.errorf(io, "no tag message supplied", .{});
-        const tag_sha = try createAnnotatedTag(allocator, git_dir, io, name, msg, target_sha);
+        const tag_sha = try createAnnotatedTag(allocator, repo, io, name, msg, target_sha);
         try refs_manager.write(allocator, io.io, ref_name, tag_sha);
     } else {
         try refs_manager.write(allocator, io.io, ref_name, target_sha);
@@ -338,22 +342,22 @@ fn resolveCommitArg(
 
 fn createAnnotatedTag(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     name: []const u8,
     msg: []const u8,
     target_sha: [20]u8,
 ) ![20]u8 {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
 
     const now_ts = std.Io.Timestamp.now(io.io, .real);
     const now: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
 
     // The tagger was hardcoded to "GitZ User <user@gitz.dev>", so every tag was
     // attributed to the wrong identity even with user.name configured.
-    const tagger_name = config_cmd.getUserName(allocator, git_dir, io);
+    const tagger_name = config_cmd.getUserName(allocator, repo.common_dir, io);
     defer if (!std.mem.eql(u8, tagger_name, "GitZ User")) allocator.free(tagger_name);
-    const tagger_email = config_cmd.getUserEmail(allocator, git_dir, io);
+    const tagger_email = config_cmd.getUserEmail(allocator, repo.common_dir, io);
     defer if (!std.mem.eql(u8, tagger_email, "user@gitz.dev")) allocator.free(tagger_email);
 
     const tag_obj = object.TagObject{

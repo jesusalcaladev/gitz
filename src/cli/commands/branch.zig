@@ -4,12 +4,17 @@ const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
 const Sha1 = @import("../../core/sha1.zig").Sha1;
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
-    const refs_manager = refs_mod.Refs.init(git_dir);
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
+    const refs_manager = refs_mod.Refs.init(repo);
 
     if (args.len == 0) {
-        try listBranches(allocator, git_dir, .local, io);
+        try listBranches(allocator, repo, .local, io);
         return;
     }
 
@@ -19,19 +24,19 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // error.
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
-            try listBranches(allocator, git_dir, .all, io);
+            try listBranches(allocator, repo, .all, io);
             return;
         }
         if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--remotes")) {
-            try listBranches(allocator, git_dir, .remotes, io);
+            try listBranches(allocator, repo, .remotes, io);
             return;
         }
         if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
-            try listBranches(allocator, git_dir, .verbose, io);
+            try listBranches(allocator, repo, .verbose, io);
             return;
         }
         if (std.mem.eql(u8, arg, "--list")) {
-            try listBranches(allocator, git_dir, .all, io);
+            try listBranches(allocator, repo, .all, io);
             return;
         }
         if (std.mem.eql(u8, arg, "--show-current")) {
@@ -165,7 +170,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         // all, so a plain `-d` destroyed work that was not merged anywhere, and
         // a later gc made it unrecoverable.
         if (!force_delete) {
-            const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+            const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
             const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
             // "Fully merged" means the branch tip is reachable *from* the
             // current HEAD, so the walk starts at HEAD and looks for the tip.
@@ -227,8 +232,8 @@ const ListMode = enum { local, all, remotes, verbose };
 /// The listing used to come straight from `getdents64`, so it appeared in
 /// directory order rather than sorted, and every listing flag was ignored:
 /// `-a` and `-r` printed the plain local list and exited 0.
-fn listBranches(allocator: std.mem.Allocator, git_dir: []const u8, mode: ListMode, io: Io) !void {
-    const refs_manager = refs_mod.Refs.init(git_dir);
+fn listBranches(allocator: std.mem.Allocator, repo: Repo, mode: ListMode, io: Io) !void {
+    const refs_manager = refs_mod.Refs.init(repo);
 
     var all = std.ArrayList([]const u8).empty;
     defer {

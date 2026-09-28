@@ -1,8 +1,13 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var remote_name: ?[]const u8 = null;
     var use_git = false;
     var force = false;
@@ -48,7 +53,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // A failed fetch must not be followed by a rebase and a success message.
     // `fetch` now exits non-zero on failure, and this catch covers the
     // remaining I/O error paths.
-    @import("fetch.zig").execute(allocator, git_dir, &fetch_args, io) catch {
+    @import("fetch.zig").execute(allocator, repo, &fetch_args, io) catch {
         try io.eprint("\x1b[31mFetch failed.\x1b[0m\n", .{});
         if (!use_git) try io.print("Try: gitz sync --git\n", .{});
         std.process.exit(1);
@@ -60,7 +65,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     try io.print("\x1b[2m[2/2] Rebasing onto {s}...\x1b[0m\n", .{remote_branch});
     const rebase_args = [_][]const u8{remote_branch};
-    @import("rebase.zig").execute(allocator, git_dir, &rebase_args, io) catch {
+    @import("rebase.zig").execute(allocator, repo, &rebase_args, io) catch {
         if (force) {
             try io.print("\x1b[33mRebase had conflicts, but --force was specified.\x1b[0m\n", .{});
             try io.print("Note: --force does not auto-resolve conflicts. Use 'gitz rebase --abort' to cancel.\n", .{});

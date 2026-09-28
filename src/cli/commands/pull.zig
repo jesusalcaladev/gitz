@@ -3,6 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const config_cmd = @import("config.zig");
 const refs_mod = @import("../../core/refs.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 /// How the fetched commits are integrated.
 const Mode = enum {
@@ -12,7 +13,11 @@ const Mode = enum {
     ff_only,
 };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var mode: Mode = .merge;
     var remote_name: ?[]const u8 = null;
     var branch_name: ?[]const u8 = null;
@@ -63,10 +68,10 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const name = remote_name orelse blk: {
         // Without an explicit remote, use the one the current branch tracks
         // (`branch.<name>.remote`), then fall back to "origin".
-        if (branchName(allocator, git_dir, io)) |b| {
+        if (branchName(allocator, repo, io)) |b| {
             const key = try std.fmt.allocPrint(allocator, "branch.{s}.remote", .{b});
             defer allocator.free(key);
-            if (configValue(allocator, git_dir, io, key)) |r| {
+            if (configValue(allocator, repo.common_dir, io, key)) |r| {
                 defer allocator.free(r);
                 if (r.len > 0 and !std.mem.eql(u8, r, ".")) break :blk try allocator.dupe(u8, r);
             }
@@ -78,13 +83,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // `gitz pull` on a feature branch integrated origin/main and lost the
     // divergence it was meant to resolve. The current branch (or the one given)
     // is used now, which is what git does.
-    const current = branchName(allocator, git_dir, io) orelse
+    const current = branchName(allocator, repo, io) orelse
         errors.fatal(io, "You are not currently on a branch", .{});
     defer allocator.free(current);
     const upstream_branch = branch_name orelse blk: {
         const merge_key = try std.fmt.allocPrint(allocator, "branch.{s}.merge", .{current});
         defer allocator.free(merge_key);
-        if (configValue(allocator, git_dir, io, merge_key)) |m| {
+        if (configValue(allocator, repo.common_dir, io, merge_key)) |m| {
             defer allocator.free(m);
             if (std.mem.startsWith(u8, m, "refs/heads/")) {
                 break :blk try allocator.dupe(u8, m["refs/heads/".len..]);
@@ -104,7 +109,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // rebase against nothing.
     if (!quiet) try io.print("Fetching {s}\n", .{name});
     const fetch_args = [_][]const u8{name};
-    @import("fetch.zig").execute(allocator, git_dir, &fetch_args, io) catch
+    @import("fetch.zig").execute(allocator, repo, &fetch_args, io) catch
         errors.fatal(io, "could not fetch from {s}", .{name});
 
     // Step 2: Integrate the remote-tracking ref.
@@ -116,7 +121,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         .rebase => {
             if (!quiet) try io.print("Rebasing onto {s}...\n", .{upstream});
             const rebase_args = [_][]const u8{upstream};
-            @import("rebase.zig").execute(allocator, git_dir, &rebase_args, io) catch |err| {
+            @import("rebase.zig").execute(allocator, repo, &rebase_args, io) catch |err| {
                 try io.eprint("error: could not rebase onto {s}: {s}\n", .{ upstream, @errorName(err) });
                 std.process.exit(errors.ExitFailure);
             };
@@ -124,7 +129,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         .merge, .ff_only => {
             if (!quiet) try io.print("Merging {s} into the current branch...\n", .{upstream});
             const merge_args = [_][]const u8{upstream};
-            @import("merge.zig").execute(allocator, git_dir, &merge_args, io) catch |err| {
+            @import("merge.zig").execute(allocator, repo, &merge_args, io) catch |err| {
                 try io.eprint("error: could not merge {s}: {s}\n", .{ upstream, @errorName(err) });
                 std.process.exit(errors.ExitFailure);
             };
@@ -138,8 +143,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 /// The name is copied out before the `HeadInfo` is released: returning the
 /// `ArrayList` member left a dangling pointer, and the name came out as garbage
 /// bytes that were then used as the remote branch to pull.
-fn branchName(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) ?[]const u8 {
-    const refs_manager = refs_mod.Refs.init(git_dir);
+fn branchName(allocator: std.mem.Allocator, repo: Repo, io: Io) ?[]const u8 {
+    const refs_manager = refs_mod.Refs.init(repo);
     var head = refs_manager.head(allocator, io.io) catch return null;
     defer head.deinit(allocator);
 

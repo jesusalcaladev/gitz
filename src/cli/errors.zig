@@ -11,6 +11,14 @@ const Io = @import("../util/io.zig").Io;
 pub const ExitSuccess: u8 = 0;
 pub const ExitFailure: u8 = 1;
 
+/// git's own exit codes: 1 for a usage error, 128 for a fatal one. Commands
+/// that report a specific failure return these so a script can tell "you asked
+/// for something impossible" from "the repository is broken".
+pub const Exit = struct {
+    pub const usage: u8 = 1;
+    pub const fatal: u8 = 128;
+};
+
 pub fn fatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
     io.eprint("fatal: " ++ fmt ++ "\n", args) catch {};
     std.process.exit(ExitFailure);

@@ -3,6 +3,7 @@ const Sha1 = @import("sha1.zig").Sha1;
 const object_mod = @import("object.zig");
 const loose_mod = @import("loose.zig");
 const shard_mod = @import("shard_store.zig");
+const Repo = @import("repo.zig").Repo;
 
 const GitObject = object_mod.GitObject;
 const ObjectType = object_mod.ObjectType;
@@ -94,7 +95,13 @@ pub const StorageBackend = union(enum) {
 
     /// Read backend from repo config file.
     /// Falls back to loose if config is missing or unreadable.
-    pub fn fromRepoConfig(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8) StorageBackend {
+    /// Build the object store described by the repository config.
+    ///
+    /// Objects live in the *common* dir: they are shared by every worktree, so
+    /// two agents in separate worktrees read the same history and see each
+    /// other's commits. A linked worktree has no `objects/` of its own.
+    pub fn fromRepoConfig(allocator: std.mem.Allocator, io: std.Io, repo: Repo) StorageBackend {
+        const git_dir = repo.common_dir;
         const config_path = std.fmt.allocPrint(allocator, "{s}/config", .{git_dir}) catch {
             return looseBackend(git_dir);
         };

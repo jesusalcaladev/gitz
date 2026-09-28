@@ -4,6 +4,7 @@ const storage_mod = @import("../core/storage.zig");
 const object = @import("../core/object.zig");
 const packfile_mod = @import("../core/packfile.zig");
 const zlib_mod = @import("../core/zlib.zig");
+const Repo = @import("../core/repo.zig").Repo;
 
 const Allocator = std.mem.Allocator;
 
@@ -69,7 +70,7 @@ pub const SshTransport = struct {
     }
 
     /// Fetch objects via SSH
-    pub fn fetch(self: *SshTransport, git_dir: []const u8, refs: []RemoteRef, have_shas: []const [20]u8) !void {
+    pub fn fetch(self: *SshTransport, repo: Repo, refs: []RemoteRef, have_shas: []const [20]u8) !void {
         // Build wants/haves input for git-upload-pack
         var input = std.ArrayList(u8).empty;
         defer input.deinit(self.allocator);
@@ -105,16 +106,16 @@ pub const SshTransport = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
-        try self.parsePackfile(git_dir, result.stdout);
+        try self.parsePackfile(repo, result.stdout);
     }
 
     /// Push objects via SSH
-    pub fn push(self: *SshTransport, git_dir: []const u8, ref_name: []const u8, sha: [20]u8, old_sha: ?[20]u8) !void {
+    pub fn push(self: *SshTransport, repo: Repo, ref_name: []const u8, sha: [20]u8, old_sha: ?[20]u8) !void {
         const new_hex = Sha1.hex(sha);
         const old_hex: [40]u8 = if (old_sha) |os| Sha1.hex(os) else [_]u8{'0'} ** 40;
 
         // Collect only the objects needed for this push (diff between old and new)
-        const objects = try self.collectPushObjects(git_dir, sha, old_sha);
+        const objects = try self.collectPushObjects(repo, sha, old_sha);
         defer self.allocator.free(objects);
 
         // Build packfile
@@ -122,7 +123,7 @@ pub const SshTransport = struct {
         defer pw.deinit();
         try pw.writeHeader(2, @intCast(objects.len));
 
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo);
         for (objects) |obj_sha| {
             const obj = store.read(self.allocator, self.io, obj_sha) catch continue;
             const serialized = try obj.serialize(self.allocator);
@@ -237,8 +238,8 @@ pub const SshTransport = struct {
     }
 
     /// Collect objects reachable from sha but not from old_sha
-    fn collectPushObjects(self: *SshTransport, git_dir: []const u8, new_sha: [20]u8, old_sha: ?[20]u8) ![][20]u8 {
-        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, git_dir);
+    fn collectPushObjects(self: *SshTransport, repo: Repo, new_sha: [20]u8, old_sha: ?[20]u8) ![][20]u8 {
+        const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo);
 
         var visited = std.AutoHashMap([20]u8, void).init(self.allocator);
         defer visited.deinit();
@@ -318,7 +319,7 @@ pub const SshTransport = struct {
     }
 
     /// Parse packfile from SSH output
-    fn parsePackfile(self: *SshTransport, git_dir: []const u8, data: []const u8) !void {
+    fn parsePackfile(self: *SshTransport, repo: Repo, data: []const u8) !void {
         var pos: usize = 0;
         while (pos + 4 <= data.len) {
             if (std.mem.eql(u8, data[pos..][0..4], "PACK")) {
@@ -350,14 +351,14 @@ pub const SshTransport = struct {
                     pos += result.consumed;
 
                     const obj_type: packfile_mod.ObjectType = @enumFromInt(obj_type_num);
-                    try self.writeObjectAsLoose(git_dir, obj_type, result.data);
+                    try self.writeObjectAsLoose(repo, obj_type, result.data);
                 },
                 else => break,
             }
         }
     }
 
-    fn writeObjectAsLoose(self: *SshTransport, git_dir: []const u8, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
+    fn writeObjectAsLoose(self: *SshTransport, repo: Repo, obj_type: packfile_mod.ObjectType, data: []const u8) !void {
         const type_str: []const u8 = switch (obj_type) {
             .commit => "commit",
             .tree => "tree",
@@ -374,7 +375,7 @@ pub const SshTransport = struct {
         @memcpy(full_obj[0..header.len], header);
         @memcpy(full_obj[header.len..], data);
 
-        const backend = storage_mod.StorageBackend.fromConfig(git_dir, null);
+        const backend = storage_mod.StorageBackend.fromConfig(repo.common_dir, null);
         const obj_type_enum: object.ObjectType = switch (obj_type) {
             .commit => .commit,
             .tree => .tree,

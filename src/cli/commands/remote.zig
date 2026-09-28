@@ -1,8 +1,13 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const Config = @import("../../core/config.zig").Config;
+const Repo = @import("../../core/repo.zig").Repo;
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
+    const git_dir = repo.worktree_dir;
     var verbose = false;
     var subcmd: ?[]const u8 = null;
     var name: ?[]const u8 = null;

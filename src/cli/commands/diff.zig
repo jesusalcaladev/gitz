@@ -8,6 +8,7 @@ const index_mod = @import("../../core/index.zig");
 const diff_mod = @import("../../core/diff.zig");
 const checkout_mod = @import("../../core/checkout.zig");
 const errors = @import("../errors.zig");
+const Repo = @import("../../core/repo.zig").Repo;
 
 /// What the two sides of the diff are.
 const Mode = enum {
@@ -19,7 +20,10 @@ const Mode = enum {
     revs,
 };
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
+pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u8, io: Io) !void {
+    // For a repository with no worktrees the three directories coincide, so
+    // the existing path building below is unchanged. A linked worktree gets
+    // the right directory per role from `repo`.
     var mode: Mode = .working;
     var no_color = false;
     var quiet = false;
@@ -58,30 +62,30 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // `gitz diff v1.0 v2.0` and `gitz diff main..feature` all printed the
     // working-tree diff.
     if (revs.items.len > 0) {
-        try diffRevs(allocator, git_dir, io, revs.items, pathspecs.items, no_color, quiet);
+        try diffRevs(allocator, repo, io, revs.items, pathspecs.items, no_color, quiet);
         return;
     }
 
     if (mode == .staged) {
-        try diffStaged(allocator, git_dir, io, no_color, pathspecs.items);
+        try diffStaged(allocator, repo, io, no_color, pathspecs.items);
         return;
     }
 
-    try diffWorking(allocator, git_dir, io, no_color, pathspecs.items, quiet);
+    try diffWorking(allocator, repo, io, no_color, pathspecs.items, quiet);
 }
 
 /// Diff two revisions, a revision against the working tree, or a range.
 fn diffRevs(
     allocator: std.mem.Allocator,
-    git_dir: []const u8,
+    repo: Repo,
     io: Io,
     revs: []const []const u8,
     pathspecs: []const []const u8,
     no_color: bool,
     quiet: bool,
 ) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs.Refs.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs.Refs.init(repo);
 
     var old_files = checkout_mod.FileMap.init(allocator);
     defer {
@@ -131,7 +135,7 @@ fn diffRevs(
         !hasRevision(allocator, io, refs_manager, store, new_spec);
 
     if (new_is_worktree) {
-        try collectWorktree(allocator, git_dir, io, store, &new_files, pathspecs);
+        try collectWorktree(allocator, repo.worktree_dir, io, store, &new_files, pathspecs);
     } else if (resolveCommit(allocator, io, refs_manager, store, new_spec)) |sha| {
         if (flattenCommitTree(allocator, io, store, sha)) |map| {
             new_files = map;
@@ -321,16 +325,16 @@ fn freeFileMap(allocator: std.mem.Allocator, map: *checkout_mod.FileMap) void {
     map.deinit();
 }
 
-fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_color: bool, pathspecs: []const []const u8) !void {
+fn diffStaged(allocator: std.mem.Allocator, repo: Repo, io: Io, no_color: bool, pathspecs: []const []const u8) !void {
     // A pathspec narrows the report; an empty one matches everything.
     const no_pathspec = pathspecs.len == 0;
-    var idx = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch {
+    var idx = index_mod.Index.readFromFile(allocator, repo.worktree_dir, io.io) catch {
         return;
     };
     defer idx.deinit(allocator);
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs.Refs.init(git_dir);
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs.Refs.init(repo);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
         return;
@@ -385,9 +389,9 @@ fn diffStaged(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_colo
     if (!has_diff) try io.eprint("", .{});
 }
 
-fn diffWorking(allocator: std.mem.Allocator, git_dir: []const u8, io: Io, no_color: bool, pathspecs: []const []const u8, quiet: bool) !void {
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
-    const refs_manager = refs.Refs.init(git_dir);
+fn diffWorking(allocator: std.mem.Allocator, repo: Repo, io: Io, no_color: bool, pathspecs: []const []const u8, quiet: bool) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs.Refs.init(repo);
 
     const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
         return;
