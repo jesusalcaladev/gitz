@@ -147,15 +147,24 @@ fn removeIfTracked(allocator: std.mem.Allocator, idx: *index_mod.Index, path: []
 }
 
 fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.Index, path: []const u8, io: Io) !void {
-    var f = io.openFile(path) catch return error.FileNotFound;
-    defer f.close(io.io);
+    // The link is not followed. `statFile` follows by default, so a symlink was
+    // seen as an ordinary file: it was stored as mode 100644 holding a *copy* of
+    // the target's bytes. git records mode 120000 with the link target path as
+    // the blob content, so the two repositories disagreed and a checkout in
+    // either replaced the link with a regular file.
+    const stat = try std.Io.Dir.cwd().statFile(io.io, path, .{ .follow_symlinks = false });
 
-    const stat = try std.Io.Dir.cwd().statFile(io.io, path, .{});
+    var content: []u8 = undefined;
+    if (stat.kind == .sym_link) {
+        content = readLink(allocator, path) orelse return error.FileNotFound;
+    } else {
+        if (stat.kind == .directory) return error.NotAFile;
 
-    // Read through the file's real size rather than a fixed buffer: a blob
-    // larger than the buffer would otherwise be silently truncated, and the
-    // index would record a hash of the first N bytes.
-    const content = try std.Io.Dir.cwd().readFileAlloc(io.io, path, allocator, .unlimited);
+        // Read through the file's real size rather than a fixed buffer: a blob
+        // larger than the buffer would otherwise be silently truncated, and the
+        // index would record a hash of the first N bytes.
+        content = try std.Io.Dir.cwd().readFileAlloc(io.io, path, allocator, .unlimited);
+    }
     defer allocator.free(content);
 
     // Write blob to object store
@@ -164,8 +173,7 @@ fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.In
     const sha = try store.write(allocator, io.io, blob);
 
     // The mode is part of the index and of every tree entry. Hardcoding
-    // 100644 lost the execute bit on scripts and turned symlinks into
-    // regular files holding the target's bytes.
+    // 100644 lost the execute bit on scripts.
     const mode: u32 = switch (stat.kind) {
         .sym_link => 0o120000,
         else => if (stat.permissions.toMode() & 0o111 != 0) 0o100755 else 0o100644,
@@ -179,6 +187,23 @@ fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.In
     });
 
     try io.print("add: {s}\n", .{path});
+}
+
+/// The target path of a symlink, which is what git stores as the blob.
+///
+/// Returns null when the link cannot be read, rather than a different errno the
+/// caller has no way to report meaningfully.
+fn readLink(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const path_z = allocator.allocSentinel(u8, path.len, 0) catch return null;
+    defer allocator.free(path_z);
+    @memcpy(path_z, path);
+
+    // PATH_MAX is the kernel's limit for a single readlink call; a longer
+    // target is a programming error rather than a truncated symlink.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = std.os.linux.readlink(path_z.ptr, &buf, buf.len);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    return allocator.dupe(u8, buf[0..rc]) catch null;
 }
 
 fn addDirectory(

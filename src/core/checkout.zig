@@ -388,6 +388,28 @@ pub fn checkoutCommit(
     }
 }
 
+/// The content git would store for a working-tree path.
+///
+/// For a symlink that is the link target, not the target's bytes: the blob of a
+/// 120000 entry is the path the link points at. Reading through the link made
+/// `status` report a correctly checked-out symlink as deleted, and would replace
+/// the link with a copy of its target.
+pub fn readWorktreeContent(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .sym_link) {
+        return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+    }
+
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    defer allocator.free(path_z);
+    @memcpy(path_z, path);
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = std.os.linux.readlink(path_z.ptr, &buf, buf.len);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.CannotReadLink;
+    return allocator.dupe(u8, buf[0..rc]);
+}
+
 pub fn freeMap(allocator: std.mem.Allocator, map: *FileMap) void {
     var it = map.keyIterator();
     while (it.next()) |k| allocator.free(k.*);

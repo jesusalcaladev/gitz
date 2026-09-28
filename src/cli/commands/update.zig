@@ -221,13 +221,20 @@ fn downloadAndInstall(
     );
     defer allocator.free(download_url);
 
-    // Create temp directory
-    _ = std.process.run(allocator, io.io, .{
-        .argv = &.{ "mkdir", "-p", "/tmp/gitz-update" },
-    }) catch {};
+    // The staging directory is private to this user and unique per run.
+    //
+    // It used to be the fixed path /tmp/gitz-update, created with `mkdir -p` and
+    // removed with `rm -rf`. Any local user could pre-create that directory (or
+    // a symlink to somewhere else), have the tarball extracted into a tree they
+    // control, and have `gitz update` install their binary over gitz -- which
+    // then runs with the user's privileges. The predictable path also meant two
+    // concurrent updates wrote the same tarball into the same place.
+    const work_dir = try privateWorkDir(allocator, io);
+    defer allocator.free(work_dir);
 
     // Download to temp file
-    const tarball_path = "/tmp/gitz-update/gitz.tar.gz";
+    const tarball_path = try std.fmt.allocPrint(allocator, "{s}/gitz.tar.gz", .{work_dir});
+    defer allocator.free(tarball_path);
     const download_result = std.process.run(allocator, io.io, .{
         .argv = &.{ "curl", "-fsSL", download_url, "-o", tarball_path },
     }) catch return error.DownloadFailed;
@@ -242,7 +249,7 @@ fn downloadAndInstall(
 
     // Extract tarball
     const extract_result = std.process.run(allocator, io.io, .{
-        .argv = &.{ "tar", "-xzf", tarball_path, "-C", "/tmp/gitz-update" },
+        .argv = &.{ "tar", "-xzf", tarball_path, "-C", work_dir },
     }) catch return error.ExtractFailed;
     defer allocator.free(extract_result.stdout);
     defer allocator.free(extract_result.stderr);
@@ -253,9 +260,12 @@ fn downloadAndInstall(
     };
     if (extract_exited != 0) return error.ExtractFailed;
 
+    const unpacked = try std.fmt.allocPrint(allocator, "{s}/gitz", .{work_dir});
+    defer allocator.free(unpacked);
+
     // Make binary executable
     _ = std.process.run(allocator, io.io, .{
-        .argv = &.{ "chmod", "+x", "/tmp/gitz-update/gitz" },
+        .argv = &.{ "chmod", "+x", unpacked },
     }) catch {};
 
     // Backup current binary
@@ -268,7 +278,7 @@ fn downloadAndInstall(
 
     // Replace binary
     const install_result = std.process.run(allocator, io.io, .{
-        .argv = &.{ "cp", "/tmp/gitz-update/gitz", install_path },
+        .argv = &.{ "cp", unpacked, install_path },
     }) catch {
         // Try to restore backup on failure
         _ = std.process.run(allocator, io.io, .{
@@ -297,15 +307,47 @@ fn downloadAndInstall(
         return error.InstallFailed;
     }
 
-    // Cleanup
-    _ = std.process.run(allocator, io.io, .{
-        .argv = &.{ "rm", "-rf", "/tmp/gitz-update" },
-    }) catch {};
+    // Cleanup. The path is one this process created, so removing it cannot reach
+    // anything another user owns.
+    io.removeTree(work_dir) catch {};
 
     // Remove backup on success
     _ = std.process.run(allocator, io.io, .{
         .argv = &.{ "rm", "-f", backup_path },
     }) catch {};
+}
+
+/// A staging directory only this user can write to, with a name that cannot be
+/// predicted or pre-created by another user.
+fn privateWorkDir(allocator: std.mem.Allocator, io: Io) ![]u8 {
+    // XDG_RUNTIME_DIR is per-user and already mode 0700; the temporary directory
+    // is the fallback for systems that do not set it.
+    const base = io.get("XDG_RUNTIME_DIR") orelse "/tmp";
+    const base_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{base}, 0);
+    defer allocator.free(base_z);
+
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var seed: [8]u8 = undefined;
+        if (std.os.linux.errno(std.os.linux.getrandom(&seed, seed.len, 0)) != .SUCCESS) {
+            return error.NoPrivateTempDir;
+        }
+
+        var name_buf: [16]u8 = undefined;
+        _ = std.fmt.bufPrint(&name_buf, "{x}", .{&seed}) catch unreachable;
+        const dir = try std.fmt.allocPrint(allocator, "{s}/gitz-update-{s}", .{ base, &name_buf });
+        errdefer allocator.free(dir);
+
+        // 0700: nobody else can enter the directory, so nothing they plant in it
+        // can be picked up by the extraction or the install.
+        std.Io.Dir.cwd().createDir(io.io, dir, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        return dir;
+    }
+
+    return error.NoPrivateTempDir;
 }
 
 /// Check for updates and print a courtesy notice to an interactive stderr.

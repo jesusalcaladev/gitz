@@ -5,6 +5,7 @@ const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 const diff_mod = @import("../../core/diff.zig");
+const checkout_mod = @import("../../core/checkout.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var base_ref: ?[]const u8 = null;
@@ -147,6 +148,21 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
 
+    // Both trees are flattened before comparison. Only the root entries were
+    // compared before and subtrees were skipped, so every change under a
+    // directory was invisible: `gitz review` reported an empty change list for a
+    // branch whose whole diff lived in `src/`.
+    var base_files = checkout_mod.FileMap.init(allocator);
+    defer checkout_mod.freeMap(allocator, &base_files);
+    var head_files = checkout_mod.FileMap.init(allocator);
+    defer checkout_mod.freeMap(allocator, &head_files);
+    if (flattenTreeOf(allocator, io, store, base_commit.tree, &base_files)) {
+        _ = flattenTreeOf(allocator, io, store, head_commit.tree, &head_files);
+    } else {
+        try io.print("\n  \x1b[31mCannot compute diff (missing tree objects)\x1b[0m\n", .{});
+        return;
+    }
+
     // Compare trees to find changed files
     var added_files: u32 = 0;
     var modified_files: u32 = 0;
@@ -160,71 +176,52 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         files_changed.deinit(allocator);
     }
 
-    // Find files in head not in base (added or modified)
-    for (head_tree.?.entries) |entry| {
-        if (entry.mode == 0o040000) continue;
+    // Files in head not in base (added or modified).
+    var hit = head_files.iterator();
+    while (hit.next()) |entry| {
+        const path = entry.key_ptr.*;
+        const entry_sha = entry.value_ptr.sha;
 
-        var found_in_base = false;
-        for (base_tree.?.entries) |base_entry| {
-            if (std.mem.eql(u8, entry.name, base_entry.name)) {
-                found_in_base = true;
-                if (!std.mem.eql(u8, &entry.sha, &base_entry.sha)) {
-                    modified_files += 1;
-                    const stats = diffFileStats(allocator, io.io, store, base_entry.sha, entry.sha);
-                    total_additions += stats.added;
-                    total_deletions += stats.deleted;
-                    try files_changed.append(allocator, .{
-                        .name = try allocator.dupe(u8, entry.name),
-                        .status = .modified,
-                        .added = stats.added,
-                        .deleted = stats.deleted,
-                    });
-                }
-                break;
-            }
-        }
-        if (!found_in_base) {
-            added_files += 1;
-            const blob_obj = store.read(allocator, io.io, entry.sha) catch continue;
-            const line_count = switch (blob_obj) {
-                .blob => |b| countLines(b.content),
-                else => 0,
-            };
-            total_additions += line_count;
+        if (base_files.get(path)) |base_entry| {
+            if (std.mem.eql(u8, &base_entry.sha, &entry_sha)) continue;
+            modified_files += 1;
+            const stats = diffFileStats(allocator, io.io, store, base_entry.sha, entry_sha);
+            total_additions += stats.added;
+            total_deletions += stats.deleted;
             try files_changed.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.name),
+                .name = try allocator.dupe(u8, path),
+                .status = .modified,
+                .added = stats.added,
+                .deleted = stats.deleted,
+            });
+        } else {
+            const lines = blobLineCount(allocator, io, store, entry_sha);
+            added_files += 1;
+            total_additions += lines;
+            try files_changed.append(allocator, .{
+                .name = try allocator.dupe(u8, path),
                 .status = .added,
-                .added = line_count,
+                .added = lines,
                 .deleted = 0,
             });
         }
     }
 
-    // Find files in base not in head (deleted)
-    for (base_tree.?.entries) |entry| {
-        if (entry.mode == 0o040000) continue;
-        var found_in_head = false;
-        for (head_tree.?.entries) |head_entry| {
-            if (std.mem.eql(u8, entry.name, head_entry.name)) {
-                found_in_head = true;
-                break;
-            }
-        }
-        if (!found_in_head) {
-            deleted_files += 1;
-            const blob_obj = store.read(allocator, io.io, entry.sha) catch continue;
-            const line_count = switch (blob_obj) {
-                .blob => |b| countLines(b.content),
-                else => 0,
-            };
-            total_deletions += line_count;
-            try files_changed.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.name),
-                .status = .deleted,
-                .added = 0,
-                .deleted = line_count,
-            });
-        }
+    // Files in base not in head (deleted).
+    var bit = base_files.iterator();
+    while (bit.next()) |entry| {
+        const path = entry.key_ptr.*;
+        if (head_files.contains(path)) continue;
+
+        deleted_files += 1;
+        const lines = blobLineCount(allocator, io, store, entry.value_ptr.sha);
+        total_deletions += lines;
+        try files_changed.append(allocator, .{
+            .name = try allocator.dupe(u8, path),
+            .status = .deleted,
+            .added = 0,
+            .deleted = lines,
+        });
     }
 
     // File stats
@@ -267,7 +264,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     if (show_diff and !summary_only) {
         try io.print("\x1b[1mDiff:\x1b[0m\n\n", .{});
         for (files_changed.items) |f| {
-            try printFileDiff(allocator, io, store, f, base_tree.?, head_tree.?, base_sha, head_sha);
+            try printFileDiff(allocator, io, store, f, &base_files, &head_files);
         }
     }
 
@@ -290,6 +287,29 @@ fn getTree(allocator: std.mem.Allocator, io: std.Io, store: storage_mod.StorageB
     return switch (tree_obj) {
         .tree => |t| t,
         else => null,
+    };
+}
+
+/// Flatten a tree into path -> blob, recursing into subdirectories.
+fn flattenTreeOf(
+    allocator: std.mem.Allocator,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    tree_sha: [20]u8,
+    out: *checkout_mod.FileMap,
+) bool {
+    checkout_mod.flattenTree(allocator, io.io, store, tree_sha, "", out) catch return false;
+    return true;
+}
+
+/// Lines in a blob, 0 when it cannot be read.
+fn blobLineCount(allocator: std.mem.Allocator, io: Io, store: storage_mod.StorageBackend, sha: [20]u8) u32 {
+    const obj = store.read(allocator, io.io, sha) catch return 0;
+    var blob_obj = obj;
+    defer blob_obj.deinit(allocator);
+    return switch (blob_obj) {
+        .blob => |b| countLines(b.content),
+        else => 0,
     };
 }
 
@@ -353,41 +373,37 @@ fn diffFileStats(
     return .{ .added = added, .deleted = deleted };
 }
 
+/// The trees are the flattened maps, not the root tree objects: a root-only
+/// lookup never found a file under a directory, so every nested change printed
+/// `diff --git /dev/null /dev/null` with an empty body.
 fn printFileDiff(
     allocator: std.mem.Allocator,
     io: Io,
     store: storage_mod.StorageBackend,
     file: ChangedFile,
-    base_tree: object.Tree,
-    head_tree: object.Tree,
-    base_sha: [20]u8,
-    head_sha: [20]u8,
+    base_files: *const checkout_mod.FileMap,
+    head_files: *const checkout_mod.FileMap,
 ) !void {
-    _ = base_sha;
-    _ = head_sha;
-
     const old_sha_opt: ?[20]u8 = switch (file.status) {
         .added => null,
-        .modified => findEntrySha(base_tree, file.name),
-        .deleted => findEntrySha(base_tree, file.name),
+        .modified, .deleted => mapSha(base_files, file.name),
     };
     const new_sha_opt: ?[20]u8 = switch (file.status) {
-        .added => findEntrySha(head_tree, file.name),
-        .modified => findEntrySha(head_tree, file.name),
+        .added, .modified => mapSha(head_files, file.name),
         .deleted => null,
     };
 
-    const old_name = if (old_sha_opt) |_|
+    const old_name = if (old_sha_opt != null)
         try std.fmt.allocPrint(allocator, "a/{s}", .{file.name})
     else
-        try std.fmt.allocPrint(allocator, "/dev/null", .{});
-    defer if (old_sha_opt != null) allocator.free(old_name);
+        try allocator.dupe(u8, "/dev/null");
+    defer allocator.free(old_name);
 
-    const new_name = if (new_sha_opt) |_|
+    const new_name = if (new_sha_opt != null)
         try std.fmt.allocPrint(allocator, "b/{s}", .{file.name})
     else
-        try std.fmt.allocPrint(allocator, "/dev/null", .{});
-    defer if (new_sha_opt != null) allocator.free(new_name);
+        try allocator.dupe(u8, "/dev/null");
+    defer allocator.free(new_name);
 
     try io.print("\x1b[1mdiff --git {s} {s}\x1b[0m\n", .{ old_name, new_name });
 
@@ -458,6 +474,11 @@ fn printFileDiff(
         }
     }
     try io.print("\n", .{});
+}
+
+fn mapSha(map: *const checkout_mod.FileMap, path: []const u8) ?[20]u8 {
+    const entry = map.get(path) orelse return null;
+    return entry.sha;
 }
 
 fn findEntrySha(tree: object.Tree, name: []const u8) ?[20]u8 {

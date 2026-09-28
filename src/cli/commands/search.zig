@@ -4,6 +4,7 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const storage_mod = @import("../../core/storage.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
+const checkout_mod = @import("../../core/checkout.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var query: ?[]const u8 = null;
@@ -135,19 +136,21 @@ fn searchCommitContent(
     context_lines: usize,
     found: *usize,
 ) !void {
-    // Get the tree for this commit
-    const tree_obj = store.read(allocator, io.io, commit.tree) catch return;
-    const tree = switch (tree_obj) {
-        .tree => |t| t,
-        else => return,
-    };
+    // The whole tree is flattened, subdirectories included. Only the root
+    // entries were walked before and subtrees were skipped outright, so
+    // `gitz search -c` never found anything under a directory -- which in a real
+    // repository is most of the code.
+    var files = checkout_mod.FileMap.init(allocator);
+    defer checkout_mod.freeMap(allocator, &files);
+    checkout_mod.flattenTree(allocator, io.io, store, commit.tree, "", &files) catch return;
 
-    // Search through tree entries
-    for (tree.entries) |entry| {
-        if (entry.mode == 0o040000) continue; // skip directories
-
-        const blob_obj = store.read(allocator, io.io, entry.sha) catch continue;
-        const blob = switch (blob_obj) {
+    var fit = files.iterator();
+    while (fit.next()) |file| {
+        const path = file.key_ptr.*;
+        const blob_obj = store.read(allocator, io.io, file.value_ptr.sha) catch continue;
+        var blob_obj_mut = blob_obj;
+        defer blob_obj_mut.deinit(allocator);
+        const blob = switch (blob_obj_mut) {
             .blob => |b| b,
             else => continue,
         };
@@ -164,7 +167,7 @@ fn searchCommitContent(
             var msg_lines = std.mem.splitScalar(u8, commit.message, '\n');
             const first_line = msg_lines.next() orelse "";
             try io.print("    \x1b[1m{s}\x1b[0m\n", .{first_line});
-            try io.print("    \x1b[36m{s}\x1b[0m\n", .{entry.name});
+            try io.print("    \x1b[36m{s}\x1b[0m\n", .{path});
 
             // Show matching lines with context
             var lines = std.mem.splitScalar(u8, blob.content, '\n');

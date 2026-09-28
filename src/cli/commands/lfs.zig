@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
-const Sha1 = @import("../../core/sha1.zig").Sha1;
+const Sha256 = @import("../../core/sha256.zig").Sha256;
 
 const LFS_POINTER_VERSION = "https://git-lfs.github.com/spec/v1";
 
@@ -112,17 +112,16 @@ fn lfsTrack(allocator: std.mem.Allocator, git_dir: []const u8, patterns: []const
         return;
     }
 
-    // Read existing .gitattributes
+    // Read the whole .gitattributes. A fixed 64 KB buffer truncated a larger
+    // file, so `lfs track` silently dropped every pattern past the cut and
+    // rewrote the file without them.
     const gitattributes_path = ".gitattributes";
-    var existing_content: []const u8 = "";
-    var content_buf: [64 * 1024]u8 = undefined;
-    var content_len: usize = 0;
-
-    if (std.Io.Dir.cwd().openFile(io.io, gitattributes_path, .{})) |f| {
-        defer f.close(io.io);
-        content_len = try f.readStreaming(io.io, &.{&content_buf});
-        existing_content = content_buf[0..content_len];
-    } else |_| {}
+    const existing_content = std.Io.Dir.cwd().readFileAlloc(
+        io.io,
+        gitattributes_path,
+        allocator,
+        .unlimited,
+    ) catch "";
 
     // Check if LFS section already exists
     const has_lfs_section = std.mem.indexOf(u8, existing_content, "# Git LFS") != null;
@@ -177,15 +176,19 @@ fn lfsUntrack(allocator: std.mem.Allocator, git_dir: []const u8, patterns: []con
     }
 
     const gitattributes_path = ".gitattributes";
-    var f = std.Io.Dir.cwd().openFile(io.io, gitattributes_path, .{}) catch {
+    if (std.Io.Dir.cwd().access(io.io, gitattributes_path, .{})) |_| {} else |_| {
         try io.eprint("fatal: .gitattributes not found\n", .{});
         return;
-    };
-    defer f.close(io.io);
+    }
 
-    var buf: [64 * 1024]u8 = undefined;
-    const n = try f.readStreaming(io.io, &.{&buf});
-    const content = buf[0..n];
+    // Read the whole file: a fixed 64 KB buffer truncated a larger
+    // .gitattributes, so `lfs untrack` rewrote it without the entries past the
+    // cut and silently dropped attributes while looking like it worked.
+    const content = std.Io.Dir.cwd().readFileAlloc(io.io, gitattributes_path, allocator, .unlimited) catch {
+        try io.eprint("fatal: could not read .gitattributes\n", .{});
+        return;
+    };
+    defer allocator.free(content);
 
     var new_lines = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer {
@@ -243,9 +246,11 @@ fn lfsStatus(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
     };
     defer f.close(io.io);
 
-    var buf: [64 * 1024]u8 = undefined;
-    const n = try f.readStreaming(io.io, &.{&buf});
-    const content = buf[0..n];
+    const content = std.Io.Dir.cwd().readFileAlloc(io.io, gitattributes_path, allocator, .unlimited) catch {
+        try io.print("  \x1b[33mCould not read .gitattributes.\x1b[0m\n", .{});
+        return;
+    };
+    defer allocator.free(content);
 
     try io.print("  \x1b[1mTracked patterns:\x1b[0m\n", .{});
     var found_patterns = false;
@@ -356,7 +361,6 @@ fn listDirRaw(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 
 
 /// Show LFS pointer for a file
 fn lfsPointer(allocator: std.mem.Allocator, git_dir: []const u8, file_args: []const []const u8, io: Io) !void {
-    _ = allocator;
     _ = git_dir;
     if (file_args.len == 0) {
         try io.eprint("usage: gitz lfs pointer <file>\n", .{});
@@ -365,20 +369,20 @@ fn lfsPointer(allocator: std.mem.Allocator, git_dir: []const u8, file_args: []co
 
     const file_path = file_args[0];
 
-    // Read the file
-    var f = std.Io.Dir.cwd().openFile(io.io, file_path, .{}) catch {
+    // The whole file is read: a fixed 1 MB buffer silently truncated anything
+    // larger, so the reported size and OID described only the first megabyte of
+    // the file.
+    const content = std.Io.Dir.cwd().readFileAlloc(io.io, file_path, allocator, .unlimited) catch {
         try io.eprint("fatal: file not found: {s}\n", .{file_path});
         return;
     };
-    defer f.close(io.io);
+    defer allocator.free(content);
 
-    var buf: [1024 * 1024]u8 = undefined; // 1MB buffer
-    const n = try f.readStreaming(io.io, &.{&buf});
-    const content = buf[0..n];
-
-    // Compute OID (SHA-256 of content)
-    const oid = Sha1.hash(content);
-    const oid_hex = Sha1.hex(oid);
+    // The OID is SHA-256 -- that is what the LFS pointer format specifies. It was
+    // computed with SHA-1 and printed under a `sha256:` label, so every pointer
+    // was wrong and no server or `git lfs` client would accept it.
+    const oid = Sha256.hash(content);
+    const oid_hex = Sha256.hex(oid);
 
     // Print pointer
     try io.print("\x1b[1;36mLFS Pointer:\x1b[0m\n\n", .{});
@@ -406,12 +410,14 @@ fn lfsEnv(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
     // Check config
     const config_path = try std.fmt.allocPrint(allocator, "{s}/lfs/config", .{git_dir});
     defer allocator.free(config_path);
-    if (std.Io.Dir.cwd().openFile(io.io, config_path, .{})) |f| {
-        defer f.close(io.io);
-        var buf: [1024]u8 = undefined;
-        const n = try f.readStreaming(io.io, &.{&buf});
+    if (std.Io.Dir.cwd().access(io.io, config_path, .{})) |_| {
+        // The whole file is read: a fixed 1 KB buffer truncated anything larger
+        // and the reported config was silently incomplete.
+        const config = std.Io.Dir.cwd().readFileAlloc(io.io, config_path, allocator, .unlimited) catch "";
+        defer allocator.free(config);
+
         try io.print("\n  \x1b[1mConfig:\x1b[0m\n", .{});
-        var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+        var lines = std.mem.splitScalar(u8, config, '\n');
         while (lines.next()) |line| {
             if (line.len > 0) {
                 try io.print("    {s}\n", .{line});

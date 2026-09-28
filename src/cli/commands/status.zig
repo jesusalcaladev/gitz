@@ -6,6 +6,7 @@ const storage_mod = @import("../../core/storage.zig");
 const alternates_mod = @import("../../core/alternates.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
+const checkout_mod = @import("../../core/checkout.zig");
 const ignore_mod = @import("../../core/ignore.zig");
 const errors = @import("../errors.zig");
 
@@ -539,12 +540,14 @@ fn collectWorkingTree(allocator: std.mem.Allocator, io: std.Io, dir_path: []cons
             }
             try collectWorkingTree(allocator, io, full_path, files, ignore);
             allocator.free(full_path);
-        } else if (e.kind == .file) {
+        } else if (e.kind == .file or e.kind == .sym_link) {
+            // A symlink is a tracked entry like any other. It was skipped, so
+            // every link in the repository was reported as deleted.
             if (ignore.isIgnored(full_path, false)) {
                 allocator.free(full_path);
                 continue;
             }
-            const content = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited) catch {
+            const content = checkout_mod.readWorktreeContent(allocator, io, full_path) catch {
                 allocator.free(full_path);
                 continue;
             };
