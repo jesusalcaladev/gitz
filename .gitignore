@@ -1,4 +1,7 @@
 .zig-cache/
+# The project is named gitz, so Zig 0.16 writes its build cache to zig-cache/
+# rather than .zig-cache/, and the test suite was not ignored.
+zig-cache/
 zig-out/
 *.o
 *.a
