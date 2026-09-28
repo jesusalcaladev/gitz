@@ -62,12 +62,17 @@ gitz lfs track "*.psd"       Track large files by pattern
 
 ---
 
-## Known Bugs (all fixed)
+## Known Bugs
+
+Audited against git 2.55 on 2026-09-28: 16 data-loss/corruption bugs (P1-P16) and
+24 visibly-wrong-behaviour bugs (N1-N24) were found. All 40 are fixed; each fix
+was verified by differential test against real `git`. See `STATUS.md` and the
+commit history for the per-bug detail.
 
 | # | Bug | Status | Fix |
 |---|-----|--------|-----|
 | 1 | **Blame** shows garbled chars for imported commits | Fixed | Improved encoding handling and path resolution |
-| 2 | **Rebase** log may show orphan commits with `--all` | Fixed | Added gc after rebase to clean up orphans |
+| 2 | **Rebase** log may show orphan commits with `--all` | Fixed | Rebase no longer auto-gcs |
 | 3 | **Stash** applies all tracked files (not just modified) | Fixed | Now compares SHA with HEAD before including |
 | 4 | **Remote list** shows nothing for new repos | Fixed | Expected behavior when no remotes configured |
 | 5 | **Clone** no auto-checkout (like `--bare`) | Fixed | Clone now performs full checkout |
@@ -132,7 +137,7 @@ gitz lfs track "*.psd"       Track large files by pattern
 | 12 | `gitz tag` expansions | Done |
 | 13 | `gitz branch` expansions | Done |
 | 14 | `gitz blame` | Done |
-| 15 | `gitz gc` | Done |
+| 15 | `gitz gc` | Partial -- reachability walk and pruning work; packing is a no-op because nothing can read a packfile back. `gc` refuses to prune while packfiles exist. |
 | 16 | Git compatibility tests | Basic tests implemented |
 
 ---

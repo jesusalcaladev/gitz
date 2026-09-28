@@ -56,12 +56,12 @@ Remote operations via SSH and HTTP:
 
 ## Known Issues
 
-### Bugs (all fixed)
+### Bugs (audit 2026-09: 40 found, 40 fixed)
 
 | Issue | Status | Fix Description |
 |-------|--------|------------------|
 | Blame encoding | Fixed | Improved encoding handling and path resolution |
-| Rebase orphan commits | Fixed | Added gc after rebase to clean up orphans |
+| Rebase orphan commits | Fixed | Rebase no longer auto-gcs; `gc` is a no-op (see below) |
 | Stash over-staging | Fixed | Now compares SHA with HEAD before including |
 | Remote list empty | Fixed | Expected behavior when no remotes configured |
 | Clone no checkout | Fixed | Clone now performs full checkout |
