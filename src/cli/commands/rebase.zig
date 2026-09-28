@@ -165,10 +165,11 @@ fn replayCommits(
         },
     }
 
-    // Run gc to clean up orphan commits from the rebase
-    // This prevents them from showing in log --all
-    const gc_args = &[_][]const u8{"gc"};
-    @import("gc.zig").execute(allocator, git_dir, gc_args, io) catch {};
+    // No automatic gc here. Running it at the end of every rebase deleted the
+    // objects it was meant to tidy up: the pre-rebase commits were the only
+    // thing still referencing the blobs the index and refs/stash held, and the
+    // packer moved every loose object somewhere unreadable. Repositories are
+    // now left alone unless the user asks for `gitz gc`.
 }
 
 /// Interactive rebase TUI with arrow key navigation

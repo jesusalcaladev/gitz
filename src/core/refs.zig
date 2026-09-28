@@ -119,21 +119,43 @@ pub const Refs = struct {
     }
 
     /// List all ref files under a subdirectory of refs/ (e.g. "heads" or "tags").
-    /// Uses raw Linux getdents64 syscall to avoid Zig 0.16 Dir.iterate() fd lifecycle issues.
     /// Returns fully-qualified ref names like "refs/heads/main".
+    ///
+    /// The listing recurses into subdirectories: git branch names may contain
+    /// slashes (`refs/heads/feature/login`), and a non-recursive walk reported
+    /// the intermediate directory `refs/heads/feature` as if it were the ref,
+    /// hiding `feature/login` from `gitz branch`, `log --all` and reachability
+    /// walks in `gc`.
     pub fn list(self: Refs, allocator: std.mem.Allocator, io: std.Io, subcategory: []const u8) ![][]const u8 {
-        _ = io;
         const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/{s}", .{ self.git_dir, subcategory });
         defer allocator.free(dir_path);
 
         const prefix = try std.fmt.allocPrint(allocator, "refs/{s}", .{subcategory});
         defer allocator.free(prefix);
 
-        return listDirRaw(allocator, dir_path, prefix) catch &.{};
+        return listDirRaw(allocator, io, dir_path, prefix, 0) catch &.{};
     }
 
-    /// Raw directory listing using Linux getdents64 syscall
-    fn listDirRaw(allocator: std.mem.Allocator, dir_path: []const u8, prefix: []const u8) ![][]const u8 {
+    /// List every ref in the repository, regardless of namespace
+    /// (`refs/heads`, `refs/tags`, `refs/remotes`, `refs/stash`, ...).
+    pub fn listAll(self: Refs, allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
+        const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs", .{self.git_dir});
+        defer allocator.free(dir_path);
+
+        return listDirRaw(allocator, io, dir_path, "refs", 0) catch &.{};
+    }
+
+    /// Maximum directory depth walked by `listDirRaw`. Refs nest one directory
+    /// per slash, so this is a runaway guard rather than a real limit.
+    const max_ref_depth = 32;
+
+    /// Raw directory listing using Linux getdents64 syscall.
+    ///
+    /// `d_type` is 0 (DT_UNKNOWN) on some filesystems, so entry kind is
+    /// confirmed with fstatat before deciding whether to recurse.
+    fn listDirRaw(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, prefix: []const u8, depth: usize) ![][]const u8 {
+        if (depth > max_ref_depth) return &.{};
+
         var result: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
 
         // Open directory using posix.openat
@@ -155,16 +177,42 @@ pub const Refs = struct {
             while (pos < n) {
                 const entry: *align(1) const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
                 const name: []const u8 = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+                pos += entry.reclen;
 
                 // Skip . and ..
-                if (name.len > 0 and name[0] != '.') {
-                    const full_ref = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+                if (name.len == 0 or name[0] == '.') continue;
+
+                const full_ref = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+                const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
+
+                if (entryIsDir(io, full_path, entry.type) catch false) {
+                    const children = listDirRaw(allocator, io, full_path, full_ref, depth + 1) catch &.{};
+                    allocator.free(full_path);
+
+                    for (children) |child| try result.append(allocator, child);
+                    // The directory itself is a namespace, never a ref: a
+                    // leftover file at that path would collide with the refs
+                    // stored below it, exactly as in git.
+                    allocator.free(full_ref);
+                } else {
+                    allocator.free(full_path);
                     try result.append(allocator, full_ref);
                 }
-                pos += entry.reclen;
             }
         }
 
         return result.toOwnedSlice(allocator);
+    }
+
+    /// Whether a directory entry is a subdirectory, resolving DT_UNKNOWN via stat.
+    fn entryIsDir(io: std.Io, full_path: []const u8, d_type: u8) !bool {
+        const DT_DIR: u8 = 4;
+        const DT_UNKNOWN: u8 = 0;
+
+        if (d_type == DT_DIR) return true;
+        if (d_type != DT_UNKNOWN) return false;
+
+        const st = std.Io.Dir.cwd().statFile(io, full_path, .{}) catch return false;
+        return st.kind == .directory;
     }
 };
