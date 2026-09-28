@@ -495,12 +495,16 @@ fn readCommit(
     return store.read(allocator, io, sha);
 }
 
-const Merged = struct {
+/// Result of a line-level three-way merge of one blob.
+pub const Merged = struct {
     content: ?[]u8,
     conflict: bool,
 };
 
-fn mergeText(
+/// Line-level diff3 merge of two blobs against a common base.
+///
+/// Public so a rebase can use the same routine when both sides changed a file.
+pub fn mergeText(
     allocator: std.mem.Allocator,
     io: std.Io,
     store: storage_mod.StorageBackend,

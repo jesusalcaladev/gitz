@@ -5,6 +5,10 @@ const loose = @import("../../core/loose.zig");
 const object = @import("../../core/object.zig");
 const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
+const checkout_mod = @import("../../core/checkout.zig");
+const index_mod = @import("../../core/index.zig");
+const config_cmd = @import("config.zig");
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var abort_mode = false;
@@ -25,7 +29,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         } else if (std.mem.eql(u8, arg, "--onto") and i + 1 < args.len) {
             i += 1;
             onto = args[i];
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
+        } else if (std.mem.eql(u8, arg, "--autostash") or std.mem.eql(u8, arg, "-q") or
+            std.mem.eql(u8, arg, "--quiet") or std.mem.eql(u8, arg, "--no-autostash"))
+        {
+            // Accepted; there is no autostash to perform.
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            errors.errorf(io, "unknown option '{s}'", .{arg});
+        } else {
             if (upstream == null) upstream = arg;
         }
     }
@@ -35,7 +45,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         return;
     }
     if (continue_mode) {
-        try io.print("No rebase in progress.\n", .{});
+        // Previously always reported "No rebase in progress", so a conflicted
+        // rebase could never be finished.
+        try continueRebase(allocator, git_dir, io);
         return;
     }
 
@@ -68,8 +80,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         std.process.exit(1);
     };
 
+    // An unresolvable --onto used to fall back to the upstream, so the command
+    // rebased onto something other than what was asked for and said nothing.
     const onto_sha = if (onto) |o|
-        resolveRef(allocator, io.io, refs_manager, store, o) catch upstream_sha
+        resolveRef(allocator, io.io, refs_manager, store, o) catch |err| switch (err) {
+            error.RefNotFound, error.InvalidRef => errors.errorf(io, "invalid upstream '{s}'", .{o}),
+            else => return err,
+        }
     else
         upstream_sha;
 
@@ -84,9 +101,22 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     var commits_to_replay = std.ArrayList(object.Commit){ .items = &.{}, .capacity = 0 };
     defer commits_to_replay.deinit(allocator);
 
+    // The commits to replay are those reachable from HEAD but not from the new
+    // base, which is what the merge base marks. Walking until the walk *hits*
+    // the new base only works when HEAD already contains it, so a rebase of a
+    // branch onto a sibling replayed the entire history: main's own base commit
+    // was duplicated and the upstream's commits were left as ancestors instead
+    // of becoming the new foundation.
+    const fork_point = mergeBase(allocator, io, store, onto_sha, current_sha) orelse onto_sha;
+
+    if (isAncestorOf(allocator, io, store, current_sha, onto_sha)) {
+        try io.print("Current branch {s} is up to date.\n", .{(head_info.branchOf() orelse "HEAD")});
+        return;
+    }
+
     var cur = current_sha;
     while (true) {
-        if (std.mem.eql(u8, &cur, &onto_sha)) break;
+        if (std.mem.eql(u8, &cur, &fork_point)) break;
         const obj = store.read(allocator, io.io, cur) catch break;
         const commit = switch (obj) {
             .commit => |c| c,
@@ -124,6 +154,16 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }});
 }
 
+/// Replay each commit onto the new base, re-applying its diff.
+///
+/// The old implementation copied each commit's *tree* verbatim, so a rebase
+/// silently dropped everything the upstream had changed: replaying a commit
+/// whose parent had been rewritten produced a tree identical to the old one,
+/// and the upstream's work vanished from the branch. The working tree was never
+/// updated either, so HEAD and the worktree disagreed.
+///
+/// The replay is a three-way merge of (old parent, old commit, new base) for
+/// every path, which is what a rebase is.
 fn replayCommits(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
@@ -134,24 +174,92 @@ fn replayCommits(
     new_base: [20]u8,
     head_info: *const refs_mod.HeadInfo,
 ) !void {
+    const Rebased = struct { sha: [20]u8, conflicted: bool };
+
     var current_parent = new_base;
+    var applied = std.ArrayList(Rebased).empty;
+    defer applied.deinit(allocator);
+
     var i: usize = commits.items.len;
     while (i > 0) {
         i -= 1;
         const commit = commits.items[i];
+
+        // The tree this replay produces: start from the new base and apply the
+        // changes the original commit made to its own parent.
+        const original_parent_tree: ?[20]u8 = if (commit.parents.len > 0)
+            treeOfCommit(allocator, io, store, commit.parents[0])
+        else
+            null;
+
+        var result = try replayOne(
+            allocator,
+            git_dir,
+            io,
+            store,
+            original_parent_tree,
+            commit.tree,
+            current_parent,
+        );
+        defer {
+            for (result.conflicts) |c| {
+                allocator.free(c.path);
+                allocator.free(c.content);
+            }
+            allocator.free(result.conflicts);
+            result.index.deinit(allocator);
+        }
+
         var parents_buf: [1][20]u8 = .{current_parent};
-        const parents = parents_buf[0..1];
         const now_ts = std.Io.Timestamp.now(io.io, .real);
         const now: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
+
+        const committer_name = config_cmd.getUserName(allocator, git_dir, io);
+        defer if (!std.mem.eql(u8, committer_name, "GitZ User")) allocator.free(committer_name);
+        const committer_email = config_cmd.getUserEmail(allocator, git_dir, io);
+        defer if (!std.mem.eql(u8, committer_email, "user@gitz.dev")) allocator.free(committer_email);
+
+        // The author and date of the original commit are preserved; the
+        // committer is whoever ran the rebase, as in git.
         const new_commit = object.Commit{
-            .tree = commit.tree,
-            .parents = parents,
+            .tree = result.tree,
+            .parents = parents_buf[0..1],
             .author = commit.author,
-            .committer = .{ .name = "GitZ User", .email = "user@gitz.dev", .timestamp = now, .timezone = "+0000" },
+            .committer = .{ .name = committer_name, .email = committer_email, .timestamp = now, .timezone = "+0000" },
             .message = commit.message,
         };
-        current_parent = try store.write(allocator, io.io, object.GitObject{ .commit = new_commit });
+
+        const sha = try store.write(allocator, io.io, object.GitObject{ .commit = new_commit });
+        current_parent = sha;
+
+        try applied.append(allocator, .{ .sha = sha, .conflicted = result.conflicts.len > 0 });
+
+        if (result.conflicts.len > 0) {
+            // Stop where git stops, with the state on disk so `--continue` and
+            // `--abort` work. Previously the conflict was never noticed and the
+            // rebased branch was written as if it were clean.
+            try writeRebaseState(allocator, git_dir, io, new_base, current_parent, i);
+            // The index keeps the conflict stages, so `status` reports the path
+            // as unmerged and `--continue` refuses until the user resolves it.
+            // The branch ref is left alone until the rebase finishes.
+            try result.index.writeToFile(git_dir, allocator, io.io);
+            for (result.conflicts) |c| {
+                try io.eprint("CONFLICT (content): Merge conflict in {s}\n", .{c.path});
+                if (std.fs.path.dirname(c.path)) |dir| {
+                    std.Io.Dir.cwd().createDirPath(io.io, dir) catch {};
+                }
+                var wf = std.Io.Dir.cwd().createFile(io.io, c.path, .{}) catch continue;
+                defer wf.close(io.io);
+                std.Io.File.writeStreamingAll(wf, io.io, c.content) catch {};
+            }
+            errors.exitWith(io, errors.ExitFailure, "Could not apply commit; stopped at {s}. Resolve and run 'gitz rebase --continue'.", .{commit.message});
+        }
     }
+
+    // The worktree is brought to the new tip; without this HEAD and the working
+    // tree disagreed after every rebase.
+    checkout_mod.checkoutCommit(allocator, git_dir, io.io, store, current_parent) catch
+        errors.fatal(io, "could not check out the rebased tree", .{});
 
     switch (head_info.*) {
         .branch => |b| {
@@ -175,12 +283,364 @@ fn replayCommits(
             try std.Io.File.writeStreamingAll(hf, io.io, wline);
         },
     }
+}
 
-    // No automatic gc here. Running it at the end of every rebase deleted the
-    // objects it was meant to tidy up: the pre-rebase commits were the only
-    // thing still referencing the blobs the index and refs/stash held, and the
-    // packer moved every loose object somewhere unreadable. Repositories are
-    // now left alone unless the user asks for `gitz gc`.
+/// One conflicted path produced while replaying a commit.
+pub const RebaseConflict = struct {
+    path: []const u8,
+    /// Conflict-marker text to write to the working tree.
+    content: []const u8,
+};
+
+const ReplayResult = struct {
+    tree: [20]u8,
+    conflicts: []RebaseConflict,
+    /// The index the replay produced, including the conflict stages.
+    index: index_mod.Index,
+};
+
+const tree_merge_mod = @import("../../core/tree_merge.zig");
+
+/// Apply the difference between `old_parent` and `old_commit` on top of
+/// `new_base`, path by path.
+fn replayOne(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    old_parent: ?[20]u8,
+    old_commit: [20]u8,
+    new_base: [20]u8,
+) !ReplayResult {
+    var base_files = checkout_mod.FileMap.init(allocator);
+    defer checkout_mod.freeMap(allocator, &base_files);
+    var from_files = checkout_mod.FileMap.init(allocator);
+    defer checkout_mod.freeMap(allocator, &from_files);
+    var onto_files = checkout_mod.FileMap.init(allocator);
+    defer checkout_mod.freeMap(allocator, &onto_files);
+
+    if (old_parent) |p| {
+        checkout_mod.flattenTree(allocator, io.io, store, p, "", &base_files) catch {};
+    }
+    // `old_commit` is already a tree SHA; only `new_base` is a commit.
+    checkout_mod.flattenTree(allocator, io.io, store, old_commit, "", &from_files) catch {};
+    // `new_base` is a commit, so its tree has to be resolved first: passing the
+    // commit SHA made the flatten fail silently and every replay started from
+    // an empty base, which silently dropped the upstream's files.
+    if (treeOfCommit(allocator, io, store, new_base)) |t| {
+        checkout_mod.flattenTree(allocator, io.io, store, t, "", &onto_files) catch {};
+    }
+
+    // Ownership of the index transfers to the caller, which writes it out and
+    // frees it. Deinitialising it here would leave the returned entry names
+    // dangling, so the conflict stages never reached the file.
+    var idx = index_mod.Index.init(allocator);
+
+    // The new base is the starting point.
+    var it = onto_files.iterator();
+    while (it.next()) |entry| {
+        try idx.add(allocator, entry.key_ptr.*, entry.value_ptr.sha, .{ .mode = entry.value_ptr.mode });
+    }
+
+    // Every path the original commit touched.
+    var touched = std.StringHashMap(void).init(allocator);
+    defer touched.deinit();
+    {
+        var a = from_files.iterator();
+        while (a.next()) |e| {
+            if (base_files.get(e.key_ptr.*) == null) try touched.put(e.key_ptr.*, {});
+        }
+        var b = base_files.iterator();
+        while (b.next()) |e| {
+            if (from_files.get(e.key_ptr.*) == null) try touched.put(e.key_ptr.*, {});
+            // A changed blob also counts.
+            const after = from_files.get(e.key_ptr.*) orelse continue;
+            if (!std.mem.eql(u8, &after.sha, &e.value_ptr.sha)) try touched.put(e.key_ptr.*, {});
+        }
+    }
+
+    var conflicts = std.ArrayList(RebaseConflict).empty;
+    defer {
+        for (conflicts.items) |c| {
+            allocator.free(c.path);
+            allocator.free(c.content);
+        }
+        conflicts.deinit(allocator);
+    }
+
+    // Stage the three sides of a conflicted path, so `status` reports it as
+    // unmerged and `--continue` refuses until it is resolved. Without this the
+    // index looked clean and `rebase --continue` accepted the markers as a
+    // resolution without the user ever touching them.
+    const stageConflict = struct {
+        fn run(
+            gpa: std.mem.Allocator,
+            ix: *index_mod.Index,
+            path: []const u8,
+            mode: u32,
+            base: ?[20]u8,
+            ours: [20]u8,
+            theirs: [20]u8,
+        ) !void {
+            if (base) |b| try ix.add(gpa, path, b, .{ .mode = mode, .stage = .base });
+            try ix.add(gpa, path, ours, .{ .mode = mode, .stage = .ours });
+            try ix.add(gpa, path, theirs, .{ .mode = mode, .stage = .theirs });
+        }
+    }.run;
+
+    // Marker text for a path, so the user can see both sides.
+    const conflictMarkers = struct {
+        fn make(
+            gpa: std.mem.Allocator,
+            st: storage_mod.StorageBackend,
+            raw_io: std.Io,
+            base: ?[20]u8,
+            ours: [20]u8,
+            theirs: [20]u8,
+        ) ![]const u8 {
+            const merged = tree_merge_mod.mergeText(gpa, raw_io, st, base, ours, theirs, "rebase") catch return "";
+            defer if (merged.content) |c| gpa.free(c);
+            return gpa.dupe(u8, merged.content orelse "") catch "";
+        }
+    }.make;
+
+    var t = touched.keyIterator();
+    while (t.next()) |key| {
+        const path = key.*;
+        const before = base_files.get(path);
+        const after = from_files.get(path);
+        const onto = onto_files.get(path);
+
+        if (after == null) {
+            // Deleted by the commit: delete it on the new base too.
+            if (onto != null and (before == null or std.mem.eql(u8, &before.?.sha, &onto.?.sha))) {
+                _ = idx.remove(allocator, path);
+            } else if (onto != null and after != null) {
+                // The new base has its own content for this path; deleting it
+                // would drop the upstream's work, so it is a conflict.
+                try stageConflict(
+                    allocator,
+                    &idx,
+                    path,
+                    onto.?.mode,
+                    if (before) |b| b.sha else null,
+                    onto.?.sha,
+                    after.?.sha,
+                );
+                try conflicts.append(allocator, .{
+                    .path = try allocator.dupe(u8, path),
+                    .content = try conflictMarkers(allocator, store, io.io, if (before) |b| b.sha else null, onto.?.sha, after.?.sha),
+                });
+            }
+            continue;
+        }
+
+        const new_sha = after.?.sha;
+
+        if (onto == null) {
+            // Added by the commit and absent from the new base.
+            try idx.add(allocator, path, new_sha, .{ .mode = after.?.mode });
+            continue;
+        }
+        if (std.mem.eql(u8, &onto.?.sha, &new_sha)) continue; // nothing to do
+
+        const upstream_changed = before != null and
+            !std.mem.eql(u8, &before.?.sha, &onto.?.sha);
+        if (before == null) {
+            // Added on both sides with different content: conflict.
+            try stageConflict(allocator, &idx, path, onto.?.mode, null, onto.?.sha, new_sha);
+            try conflicts.append(allocator, .{
+                .path = try allocator.dupe(u8, path),
+                .content = try conflictMarkers(allocator, store, io.io, null, onto.?.sha, new_sha),
+            });
+            continue;
+        }
+        if (upstream_changed) {
+            // Both sides changed the file since the base: three-way the content.
+            const merged = tree_merge_mod.mergeText(allocator, io.io, store, before.?.sha, onto.?.sha, new_sha, "rebase") catch null;
+            if (merged) |m| {
+                defer if (m.content) |c| allocator.free(c);
+                if (m.conflict) {
+                    try stageConflict(allocator, &idx, path, onto.?.mode, before.?.sha, onto.?.sha, new_sha);
+                    try conflicts.append(allocator, .{
+                        .path = try allocator.dupe(u8, path),
+                        .content = try allocator.dupe(u8, m.content orelse ""),
+                    });
+                } else if (m.content) |c| {
+                    const sha = try store.write(allocator, io.io, .{ .blob = .{ .content = c } });
+                    try idx.add(allocator, path, sha, .{ .mode = after.?.mode });
+                } else {
+                    try idx.add(allocator, path, new_sha, .{ .mode = after.?.mode });
+                }
+            } else {
+                try idx.add(allocator, path, new_sha, .{ .mode = after.?.mode });
+            }
+            continue;
+        }
+
+        // Only the commit changed this path: take its version.
+        try idx.add(allocator, path, new_sha, .{ .mode = after.?.mode });
+    }
+
+    // A tree cannot hold the three stages of a conflict, so on a conflict the
+    // tree is not written: the caller stops and the index is what the user
+    // resolves against.
+    const tree_sha: [20]u8 = if (conflicts.items.len == 0)
+        try idx.writeTree(store, allocator, io.io)
+    else
+        currentTreeOf(allocator, io, store, new_base) orelse [_]u8{0} ** 20;
+    _ = git_dir;
+
+    return .{
+        .tree = tree_sha,
+        .conflicts = try conflicts.toOwnedSlice(allocator),
+        .index = idx,
+    };
+}
+
+/// The best common ancestor of two commits.
+fn mergeBase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    a: [20]u8,
+    b: [20]u8,
+) ?[20]u8 {
+    var a_map = reachableSet(allocator, io, store, a) orelse return null;
+    defer a_map.deinit();
+
+    // Breadth-first from `b`: the first commit also reachable from `a` is a
+    // merge base, and for the linear histories a rebase deals with it is the
+    // best one.
+    var queue = std.ArrayList([20]u8).empty;
+    defer queue.deinit(allocator);
+    var seen = std.AutoHashMap([20]u8, void).init(allocator);
+    defer seen.deinit();
+
+    queue.append(allocator, b) catch return null;
+    seen.put(b, {}) catch return null;
+
+    var steps: usize = 0;
+    while (queue.items.len > 0 and steps < 1_000_000) : (steps += 1) {
+        const sha = queue.orderedRemove(0);
+        if (a_map.contains(sha)) return sha;
+
+        const obj = store.read(allocator, io.io, sha) catch continue;
+        defer obj.deinit(allocator);
+        const commit = switch (obj) {
+            .commit => |c| c,
+            else => continue,
+        };
+        for (commit.parents) |p| {
+            if (seen.contains(p)) continue;
+            seen.put(p, {}) catch continue;
+            queue.append(allocator, p) catch {};
+        }
+    }
+    return null;
+}
+
+fn reachableSet(allocator: std.mem.Allocator, io: Io, store: storage_mod.StorageBackend, sha: [20]u8) ?std.AutoHashMap([20]u8, void) {
+    var set = std.AutoHashMap([20]u8, void).init(allocator);
+    var queue = std.ArrayList([20]u8).empty;
+    defer queue.deinit(allocator);
+
+    queue.append(allocator, sha) catch return null;
+    set.put(sha, {}) catch return null;
+
+    var steps: usize = 0;
+    while (queue.items.len > 0 and steps < 1_000_000) : (steps += 1) {
+        const cur = queue.orderedRemove(0);
+        const obj = store.read(allocator, io.io, cur) catch continue;
+        defer obj.deinit(allocator);
+        const commit = switch (obj) {
+            .commit => |c| c,
+            else => continue,
+        };
+        if (set.contains(commit.tree)) continue;
+        set.put(commit.tree, {}) catch {};
+        for (commit.parents) |p| {
+            if (set.contains(p)) continue;
+            set.put(p, {}) catch continue;
+            queue.append(allocator, p) catch {};
+        }
+    }
+    return set;
+}
+
+/// Whether `candidate` is reachable from `from`.
+fn isAncestorOf(allocator: std.mem.Allocator, io: Io, store: storage_mod.StorageBackend, from: [20]u8, candidate: [20]u8) bool {
+    var seen = std.AutoHashMap([20]u8, void).init(allocator);
+    defer seen.deinit();
+
+    var queue = std.ArrayList([20]u8).empty;
+    defer queue.deinit(allocator);
+
+    queue.append(allocator, from) catch return false;
+    seen.put(from, {}) catch return false;
+
+    var steps: usize = 0;
+    while (queue.items.len > 0 and steps < 1_000_000) : (steps += 1) {
+        const sha = queue.orderedRemove(0);
+        if (std.mem.eql(u8, &sha, &candidate)) return true;
+        if (seen.contains(sha)) continue;
+        seen.put(sha, {}) catch continue;
+
+        const obj = store.read(allocator, io.io, sha) catch continue;
+        defer obj.deinit(allocator);
+        const commit = switch (obj) {
+            .commit => |c| c,
+            else => continue,
+        };
+        for (commit.parents) |p| queue.append(allocator, p) catch {};
+    }
+    return false;
+}
+
+/// The tree a commit already points at.
+fn currentTreeOf(allocator: std.mem.Allocator, io: Io, store: storage_mod.StorageBackend, commit: [20]u8) ?[20]u8 {
+    return treeOfCommit(allocator, io, store, commit);
+}
+
+fn treeOfCommit(allocator: std.mem.Allocator, io: Io, store: storage_mod.StorageBackend, sha: [20]u8) ?[20]u8 {
+    const obj = store.read(allocator, io.io, sha) catch return null;
+    defer obj.deinit(allocator);
+    const commit = switch (obj) {
+        .commit => |c| c,
+        else => return null,
+    };
+    return commit.tree;
+}
+
+/// Persist the state `--continue` and `--abort` need.
+fn writeRebaseState(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    io: Io,
+    onto: [20]u8,
+    head: [20]u8,
+    remaining_from: usize,
+) !void {
+    const dir = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{git_dir});
+    defer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(io.io, dir) catch {};
+
+    const files = [_]struct { name: []const u8, value: [20]u8 }{
+        .{ .name = "onto", .value = onto },
+        .{ .name = "orig-head", .value = head },
+    };
+    for (files) |f| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, f.name });
+        defer allocator.free(path);
+        const hex = Sha1.hex(f.value);
+        try io.writeFile(path, hex[0..]);
+    }
+
+    const done_path = try std.fmt.allocPrint(allocator, "{s}/done", .{dir});
+    defer allocator.free(done_path);
+    const done = try std.fmt.allocPrint(allocator, "{d}\n", .{remaining_from});
+    defer allocator.free(done);
+    try io.writeFile(done_path, done);
 }
 
 /// Interactive rebase TUI with arrow key navigation
@@ -328,6 +788,99 @@ fn interactiveRebase(
     try io.print("Successfully rebased ({d} rebased, {d} dropped).\n", .{ rebased, dropped });
 }
 
+/// Finish a rebase that stopped on a conflict.
+///
+/// Everything the resolution staged is committed on top of the rewritten tip, and
+/// the branch is advanced to it.
+fn continueRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
+    const rebase_merge = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{git_dir});
+    defer allocator.free(rebase_merge);
+
+    if (std.Io.Dir.cwd().access(io.io, rebase_merge, .{})) |_| {} else |_| {
+        errors.fatal(io, "No rebase in progress?", .{});
+    }
+
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+    const refs_manager = refs_mod.Refs.init(git_dir);
+
+    var idx = index_mod.Index.readFromFile(allocator, git_dir, io.io) catch
+        errors.fatal(io, "could not read the index", .{});
+    defer idx.deinit(allocator);
+
+    if (idx.hasConflicts()) {
+        const paths = idx.conflictedPaths(allocator);
+        defer {
+            for (paths) |p| allocator.free(p);
+            allocator.free(paths);
+        }
+        try io.eprint("error: you must edit all merge conflicts and then\nmark them as resolved using gitz add\n", .{});
+        for (paths) |p| try io.eprint("\t{s}\n", .{p});
+        std.process.exit(1);
+    }
+
+    const tree_sha = try idx.writeTree(store, allocator, io.io);
+
+    const head_path = try std.fmt.allocPrint(allocator, "{s}/rebase-merge/orig-head", .{git_dir});
+    defer allocator.free(head_path);
+    const head_content = io.readFileAlloc(head_path) catch "";
+    defer if (head_content.len > 0) allocator.free(head_content);
+    const trimmed = std.mem.trim(u8, head_content, " \t\r\n");
+    const current = Sha1.fromHex(trimmed) catch
+        errors.fatal(io, "the rebase state is unreadable; run 'gitz rebase --abort'", .{});
+
+    const obj = store.read(allocator, io.io, current) catch
+        errors.fatal(io, "the rebased commit is missing", .{});
+    var commit_obj = obj;
+    defer commit_obj.deinit(allocator);
+    const previous = switch (commit_obj) {
+        .commit => |c| c,
+        else => errors.fatal(io, "the rebased commit is not a commit", .{}),
+    };
+
+    const now_ts = std.Io.Timestamp.now(io.io, .real);
+    const now: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
+    const committer_name = config_cmd.getUserName(allocator, git_dir, io);
+    const committer_email = config_cmd.getUserEmail(allocator, git_dir, io);
+
+    const resolved = object.Commit{
+        .tree = tree_sha,
+        .parents = previous.parents,
+        .author = previous.author,
+        .committer = .{ .name = committer_name, .email = committer_email, .timestamp = now, .timezone = "+0000" },
+        .message = previous.message,
+    };
+    const resolved_sha = try store.write(allocator, io.io, object.GitObject{ .commit = resolved });
+
+    var head_info = refs_manager.head(allocator, io.io) catch null;
+    defer if (head_info) |*h| h.deinit(allocator);
+    if (head_info) |*h| {
+        switch (h.*) {
+            .branch => |b| {
+                const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
+                defer allocator.free(ref_name);
+                try refs_manager.write(allocator, io.io, ref_name, resolved_sha);
+            },
+            .unborn => |u| {
+                const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{u.name.items});
+                defer allocator.free(ref_name);
+                try refs_manager.write(allocator, io.io, ref_name, resolved_sha);
+            },
+            .detached => {
+                const hp = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir});
+                defer allocator.free(hp);
+                const hex = Sha1.hex(resolved_sha);
+                try io.writeFile(hp, hex[0..]);
+            },
+        }
+    }
+
+    checkout_mod.checkoutCommit(allocator, git_dir, io.io, store, resolved_sha) catch {};
+
+    std.Io.Dir.cwd().deleteTree(io.io, rebase_merge) catch {};
+    const hex = Sha1.hex(resolved_sha);
+    try io.print("Successfully rebased and updated {s}.\n", .{hex[0..7]});
+}
+
 fn abortRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
     const rebase_merge = try std.fmt.allocPrint(allocator, "{s}/rebase-merge", .{git_dir});
     defer allocator.free(rebase_merge);
@@ -338,8 +891,7 @@ fn abortRebase(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void 
     const has_apply = if (std.Io.Dir.cwd().access(io.io, rebase_apply, .{})) |_| true else |_| false;
 
     if (!has_merge and !has_apply) {
-        try io.eprint("fatal: No rebase in progress?\n", .{});
-        return;
+        errors.fatal(io, "No rebase in progress?", .{});
     }
 
     std.Io.Dir.cwd().deleteTree(io.io, rebase_merge) catch {};
