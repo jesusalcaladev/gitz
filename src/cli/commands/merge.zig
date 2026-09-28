@@ -99,9 +99,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         // simply becomes HEAD. Treating the all-zero SHA as a real commit made
         // this fail with "could not merge".
         .unborn => {
-            const target_ref_ub = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
-            defer allocator.free(target_ref_ub);
-            const target_ub = refs_manager.read(allocator, io.io, target_ref_ub) catch {
+            const target_ub = resolveTarget(allocator, io, refs_manager, store, name) catch {
                 errors.errorf(io, "branch '{s}' not found", .{name});
             };
             try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, target_ub);
@@ -112,10 +110,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         },
     };
 
-    const target_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
-    defer allocator.free(target_ref);
-
-    const target_sha = refs_manager.read(allocator, io.io, target_ref) catch {
+    const target_sha = resolveTarget(allocator, io, refs_manager, store, name) catch {
         errors.errorf(io, "branch '{s}' not found", .{name});
     };
 
@@ -447,6 +442,36 @@ fn wouldLoseWork(
     return r.paths.len > 0;
 }
 
+/// Resolve the thing being merged: a local branch, a remote-tracking branch, a
+/// tag, a full ref name or a raw SHA.
+///
+/// Only `refs/heads/<name>` was tried, so `gitz merge origin/main` -- what
+/// `gitz pull` itself passes -- always failed with "branch not found", and
+/// `gitz pull --merge` could never integrate anything.
+fn resolveTarget(
+    allocator: std.mem.Allocator,
+    io: Io,
+    refs_manager: refs_mod.Refs,
+    store: storage_mod.StorageBackend,
+    name: []const u8,
+) ![20]u8 {
+    const candidates = [_][]const u8{ "refs/heads/", "refs/remotes/", "refs/tags/" };
+    for (candidates) |prefix| {
+        const ref = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
+        defer allocator.free(ref);
+        if (refs_manager.read(allocator, io.io, ref)) |sha| return sha else |_| {}
+    }
+
+    if (refs_manager.read(allocator, io.io, name)) |sha| return sha else |_| {}
+
+    if (Sha1.fromHex(name)) |sha| {
+        if (store.exists(io.io, sha)) return sha;
+        return error.RefNotFound;
+    } else |_| {}
+
+    return error.RefNotFound;
+}
+
 /// The paths a merge would clobber because they carry uncommitted changes.
 ///
 /// A path is at risk when the merge result differs from HEAD's version *and* the
@@ -636,9 +661,10 @@ fn reportConflicts(
 fn abortMerge(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
     const head_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, MERGE_HEAD });
     defer allocator.free(head_path);
+    // git exits 128 here; printing and returning 0 made a scripted
+    // `gitz merge --abort` look like it had undone a merge.
     if (!io.fileExists(head_path)) {
-        try io.print("No merge in progress.\n", .{});
-        return;
+        errors.fatal(io, "There is no merge to abort (MERGE_HEAD missing)", .{});
     }
 
     const refs_manager = refs_mod.Refs.init(git_dir);
@@ -662,7 +688,9 @@ fn abortMerge(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
 }
 
 pub fn clearMergeState(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
-    for ([_][]const u8{ MERGE_HEAD, MERGE_MSG }) |name| {
+    // SQUASH_MSG is cleared too: `merge --squash` writes it instead of
+    // MERGE_HEAD, so `commit` kept picking up a stale message afterwards.
+    for ([_][]const u8{ MERGE_HEAD, MERGE_MSG, "SQUASH_MSG" }) |name| {
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ git_dir, name });
         defer allocator.free(p);
         std.Io.Dir.cwd().deleteFile(io.io, p) catch {};

@@ -7,9 +7,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     var use_git = false;
     var force = false;
 
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    for (args) |arg| {
         if (std.mem.eql(u8, arg, "--git") or std.mem.eql(u8, arg, "-g")) {
             use_git = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
@@ -27,7 +25,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
                 \\
             , .{});
             return;
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            errors.errorf(io, "unknown option '{s}'", .{arg});
+        } else {
             remote_name = arg;
         }
     }

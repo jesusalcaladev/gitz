@@ -314,6 +314,24 @@ fn writeConfigFile(
     try io.writeFile(path, serialized);
 }
 
+/// Read a config file as a flat `section.key -> value` map.
+///
+/// The map and its keys and values are owned by the caller; release it with
+/// `freeFlatMap`.
+pub fn readFlatMap(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    io: Io,
+) !std.StringHashMap([]const u8) {
+    const path = try getConfigPath(allocator, git_dir, false, io);
+    defer allocator.free(path);
+    return readConfig(allocator, path, io);
+}
+
+pub fn freeFlatMap(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void {
+    freeConfigMap(allocator, map);
+}
+
 fn freeConfigMap(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void {
     var iter = map.iterator();
     while (iter.next()) |entry| {

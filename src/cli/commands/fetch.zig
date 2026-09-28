@@ -188,9 +188,16 @@ fn fetchViaGit(
     try argv.append(allocator, "fetch");
     try argv.append(allocator, remote_name);
 
+    // git must not read gitz's index while it negotiates over the native
+    // protocol. `/dev/null` was used, but git parses that file and aborts with
+    // "index file smaller than expected", so every fallback to git failed. A
+    // path that does not exist is an empty index as far as git is concerned.
+    const null_index = try std.fmt.allocPrint(allocator, "{s}/gitz-null-index", .{git_dir});
+    defer allocator.free(null_index);
+
     var env = try io.childEnviron(allocator, &.{
         .{ "GIT_DIR", git_dir },
-        .{ "GIT_INDEX_FILE", "/dev/null" },
+        .{ "GIT_INDEX_FILE", null_index },
     });
     defer env.deinit();
 

@@ -4,6 +4,7 @@ const storage_mod = @import("storage.zig");
 const index_mod = @import("index.zig");
 const object = @import("object.zig");
 const safety = @import("../util/clone_safety.zig");
+const refs_mod = @import("refs.zig");
 
 /// Flat map of repository path -> blob SHA (plus mode).
 pub const FileEntry = struct {
@@ -11,6 +12,7 @@ pub const FileEntry = struct {
     mode: u32 = 0o100644,
 };
 pub const FileMap = std.StringHashMap(FileEntry);
+const StringHashMap = std.StringHashMap;
 
 /// Git blob SHA-1 for the given file content.
 pub fn blobSha(allocator: std.mem.Allocator, content: []const u8) ![20]u8 {
@@ -140,6 +142,19 @@ pub fn restoreTree(
     tree_sha: [20]u8,
     prefix: []const u8,
 ) void {
+    restoreTreeKeeping(allocator, io, store, tree_sha, prefix, null);
+}
+
+/// `keep` holds paths the working tree must not be rewritten for, because they
+/// carry a local modification the target does not touch.
+pub fn restoreTreeKeeping(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage_mod.StorageBackend,
+    tree_sha: [20]u8,
+    prefix: []const u8,
+    keep: ?*const StringHashMap(void),
+) void {
     const tree_obj = store.read(allocator, io, tree_sha) catch return;
     defer tree_obj.deinit(allocator);
     const tree = switch (tree_obj) {
@@ -160,13 +175,17 @@ pub fn restoreTree(
             // worktree.
             safety.validateWorktreePath(full_path) catch continue;
             std.Io.Dir.cwd().createDirPath(io, full_path) catch {};
-            restoreTree(allocator, io, store, entry.sha, full_path);
+            restoreTreeKeeping(allocator, io, store, entry.sha, full_path, keep);
         } else {
             // `entry.name` comes straight from a fetched tree object. The clone
             // entry points validated it, but checkout (reached from `switch`,
             // `merge` and `merge --abort`) did not, so an entry named
             // `../../../../home/user/.bashrc` wrote outside the worktree.
             safety.validateWorktreePath(full_path) catch continue;
+
+            if (keep) |k| {
+                if (k.contains(full_path)) continue;
+            }
 
             const content = readBlob(allocator, io, store, entry.sha) orelse continue;
             defer allocator.free(content);
@@ -312,10 +331,57 @@ pub fn checkoutCommit(
         allocator.free(stale);
     }
 
+    // Paths the target tree leaves alone but the working tree has modified --
+    // staged or not. git keeps the local content across the switch and reports
+    // the file as modified; writing the target blob over it silently threw the
+    // uncommitted work away.
+    var keep = StringHashMap(void).init(allocator);
+    defer {
+        var kit = keep.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+        keep.deinit();
+    }
+    {
+        // The file's content at the commit being left, so a path the switch does
+        // not change can be recognised.
+        var head_files: FileMap = .init(allocator);
+        defer freeMap(allocator, &head_files);
+        if (refs_mod.Refs.init(git_dir).read(allocator, io, "HEAD")) |head_sha| {
+            if (store.read(allocator, io, head_sha)) |o| {
+                var head_obj = o;
+                defer head_obj.deinit(allocator);
+                if (head_obj == .commit) {
+                    const t = head_obj.commit.tree;
+                    flattenTree(allocator, io, store, t, "", &head_files) catch {};
+                }
+            } else |_| {}
+        } else |_| {}
+
+        var tit = target.iterator();
+        while (tit.next()) |entry| {
+            const path = entry.key_ptr.*;
+            const target_sha = entry.value_ptr.sha;
+
+            const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch continue;
+            defer allocator.free(content);
+            const work = try blobSha(allocator, content);
+            if (std.mem.eql(u8, &work, &target_sha)) continue;
+
+            // A file the two commits hold identical is not being changed by the
+            // switch, so a local edit to it survives -- staged or not. A file the
+            // switch really changes and that carries local work was already
+            // refused by `checkSafeToReplace`.
+            const head_entry = head_files.get(path) orelse continue;
+            if (!std.mem.eql(u8, &head_entry.sha, &target_sha)) continue;
+
+            try keep.put(try allocator.dupe(u8, path), {});
+        }
+    }
+
     // 1) index matches the target tree
     try writeIndexForCommit(allocator, git_dir, io, store, commit_sha);
     // 2) files come from the target tree
-    restoreTree(allocator, io, store, commit.tree, "");
+    restoreTreeKeeping(allocator, io, store, commit.tree, "", &keep);
     // 3) files the target tree no longer has are removed
     for (stale) |path| {
         std.Io.Dir.cwd().deleteFile(io, path) catch {};
