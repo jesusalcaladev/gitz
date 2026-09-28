@@ -3,6 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
 const checkout = @import("../../core/checkout.zig");
+const errors = @import("../errors.zig");
 
 /// gitz switch <branch>          -> change to an existing branch
 /// gitz switch -c <branch>       -> create the branch at HEAD and change to it
@@ -34,6 +35,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     const refs_manager = refs_mod.Refs.init(git_dir);
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
 
+    if (!refs_mod.Refs.isValidRefName(branch_name)) {
+        errors.errorf(io, "'{s}' is not a valid branch name", .{branch_name});
+    }
     const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{branch_name});
     defer allocator.free(ref_name);
 

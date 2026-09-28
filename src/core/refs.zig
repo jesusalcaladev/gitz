@@ -34,6 +34,32 @@ pub const Refs = struct {
         return .{ .git_dir = git_dir };
     }
 
+    /// Whether a ref name is safe to turn into a path inside the git dir.
+    ///
+    /// Ref names were previously concatenated into `{git_dir}/{refname}` with no
+    /// validation, so `gitz branch ../../../tmp/x`, `gitz tag ../y` and
+    /// `gitz switch -c ../../z` created and deleted files outside `.gitz`.
+    /// This is the subset of `git check-ref-format` that matters for that.
+    pub fn isValidRefName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        if (std.mem.eql(u8, name, "@")) return false;
+        if (name[0] == '/' or name[name.len - 1] == '/') return false;
+        if (name[0] == '.') return false;
+        if (std.mem.endsWith(u8, name, ".lock")) return false;
+        if (std.mem.indexOf(u8, name, "..") != null) return false;
+        if (std.mem.indexOf(u8, name, "@{") != null) return false;
+        if (std.mem.indexOfScalar(u8, name, '\\') != null) return false;
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return false;
+        // No component may start with a dot, and none may end in ".lock".
+        var it = std.mem.splitScalar(u8, name, '/');
+        while (it.next()) |component| {
+            if (component.len == 0) return false;
+            if (component[0] == '.') return false;
+            if (std.mem.endsWith(u8, component, ".lock")) return false;
+        }
+        return true;
+    }
+
     fn readFileContent(self: Refs, allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) ![]u8 {
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, sub_path });
         defer allocator.free(full_path);
@@ -58,6 +84,10 @@ pub const Refs = struct {
     }
 
     pub fn write(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8, sha: [20]u8) !void {
+        // Refuse to write outside the git dir. Without this, a name containing
+        // `..` created or overwrote files anywhere on the filesystem.
+        if (!isValidRefName(refname)) return error.InvalidRefName;
+
         const dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, std.fs.path.dirname(refname) orelse "." });
         defer allocator.free(dir_path);
 
@@ -75,6 +105,8 @@ pub const Refs = struct {
     }
 
     pub fn writeSymbolic(self: Refs, allocator: std.mem.Allocator, io: std.Io, name: []const u8, target: []const u8) !void {
+        if (!isValidRefName(name) or !isValidRefName(target)) return error.InvalidRefName;
+
         const ref_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, name });
         defer allocator.free(ref_path);
 
@@ -87,6 +119,8 @@ pub const Refs = struct {
     }
 
     pub fn delete(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) !void {
+        if (!isValidRefName(refname)) return error.InvalidRefName;
+
         const ref_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.git_dir, refname });
         defer allocator.free(ref_path);
         try std.Io.Dir.cwd().deleteFile(io, ref_path);

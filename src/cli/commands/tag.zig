@@ -4,6 +4,7 @@ const Sha1 = @import("../../core/sha1.zig").Sha1;
 const refs_mod = @import("../../core/refs.zig");
 const object = @import("../../core/object.zig");
 const storage_mod = @import("../../core/storage.zig");
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     const refs_manager = refs_mod.Refs.init(git_dir);
@@ -51,6 +52,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try io.eprint("usage: gitz tag -d <tagname>\n", .{});
             return;
         };
+        if (!refs_mod.Refs.isValidRefName(name)) {
+            errors.errorf(io, "'{s}' is not a valid tag name", .{name});
+        }
         const ref_name = try std.fmt.allocPrint(allocator, "refs/tags/{s}", .{name});
         defer allocator.free(ref_name);
 
@@ -63,6 +67,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     const name = tag_name orelse return;
+    if (!refs_mod.Refs.isValidRefName(name)) {
+        errors.errorf(io, "'{s}' is not a valid tag name", .{name});
+    }
 
     // Check if tag already exists
     const ref_name = try std.fmt.allocPrint(allocator, "refs/tags/{s}", .{name});

@@ -3,6 +3,7 @@ const Io = @import("../../util/io.zig").Io;
 const refs_mod = @import("../../core/refs.zig");
 const storage_mod = @import("../../core/storage.zig");
 const Sha1 = @import("../../core/sha1.zig").Sha1;
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     const refs_manager = refs_mod.Refs.init(git_dir);
@@ -118,6 +119,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     if (delete_mode) {
         const name = branch_name orelse return;
+        if (!refs_mod.Refs.isValidRefName(name)) {
+            errors.errorf(io, "'{s}' is not a valid branch name", .{name});
+        }
         const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
         defer allocator.free(ref_name);
 
@@ -173,6 +177,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     // Create branch
     const name = branch_name orelse return;
+    if (!refs_mod.Refs.isValidRefName(name)) {
+        errors.errorf(io, "'{s}' is not a valid branch name", .{name});
+    }
     const sha = try refs_manager.read(allocator, io.io, "HEAD");
     const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
     defer allocator.free(ref_name);

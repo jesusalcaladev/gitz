@@ -167,29 +167,42 @@ fn detectPlatform() ![]const u8 {
 
 /// Find the current binary location
 fn findCurrentBinary(allocator: std.mem.Allocator, io: Io) ![]const u8 {
-    // Try /proc/self/exe on Linux
-    const exe_path = std.Io.Dir.cwd().readFileAlloc(io.io, "/proc/self/exe", allocator, .unlimited) catch {
-        // Fallback: try to find in PATH
-        const result = std.process.run(allocator, io.io, .{
-            .argv = &.{ "which", "gitz" },
-        }) catch return error.BinaryNotFound;
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
+    // /proc/self/exe is a symlink: it has to be *read*, not opened. The old
+    // code used readFileAlloc, which slurped the entire ELF image into memory
+    // and then treated those megabytes of binary as the install path -- so the
+    // "current version" banner printed the whole binary to stdout and the
+    // subsequent `cp` failed with E2BIG.
+    if (selfExePath(allocator)) |resolved| {
+        return resolved;
+    } else |_| {}
 
-        const exited: u8 = switch (result.term) {
-            .exited => |code| code,
-            else => return error.BinaryNotFound,
-        };
+    // Fallback: try to find in PATH
+    const result = std.process.run(allocator, io.io, .{
+        .argv = &.{ "which", "gitz" },
+    }) catch return error.BinaryNotFound;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-        if (exited == 0 and result.stdout.len > 0) {
-            // Trim newline
-            const path = std.mem.trimEnd(u8, result.stdout, &[_]u8{ '\n', '\r' });
-            return allocator.dupe(u8, path);
-        }
-
-        return error.BinaryNotFound;
+    const exited: u8 = switch (result.term) {
+        .exited => |code| code,
+        else => return error.BinaryNotFound,
     };
-    return exe_path;
+
+    if (exited == 0 and result.stdout.len > 0) {
+        const path = std.mem.trimEnd(u8, result.stdout, &[_]u8{ '\n', '\r' });
+        return allocator.dupe(u8, path);
+    }
+
+    return error.BinaryNotFound;
+}
+
+/// Path of the running executable, via readlink on `/proc/self/exe`.
+fn selfExePath(allocator: std.mem.Allocator) ![]const u8 {
+    const path_z = "/proc/self/exe";
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const written = std.os.linux.readlink(path_z, &buf, buf.len);
+    if (written == 0) return error.BinaryNotFound;
+    return allocator.dupe(u8, buf[0..written]);
 }
 
 /// Download and install the new binary
