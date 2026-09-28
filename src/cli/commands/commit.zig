@@ -7,6 +7,7 @@ const refs_mod = @import("../../core/refs.zig");
 const index_mod = @import("../../core/index.zig");
 const config_cmd = @import("config.zig");
 const merge_cmd = @import("merge.zig");
+const checkout_mod = @import("../../core/checkout.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var message: ?[]const u8 = null;
@@ -65,15 +66,32 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
     if (idx.count() == 0) {
-        try io.print("nothing to commit, working tree clean\n", .{});
+        try io.eprint("nothing to commit, working tree clean\n", .{});
         idx.deinit(allocator);
-        return;
+        std.process.exit(1);
     }
 
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
     const refs_manager = refs_mod.Refs.init(git_dir);
 
     const tree_sha = try idx.writeTree(store, allocator, io.io);
+
+    // "Nothing to commit" is about the tree, not about how many entries the
+    // index happens to hold. After a commit the index is repopulated from the
+    // tree, so `count() > 0` was true even with nothing staged: a stray
+    // `gitz commit -m ...` silently created an empty commit and exited 0.
+    // Comparing the index tree with HEAD's tree is what git does.
+    if (!amend) {
+        if (refs_manager.read(allocator, io.io, "HEAD")) |head_sha| {
+            if (headTreeEquals(store, allocator, io, head_sha, tree_sha)) {
+                try io.eprint("nothing to commit, working tree clean\n", .{});
+                idx.deinit(allocator);
+                std.process.exit(1);
+            }
+        } else |_| {
+            // Unborn HEAD: the first commit is legitimate.
+        }
+    }
 
     // Get author info from config
     const author_name = config_cmd.getUserName(allocator, git_dir, io);
@@ -144,26 +162,45 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     const commit_sha = try store.write(allocator, io.io, object.GitObject{ .commit = commit });
 
-    // Update HEAD
+    // Update HEAD. A detached HEAD holds a raw SHA rather than a `ref:` line,
+    // and the old code only handled the symbolic case: the commit object was
+    // written and the command reported success, orphaning the commit
+    // immediately. Git updates a detached HEAD in place, so we do too.
     const head_path = try std.fmt.allocPrint(allocator, "{s}/HEAD", .{git_dir});
     defer allocator.free(head_path);
 
-    var head_file = std.Io.Dir.cwd().openFile(io.io, head_path, .{}) catch null;
-    if (head_file) |*f| {
+    var head_was_detached = false;
+    if (std.Io.Dir.cwd().openFile(io.io, head_path, .{})) |head_file_open| {
+        var file = head_file_open;
+        defer file.close(io.io);
         var buf: [256]u8 = undefined;
-        const n = try f.readStreaming(io.io, &.{&buf});
-        f.close(io.io);
+        const n = file.readStreaming(io.io, &.{&buf}) catch 0;
         const content = std.mem.trim(u8, buf[0..n], &[_]u8{ '\n', '\r', ' ' });
 
         if (std.mem.startsWith(u8, content, "ref: ")) {
             const target = content[5..];
             try refs_manager.write(allocator, io.io, target, commit_sha);
+        } else {
+            head_was_detached = true;
+            const hex_sha = Sha1.hex(commit_sha);
+            var wbuf: [64]u8 = undefined;
+            const line = try std.fmt.bufPrint(&wbuf, "{s}\n", .{hex_sha});
+            var f = try std.Io.Dir.cwd().createFile(io.io, head_path, .{});
+            defer f.close(io.io);
+            try std.Io.File.writeStreamingAll(f, io.io, line);
         }
+    } else |_| {
+        try io.eprint("error: could not update HEAD\n", .{});
+        std.process.exit(1);
     }
 
     const hex = Sha1.hex(commit_sha);
     if (amend) {
         try io.print("[{s}] {s} (amend)\n", .{ hex[0..7], message.? });
+    } else if (head_was_detached) {
+        // git prints the "(root-commit)" / "(no branch)" style hint; the
+        // detached case is the important part: the commit is now reachable.
+        try io.print("[{s}] {s} (HEAD detached)\n", .{ hex[0..7], message.? });
     } else {
         try io.print("[{s}] {s}\n", .{ hex[0..7], message.? });
     }
@@ -197,6 +234,25 @@ fn mergeMessage(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) ?[]co
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return null;
     return allocator.dupe(u8, trimmed) catch null;
+}
+
+/// Whether two commits point at the same tree, meaning the index records no
+/// change relative to HEAD.
+fn headTreeEquals(
+    store: storage_mod.StorageBackend,
+    allocator: std.mem.Allocator,
+    io: Io,
+    head_sha: [20]u8,
+    index_tree: [20]u8,
+) bool {
+    if (std.mem.eql(u8, &head_sha, &index_tree)) return true;
+    const head_obj = store.read(allocator, io.io, head_sha) catch return false;
+    defer head_obj.deinit(allocator);
+    const head_commit = switch (head_obj) {
+        .commit => |c| c,
+        else => return false,
+    };
+    return std.mem.eql(u8, &head_commit.tree, &index_tree);
 }
 
 /// Recursively rebuild index entries from a tree object
@@ -241,27 +297,52 @@ fn autoStageAll(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void
     var modified = false;
 
     // Only update entries that have actually changed
-    for (idx.entries.items) |*entry| {
+    var i: usize = 0;
+    while (i < idx.entries.items.len) {
+        const entry = &idx.entries.items[i];
         const clean_name = if (std.mem.startsWith(u8, entry.name, "./"))
             entry.name[2..]
         else
             entry.name;
 
-        const content = std.Io.Dir.cwd().readFileAlloc(io.io, clean_name, allocator, .unlimited) catch continue;
+        // A tracked file missing from the worktree has been deleted.
+        // `git commit -a` stages that deletion; skipping it made the commit
+        // still contain the file, so it came back on the next checkout while
+        // the user's working tree no longer had it.
+        const content = std.Io.Dir.cwd().readFileAlloc(io.io, clean_name, allocator, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => {
+                // `entry` points into the ArrayList, which orderedRemove
+                // shifts, so the name is captured before the removal.
+                const removed_name = entry.name;
+                _ = idx.entries.orderedRemove(i);
+                allocator.free(removed_name);
+                modified = true;
+                continue;
+            },
+            else => continue,
+        };
         defer allocator.free(content);
 
-        const work_sha = Sha1.hash(content);
+        // A git blob SHA covers the `blob <len>\0` header, so hashing the raw
+        // content never matched and every file looked modified.
+        const work_sha = checkout_mod.blobSha(allocator, content) catch continue;
+
+        // The mode lives in the index, so it is refreshed whether or not the
+        // content changed: `chmod +x` alone has to be recorded as 100755.
+        if (std.Io.Dir.cwd().statFile(io.io, clean_name, .{})) |stat| {
+            entry.size = @intCast(@min(stat.size, std.math.maxInt(u32)));
+            entry.mtime = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
+            entry.ctime = @intCast(@divTrunc(stat.ctime.nanoseconds, std.time.ns_per_s));
+            entry.mode = if (stat.permissions.toMode() & 0o111 != 0) 0o100755 else 0o100644;
+        } else |_| {}
+
         if (!std.mem.eql(u8, &work_sha, &entry.sha)) {
             const blob = object.GitObject{ .blob = .{ .content = content } };
             const new_sha = try store.write(allocator, io.io, blob);
-
-            const stat = std.Io.Dir.cwd().statFile(io.io, clean_name, .{}) catch continue;
             entry.sha = new_sha;
-            entry.size = @intCast(stat.size);
-            entry.mtime = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
-            entry.ctime = @intCast(@divTrunc(stat.ctime.nanoseconds, std.time.ns_per_s));
             modified = true;
         }
+        i += 1;
     }
 
     // Only write if something actually changed

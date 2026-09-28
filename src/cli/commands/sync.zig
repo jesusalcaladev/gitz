@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var remote_name: ?[]const u8 = null;
@@ -35,8 +36,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
 
     // Detect current branch
     const current_branch = detectCurrentBranch(allocator, git_dir, io) catch {
-        try io.eprint("fatal: not on any branch\n", .{});
-        return;
+        errors.fatal(io, "not on any branch", .{});
     };
     defer allocator.free(current_branch);
 
@@ -45,12 +45,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     // Step 1: Fetch
     try io.print("\x1b[2m[1/2] Fetching from {s}...\x1b[0m\n", .{name});
     const fetch_args = [_][]const u8{name};
+    // A failed fetch must not be followed by a rebase and a success message.
+    // `fetch` now exits non-zero on failure, and this catch covers the
+    // remaining I/O error paths.
     @import("fetch.zig").execute(allocator, git_dir, &fetch_args, io) catch {
         try io.eprint("\x1b[31mFetch failed.\x1b[0m\n", .{});
-        if (!use_git) {
-            try io.print("Try: gitz sync --git\n", .{});
-        }
-        return;
+        if (!use_git) try io.print("Try: gitz sync --git\n", .{});
+        std.process.exit(1);
     };
 
     // Step 2: Rebase onto remote branch
@@ -68,7 +69,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try io.print("To abort: gitz rebase --abort\n", .{});
             try io.print("To force: gitz sync --force\n", .{});
         }
-        return;
+        std.process.exit(1);
     };
 
     try io.print("\n\x1b[1;32m✓ Sync complete!\x1b[0m\n", .{});

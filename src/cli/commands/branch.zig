@@ -1,6 +1,8 @@
 const std = @import("std");
 const Io = @import("../../util/io.zig").Io;
 const refs_mod = @import("../../core/refs.zig");
+const storage_mod = @import("../../core/storage.zig");
+const Sha1 = @import("../../core/sha1.zig").Sha1;
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     const refs_manager = refs_mod.Refs.init(git_dir);
@@ -119,27 +121,53 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
         defer allocator.free(ref_name);
 
-        // Check if it's the current branch
+        // The current branch can never be deleted, not even with -D. Removing it
+        // left HEAD pointing at a ref that no longer existed, so the next
+        // `gitz status` reported "HEAD detached at 0000000" and the next
+        // `gitz commit` created a root commit on a bogus history.
         var head_info = refs_manager.head(allocator, io.io) catch null;
         defer if (head_info) |*h| h.deinit(allocator);
 
         if (head_info) |hi| {
             switch (hi) {
                 .branch => |b| {
-                    if (std.mem.eql(u8, name, b.name.items) and !force_delete) {
+                    if (std.mem.eql(u8, name, b.name.items)) {
                         try io.eprint("error: cannot delete branch '{s}': checked out\n", .{name});
-                        return;
+                        std.process.exit(1);
                     }
                 },
                 .detached => {},
             }
         }
 
+        const target_sha = refs_manager.read(allocator, io.io, ref_name) catch {
+            try io.eprint("error: branch '{s}' not found\n", .{name});
+            std.process.exit(1);
+        };
+        const target_hex = Sha1.hex(target_sha);
+
+        // `-d` refuses to delete a branch whose commits are not reachable from
+        // the current HEAD, exactly like git. There was no mergedness check at
+        // all, so a plain `-d` destroyed work that was not merged anywhere, and
+        // a later gc made it unrecoverable.
+        if (!force_delete) {
+            const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
+            const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch null;
+            // "Fully merged" means the branch tip is reachable *from* the
+            // current HEAD, so the walk starts at HEAD and looks for the tip.
+            const merged = if (head_sha) |h| isAncestor(allocator, io.io, store, target_sha, h) else false;
+            if (!merged) {
+                try io.eprint("error: the branch '{s}' is not fully merged\n", .{name});
+                try io.eprint("If you are sure you want to delete it, run 'gitz branch -D {s}'.\n", .{name});
+                std.process.exit(1);
+            }
+        }
+
         refs_manager.delete(allocator, io.io, ref_name) catch {
             try io.eprint("error: branch '{s}' not found\n", .{name});
-            return;
+            std.process.exit(1);
         };
-        try io.print("Deleted branch {s}\n", .{name});
+        try io.print("Deleted branch {s} (was {s})\n", .{ name, target_hex[0..7] });
         return;
     }
 
@@ -159,4 +187,49 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
 
     try io.eprint("error: a branch named '{s}' already exists\n", .{name});
+    std.process.exit(1);
+}
+
+/// Whether `ancestor` is reachable from `descendant` by walking parents.
+///
+/// Used by `branch -d` to decide whether a branch is fully merged. The walk is
+/// bounded and keeps a visited set so a corrupt (cyclic) commit graph cannot
+/// spin forever.
+fn isAncestor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage_mod.StorageBackend,
+    ancestor: [20]u8,
+    descendant: [20]u8,
+) bool {
+    var visited = std.AutoHashMap([20]u8, void).init(allocator);
+    defer visited.deinit();
+
+    var queue = std.ArrayList([20]u8).empty;
+    defer queue.deinit(allocator);
+
+    queue.append(allocator, descendant) catch return false;
+
+    const max_steps: usize = 1_000_000;
+    var steps: usize = 0;
+
+    while (queue.items.len > 0) {
+        steps += 1;
+        if (steps > max_steps) return false;
+
+        const sha = queue.orderedRemove(0);
+        if (std.mem.eql(u8, &sha, &ancestor)) return true;
+        if (visited.contains(sha)) continue;
+        visited.put(sha, {}) catch return false;
+
+        const obj = store.read(allocator, io, sha) catch continue;
+        defer obj.deinit(allocator);
+        const commit = switch (obj) {
+            .commit => |c| c,
+            else => continue,
+        };
+        for (commit.parents) |parent| queue.append(allocator, parent) catch {};
+    }
+
+    return false;
 }

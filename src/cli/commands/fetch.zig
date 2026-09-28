@@ -6,6 +6,7 @@ const http = @import("../../transport/http.zig");
 const ssh_cmd = @import("../../transport/ssh_cmd.zig");
 const ssh_mod = @import("../../transport/ssh.zig");
 const remote_cmd = @import("remote.zig");
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var remote_name: ?[]const u8 = null;
@@ -37,11 +38,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer if (url) |u| allocator.free(u);
 
     if (url == null) {
-        try io.eprint("fatal: '{s}' does not appear to be a git repository\n", .{name});
-        try io.eprint("fatal: could not read from remote repository.\n\n", .{});
-        try io.eprint("Please make sure you have the correct access rights\n", .{});
-        try io.eprint("and the repository exists.\n", .{});
-        return;
+        errors.fatal(io, "'{s}' does not appear to be a git repository", .{name});
     }
 
     try io.print("Fetching {s}\n", .{name});
@@ -174,31 +171,34 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 }
 
-/// Fetch using system git as fallback
+/// Fetch using system git as fallback.
+///
+/// Like the push fallback, this used to build an `sh -c` string out of the
+/// remote name, so a crafted remote executed arbitrary commands. The
+/// environment is now passed as a map and git is invoked with a plain argv.
 fn fetchViaGit(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
     remote_name: []const u8,
     io: Io,
 ) !void {
-    var git_cmd = std.ArrayList(u8).empty;
-    defer git_cmd.deinit(allocator);
-    try git_cmd.appendSlice(allocator, "GIT_DIR=");
-    try git_cmd.appendSlice(allocator, git_dir);
-    try git_cmd.appendSlice(allocator, " GIT_INDEX_FILE=/dev/null git fetch ");
-    try git_cmd.appendSlice(allocator, remote_name);
-
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, "sh");
-    try argv.append(allocator, "-c");
-    try argv.append(allocator, git_cmd.items);
+    try argv.append(allocator, "git");
+    try argv.append(allocator, "fetch");
+    try argv.append(allocator, remote_name);
+
+    var env = try io.childEnviron(allocator, &.{
+        .{ "GIT_DIR", git_dir },
+        .{ "GIT_INDEX_FILE", "/dev/null" },
+    });
+    defer env.deinit();
 
     const result = std.process.run(allocator, io.io, .{
         .argv = argv.items,
+        .environ_map = &env,
     }) catch |err| {
-        try io.eprint("error: git fetch failed: {}\n", .{err});
-        return;
+        errors.fatal(io, "git fetch failed: {s}", .{@errorName(err)});
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -209,4 +209,13 @@ fn fetchViaGit(
     if (result.stderr.len > 0) {
         try io.eprint("{s}", .{result.stderr});
     }
+
+    // A failed fetch used to be indistinguishable from a successful one, so
+    // `gitz pull` went on to rebase against nothing and `gitz sync` printed
+    // "Sync complete!".
+    const exited: u8 = switch (result.term) {
+        .exited => |code| code,
+        else => 1,
+    };
+    if (exited != 0) std.process.exit(exited);
 }

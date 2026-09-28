@@ -6,6 +6,7 @@ const http = @import("../../transport/http.zig");
 const ssh_cmd = @import("../../transport/ssh_cmd.zig");
 const ssh_mod = @import("../../transport/ssh.zig");
 const remote_cmd = @import("remote.zig");
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
     var remote_name: ?[]const u8 = null;
@@ -34,15 +35,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         // Get current branch name
         const refs_manager = refs_mod.Refs.init(git_dir);
         var head_info = refs_manager.head(allocator, io.io) catch {
-            try io.eprint("fatal: not a gitz repository\n", .{});
-            return;
+            errors.fatal(io, "not a gitz repository", .{});
         };
         defer head_info.deinit(allocator);
         break :refspec switch (head_info) {
             .branch => |b| try allocator.dupe(u8, b.name.items),
             .detached => {
-                try io.eprint("fatal: not on a branch\n", .{});
-                return;
+                errors.fatal(io, "not on a branch", .{});
             },
         };
     };
@@ -53,8 +52,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer if (url) |u| allocator.free(u);
 
     if (url == null) {
-        try io.eprint("fatal: '{s}' does not appear to be a git repository\n", .{name});
-        return;
+        errors.fatal(io, "'{s}' does not appear to be a git repository", .{name});
     }
 
     // Get the commit SHA to push
@@ -63,8 +61,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer allocator.free(ref_name);
 
     const push_sha = refs_manager.read(allocator, io.io, ref_name) catch {
-        try io.eprint("error: src refspec '{s}' does not match any\n", .{ref});
-        return;
+        errors.errorf(io, "src refspec '{s}' does not match any", .{ref});
     };
 
     // Force git fallback if requested
@@ -127,9 +124,13 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     try io.print("   {s}..{s}  {s} -> {s}\n", .{ hex[0..7], hex[0..7], ref, ref });
 }
 
-/// Push using system git as fallback
-/// Wraps git push in sh -c to set GIT_DIR and GIT_INDEX_FILE=/dev/null
-/// so git doesn't choke on gitz's incompatible index format
+/// Push using system git as fallback.
+///
+/// The remote name and ref come straight from argv. Assembling a shell string
+/// out of them and running `sh -c` meant `gitz push 'origin; id' --git` (or any
+/// transport failure that triggers the automatic fallback) executed arbitrary
+/// commands. The environment is now passed through `std.process.run`'s `env_map`
+/// and the command runs as a plain argv, with no shell involved.
 fn pushViaGit(
     allocator: std.mem.Allocator,
     git_dir: []const u8,
@@ -138,31 +139,27 @@ fn pushViaGit(
     force: bool,
     io: Io,
 ) !void {
-    // Build the git command string
-    var git_cmd = std.ArrayList(u8).empty;
-    defer git_cmd.deinit(allocator);
-
-    try git_cmd.appendSlice(allocator, "GIT_DIR=");
-    try git_cmd.appendSlice(allocator, git_dir);
-    try git_cmd.appendSlice(allocator, " GIT_INDEX_FILE=/dev/null git push ");
-    try git_cmd.appendSlice(allocator, remote_name);
-    try git_cmd.appendSlice(allocator, " ");
-    try git_cmd.appendSlice(allocator, ref);
-    if (force) {
-        try git_cmd.appendSlice(allocator, " --force-with-lease");
-    }
-
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, "sh");
-    try argv.append(allocator, "-c");
-    try argv.append(allocator, git_cmd.items);
+    try argv.append(allocator, "git");
+    try argv.append(allocator, "push");
+    if (force) try argv.append(allocator, "--force-with-lease");
+    try argv.append(allocator, remote_name);
+    try argv.append(allocator, ref);
+
+    // GIT_INDEX_FILE=/dev/null keeps git from reading gitz's index while it
+    // negotiates over the native protocol.
+    var env = try io.childEnviron(allocator, &.{
+        .{ "GIT_DIR", git_dir },
+        .{ "GIT_INDEX_FILE", "/dev/null" },
+    });
+    defer env.deinit();
 
     const result = std.process.run(allocator, io.io, .{
         .argv = argv.items,
+        .environ_map = &env,
     }) catch |err| {
-        try io.eprint("error: git push failed: {}\n", .{err});
-        return;
+        errors.fatal(io, "git push failed: {s}", .{@errorName(err)});
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -178,7 +175,9 @@ fn pushViaGit(
         .exited => |code| code,
         else => 1,
     };
+    // Propagate the failure. Returning here reported success for a rejected or
+    // unreachable push, so any CI job gating on `gitz push` was green.
     if (exited != 0) {
-        try io.eprint("error: git push failed with exit code {d}\n", .{exited});
+        std.process.exit(if (exited == 0) 1 else exited);
     }
 }

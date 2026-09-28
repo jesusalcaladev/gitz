@@ -6,6 +6,11 @@ pub const Io = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     color: bool,
+    /// The process environment, kept so child processes can inherit it while
+    /// overriding individual variables. Passing a `Environ.Map` replaces the
+    /// whole environment, so anything spawning git needs the original values
+    /// (PATH, HOME, SSH_AUTH_SOCK) plus the overrides.
+    environ: std.process.Environ,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) Io {
         const no_color = std.process.Environ.contains(environ, std.heap.page_allocator, "NO_COLOR") catch false;
@@ -13,7 +18,37 @@ pub const Io = struct {
             .io = io,
             .allocator = allocator,
             .color = !no_color,
+            .environ = environ,
         };
+    }
+
+    /// Snapshot the current environment, then apply `overrides` on top.
+    ///
+    /// Used to run `git` as a fallback without going through a shell: the
+    /// remote name and ref come from argv, and building an `sh -c` string out of
+    /// them made `gitz push 'origin; id' --git` execute arbitrary commands.
+    pub fn childEnviron(
+        self: Io,
+        allocator: std.mem.Allocator,
+        overrides: []const [2][]const u8,
+    ) !std.process.Environ.Map {
+        var map = std.process.Environ.Map.init(allocator);
+        errdefer map.deinit();
+
+        // `Environ.Block` is a per-OS type, not a union, so the branch is
+        // resolved at comptime for the target.
+        if (@hasDecl(std.process.Environ.PosixBlock, "view")) {
+            const block: *const std.process.Environ.PosixBlock = &self.environ.block;
+            map.putPosixBlock(block.view()) catch {};
+        } else if (@hasDecl(std.process.Environ.WindowsBlock, "view")) {
+            const block: *const std.process.Environ.WindowsBlock = &self.environ.block;
+            map.putWindowsBlock(block.view()) catch {};
+        }
+
+        for (overrides) |kv| {
+            map.put(kv[0], kv[1]) catch {};
+        }
+        return map;
     }
 
     // ── Output ───────────────────────────────────────────────────────

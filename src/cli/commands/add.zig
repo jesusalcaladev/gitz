@@ -115,11 +115,19 @@ fn addFile(allocator: std.mem.Allocator, git_dir: []const u8, idx: *index_mod.In
     const blob = object.GitObject{ .blob = .{ .content = content } };
     const sha = try store.write(allocator, io.io, blob);
 
+    // The mode is part of the index and of every tree entry. Hardcoding
+    // 100644 lost the execute bit on scripts and turned symlinks into
+    // regular files holding the target's bytes.
+    const mode: u32 = switch (stat.kind) {
+        .sym_link => 0o120000,
+        else => if (stat.permissions.toMode() & 0o111 != 0) 0o100755 else 0o100644,
+    };
+
     try idx.add(allocator, path, sha, .{
-        .size = @intCast(stat.size),
+        .size = @intCast(@min(stat.size, std.math.maxInt(u32))),
         .mtime = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s)),
         .ctime = @intCast(@divTrunc(stat.ctime.nanoseconds, std.time.ns_per_s)),
-        .mode = 0o100644,
+        .mode = mode,
     });
 
     try io.print("add: {s}\n", .{path});
@@ -159,7 +167,15 @@ fn collectFiles(
         dirs_to_visit.deinit(allocator);
     }
 
-    try dirs_to_visit.append(allocator, try allocator.dupe(u8, dir_path));
+    // `gitz add dir/` is the same as `gitz add dir`. The trailing slash used to
+    // be carried into the composed path, so the index held `dir//file.txt`;
+    // writeTree then split at the first `/` and produced a tree entry named
+    // `/file.txt`, which is not a legal git object and made the repository
+    // permanently corrupt.
+    var root = dir_path;
+    while (root.len > 1 and root[root.len - 1] == '/') root = root[0 .. root.len - 1];
+    const start = if (root.len == 0) "." else root;
+    try dirs_to_visit.append(allocator, try allocator.dupe(u8, start));
 
     while (dirs_to_visit.pop()) |current_z| {
         defer allocator.free(current_z);

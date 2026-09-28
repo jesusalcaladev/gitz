@@ -55,20 +55,39 @@ pub const Index = struct {
     }
 
     pub fn add(self: *Index, allocator: std.mem.Allocator, path: []const u8, sha: [20]u8, stat: StatInfo) !void {
-        // Normalize path: strip leading ./ and trailing /
+        // Normalize the path: strip a leading `./` and any trailing or
+        // duplicated separators. `gitz add dir/` used to reach the index as
+        // `dir//file.txt`, and writeTree then produced a tree entry literally
+        // named `/file.txt`, an illegal git object.
         var clean = path;
         while (std.mem.startsWith(u8, clean, "./")) clean = clean[2..];
         while (clean.len > 0 and clean[clean.len - 1] == '/') clean = clean[0 .. clean.len - 1];
         if (clean.len == 0) return;
+        if (std.mem.indexOf(u8, clean, "//")) |_| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            var it = std.mem.tokenizeScalar(u8, clean, '/');
+            var first = true;
+            while (it.next()) |component| {
+                if (!first) try buf.append(allocator, '/');
+                first = false;
+                try buf.appendSlice(allocator, component);
+            }
+            clean = buf.items;
+        }
 
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry.name, clean)) {
+                // Duplicate first: freeing the old name before the allocation
+                // below left a dangling pointer if the allocation failed.
+                const new_name = try allocator.dupe(u8, clean);
                 allocator.free(entry.name);
                 self.entries.items[i].sha = sha;
                 self.entries.items[i].size = stat.size;
                 self.entries.items[i].mtime = stat.mtime;
                 self.entries.items[i].ctime = stat.ctime;
-                self.entries.items[i].name = try allocator.dupe(u8, clean);
+                self.entries.items[i].mode = stat.mode;
+                self.entries.items[i].name = new_name;
                 return;
             }
         }
@@ -168,10 +187,24 @@ pub const Index = struct {
         var f = try std.Io.Dir.cwd().createFile(io, index_path, .{});
         defer f.close(io);
 
-        try std.Io.File.writeStreamingAll(f, io, "DIRC");
-        try std.Io.File.writeStreamingAll(f, io, &[_]u8{ 0, 0, 0, 2 });
+        // The index trailer is the SHA-1 of every preceding byte, not a run of
+        // zeros. With zeros, real git rejected the file ("cache entry has null
+        // sha1" / "corrupt index file"), so a repository written by gitz could
+        // not be opened by git even though the entries themselves were valid.
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+
+        const emit = struct {
+            fn put(list: *std.ArrayList(u8), gpa: std.mem.Allocator, bytes: []const u8) !void {
+                try list.appendSlice(gpa, bytes);
+            }
+        };
+
+        try emit.put(&body, allocator, "DIRC");
+        try emit.put(&body, allocator, &[_]u8{ 0, 0, 0, 2 });
         const count_bytes = std.mem.nativeToBig(u32, @intCast(self.entries.items.len));
-        try std.Io.File.writeStreamingAll(f, io, std.mem.asBytes(&count_bytes));
+        try emit.put(&body, allocator, std.mem.asBytes(&count_bytes));
 
         for (self.entries.items) |entry| {
             var buf: [64]u8 = undefined;
@@ -186,22 +219,36 @@ pub const Index = struct {
             std.mem.writeInt(u32, buf[pos..][0..4], entry.gid, .big); pos += 4;
             std.mem.writeInt(u32, buf[pos..][0..4], entry.size, .big); pos += 4;
             @memcpy(buf[pos..][0..20], &entry.sha); pos += 20;
-            std.mem.writeInt(u16, buf[pos..][0..2], entry.flags, .big); pos += 2;
 
-            try std.Io.File.writeStreamingAll(f, io, buf[0..pos]);
-            try std.Io.File.writeStreamingAll(f, io, entry.name);
-            try std.Io.File.writeStreamingAll(f, io, "\x00");
+            // The low 12 bits of the flags word hold the name length. They used
+            // to be written as whatever `StatInfo.flags` held (usually 0), so
+            // git read every entry as having an empty name.
+            const name_len = entry.name.len;
+            const flag_len: u16 = if (name_len >= 0xFFF) 0xFFF else @intCast(name_len);
+            const flags: u16 = (entry.flags & 0xF000) | flag_len;
+            std.mem.writeInt(u16, buf[pos..][0..2], flags, .big); pos += 2;
 
-            const total = pos + entry.name.len + 1;
+            try emit.put(&body, allocator, buf[0..pos]);
+            try emit.put(&body, allocator, entry.name);
+            try emit.put(&body, allocator, "\x00");
+
+            // Entries are padded with NULs to a multiple of eight bytes.
+            // Verified against git 2.55: a 5-byte name produces a 68-byte
+            // record and the next entry starts at +72.
+            const total = pos + name_len + 1;
             const pad = (8 - (total % 8)) % 8;
             if (pad > 0) {
                 var pad_buf: [8]u8 = [_]u8{0} ** 8;
-                try std.Io.File.writeStreamingAll(f, io, pad_buf[0..pad]);
+                try emit.put(&body, allocator, pad_buf[0..pad]);
             }
         }
 
-        var zero_sha: [20]u8 = [_]u8{0} ** 20;
-        try std.Io.File.writeStreamingAll(f, io, &zero_sha);
+        hasher.update(body.items);
+        var trailer: [20]u8 = undefined;
+        hasher.final(&trailer);
+
+        try std.Io.File.writeStreamingAll(f, io, body.items);
+        try std.Io.File.writeStreamingAll(f, io, &trailer);
     }
 
     pub fn readFromFile(allocator: std.mem.Allocator, git_dir: []const u8, io: std.Io) !Index {
@@ -242,16 +289,43 @@ pub const Index = struct {
 
             pos += 2;
 
-            var name_buf: [256]u8 = undefined;
+            // Prefer the name length from the flags word, so an index written
+            // by real git round-trips. 0xFFF is the "long name" marker, and
+            // only then is the name read up to its NUL.
+            const flags = std.mem.readInt(u16, entry_data[pos - 2 ..][0..2], .big);
+            const flag_name_len = flags & 0x0FFF;
+
+            var name_buf: [4096]u8 = undefined;
             var name_len: usize = 0;
-            while (name_len < 256) {
-                var byte: [1]u8 = undefined;
-                _ = try f.readStreaming(io, &.{&byte});
-                if (byte[0] == 0) break;
-                name_buf[name_len] = byte[0];
-                name_len += 1;
+
+            if (flag_name_len == 0xFFF) {
+                while (name_len < name_buf.len) {
+                    var byte: [1]u8 = undefined;
+                    _ = try f.readStreaming(io, &.{&byte});
+                    if (byte[0] == 0) break;
+                    name_buf[name_len] = byte[0];
+                    name_len += 1;
+                }
+            } else if (flag_name_len != 0) {
+                name_len = @intCast(flag_name_len);
+                if (name_len > name_buf.len) name_len = name_buf.len;
+                _ = try f.readStreaming(io, &.{name_buf[0..name_len]});
+
+                var term: [1]u8 = undefined;
+                _ = try f.readStreaming(io, &.{&term});
+            } else {
+                // No length recorded (an index written by an older gitz): scan
+                // for the NUL terminator instead.
+                while (name_len < name_buf.len) {
+                    var byte: [1]u8 = undefined;
+                    _ = try f.readStreaming(io, &.{&byte});
+                    if (byte[0] == 0) break;
+                    name_buf[name_len] = byte[0];
+                    name_len += 1;
+                }
             }
 
+            // Entries are padded to a multiple of eight bytes.
             const entry_len = 62 + name_len + 1;
             const pad = (8 - (entry_len % 8)) % 8;
             if (pad > 0) {
