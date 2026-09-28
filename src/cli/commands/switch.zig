@@ -58,13 +58,17 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         // Create the branch from the current HEAD.
         var head_info = refs_manager.head(allocator, io.io) catch null;
         defer if (head_info) |*h| h.deinit(allocator);
-        const current = if (head_info) |h| h.sha() else [_]u8{0} ** 20;
-        if (std.mem.allEqual(u8, &current, 0)) {
-            try io.eprint("error: cannot create branch '{s}': no commits yet\n", .{branch_name});
-            std.process.exit(1);
+        const current = if (head_info) |h| h.sha() else null;
+        if (current == null) {
+            // HEAD is unborn: git still lets you name the next branch, which is
+            // what `gitz switch -c` is for on a fresh repository. HEAD simply
+            // points at the new, still-unborn branch.
+            try refs_manager.writeSymbolic(allocator, io.io, "HEAD", ref_name);
+            try io.print("Switched to a new branch '{s}'\n", .{branch_name});
+            return;
         }
-        try refs_manager.write(allocator, io.io, ref_name, current);
-        target_sha = current;
+        try refs_manager.write(allocator, io.io, ref_name, current.?);
+        target_sha = current.?;
     }
 
     // Refuse to switch if the target commit object is missing.

@@ -57,9 +57,24 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
     defer head_info.deinit(allocator);
 
-    const current_sha = switch (head_info) {
+    const current_sha: [20]u8 = switch (head_info) {
         .branch => |b| b.sha,
         .detached => |d| d.sha,
+        // Merging into a branch with no commits is a fast-forward: the target
+        // simply becomes HEAD. Treating the all-zero SHA as a real commit made
+        // this fail with "could not merge".
+        .unborn => {
+            const target_ref_ub = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
+            defer allocator.free(target_ref_ub);
+            const target_ub = refs_manager.read(allocator, io.io, target_ref_ub) catch {
+                errors.errorf(io, "branch '{s}' not found", .{name});
+            };
+            try updateCurrentRef(allocator, git_dir, io, refs_manager, &head_info, target_ub);
+            checkout.checkoutCommit(allocator, git_dir, io.io, store, target_ub) catch
+                errors.fatal(io, "could not check out the merged tree", .{});
+            try io.print("Fast-forward\n", .{});
+            return;
+        },
     };
 
     const target_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
@@ -339,6 +354,8 @@ fn abortMerge(allocator: std.mem.Allocator, git_dir: []const u8, io: Io) !void {
     const current_sha = switch (head_info) {
         .branch => |b| b.sha,
         .detached => |d| d.sha,
+        // A merge can only be in progress if HEAD already has commits.
+        .unborn => errors.fatal(io, "There is no merge to abort (MERGE_HEAD missing)", .{}),
     };
 
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, git_dir);
@@ -379,6 +396,12 @@ fn updateCurrentRef(
     switch (head_info.*) {
         .branch => |b| {
             const current_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
+            defer allocator.free(current_ref);
+            try refs_manager.write(allocator, io.io, current_ref, sha);
+        },
+        // An unborn branch simply gains its first commit.
+        .unborn => |u| {
+            const current_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{u.name.items});
             defer allocator.free(current_ref);
             try refs_manager.write(allocator, io.io, current_ref, sha);
         },

@@ -27,6 +27,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             const hex = Sha1.hex(d.sha);
             try io.print("\x1b[1;31m●\x1b[0m HEAD detached at \x1b[1;33m{s}\x1b[0m\n", .{hex[0..7]});
         },
+        // A branch with no commits is not a detached HEAD: report it the way
+        // git does instead of "HEAD detached at 0000000".
+        .unborn => |u| {
+            try io.print("\x1b[1;36m●\x1b[0m On branch \x1b[1;33m{s}\x1b[0m\n", .{u.name.items});
+            try io.print("\n  \x1b[1;33mNo commits yet\x1b[0m\n", .{});
+        },
     }
 
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);

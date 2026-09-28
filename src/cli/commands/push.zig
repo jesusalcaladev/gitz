@@ -40,6 +40,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         defer head_info.deinit(allocator);
         break :refspec switch (head_info) {
             .branch => |b| try allocator.dupe(u8, b.name.items),
+            .unborn => |u| try allocator.dupe(u8, u.name.items),
             .detached => {
                 errors.fatal(io, "not on a branch", .{});
             },

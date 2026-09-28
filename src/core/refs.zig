@@ -2,27 +2,50 @@ const std = @import("std");
 const Sha1 = @import("sha1.zig").Sha1;
 
 pub const HeadInfo = union(enum) {
+    /// A branch that exists and has commits.
     branch: struct { name: std.ArrayList(u8), sha: [20]u8 },
+    /// HEAD points directly at a commit.
     detached: struct { sha: [20]u8 },
+    /// HEAD names a branch with no commits yet (`gitz init`, before the first
+    /// commit). This used to be reported as a detached HEAD at the all-zero
+    /// SHA, so a fresh repository printed "HEAD detached at 0000000" instead of
+    /// "On branch main / No commits yet", `gitz switch -c foo` refused with "no
+    /// commits yet", and `gitz merge` treated HEAD as a detached all-zero
+    /// commit.
+    unborn: struct { name: std.ArrayList(u8) },
 
     pub fn deinit(self: *HeadInfo, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .branch => |*b| b.name.deinit(allocator),
             .detached => {},
+            .unborn => |*u| u.name.deinit(allocator),
         }
     }
 
     pub fn branchName(self: HeadInfo) []const u8 {
         return switch (self) {
             .branch => |b| b.name.items,
+            .unborn => |u| u.name.items,
+            // A detached HEAD has no branch name; callers must not ask for one.
             .detached => unreachable,
         };
     }
 
-    pub fn sha(self: HeadInfo) [20]u8 {
+    /// The commit HEAD points at, if any. An unborn branch has none.
+    pub fn sha(self: HeadInfo) ?[20]u8 {
         return switch (self) {
             .branch => |b| b.sha,
             .detached => |d| d.sha,
+            .unborn => null,
+        };
+    }
+
+    /// The branch HEAD points at, whether or not it has commits.
+    pub fn branchOf(self: HeadInfo) ?[]const u8 {
+        return switch (self) {
+            .branch => |b| b.name.items,
+            .unborn => |u| u.name.items,
+            .detached => null,
         };
     }
 };
@@ -126,13 +149,15 @@ pub const Refs = struct {
         try std.Io.Dir.cwd().deleteFile(io, ref_path);
     }
 
+    /// Describe HEAD.
+    ///
+    /// A symbolic HEAD whose branch does not exist yet is `.unborn`, not a
+    /// detached HEAD at the all-zero SHA. The two were conflated, so a freshly
+    /// initialised repository reported "HEAD detached at 0000000" and the
+    /// branch-creating commands treated it as a detached commit.
     pub fn head(self: Refs, allocator: std.mem.Allocator, io: std.Io) !HeadInfo {
-        const sha = self.read(allocator, io, "HEAD") catch {
-            return HeadInfo{ .detached = .{ .sha = [_]u8{0} ** 20 } };
-        };
-
         const head_content = self.readFileContent(allocator, io, "HEAD") catch {
-            return HeadInfo{ .detached = .{ .sha = sha } };
+            return error.RefNotFound;
         };
         defer allocator.free(head_content);
 
@@ -146,9 +171,16 @@ pub const Refs = struct {
                 target;
             var name_list: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
             try name_list.appendSlice(allocator, raw_name);
+
+            // The branch the symref names may not exist yet.
+            const sha = self.read(allocator, io, target) catch {
+                return HeadInfo{ .unborn = .{ .name = name_list } };
+            };
             return HeadInfo{ .branch = .{ .name = name_list, .sha = sha } };
         }
 
+        // A direct SHA in HEAD: a detached head.
+        const sha = Sha1.fromHex(trimmed) catch return error.InvalidRef;
         return HeadInfo{ .detached = .{ .sha = sha } };
     }
 

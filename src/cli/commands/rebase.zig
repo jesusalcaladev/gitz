@@ -53,14 +53,19 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     };
     defer head_info.deinit(allocator);
 
-    const current_sha = switch (head_info) {
+    const current_sha: [20]u8 = switch (head_info) {
         .branch => |b| b.sha,
         .detached => |d| d.sha,
+        // There is nothing to replay on a branch with no commits.
+        .unborn => {
+            try io.eprint("fatal: no commits to rebase\n", .{});
+            std.process.exit(128);
+        },
     };
 
     const upstream_sha = resolveRef(allocator, io.io, refs_manager, store, branch) catch {
         try io.eprint("error: branch '{s}' not found\n", .{branch});
-        return;
+        std.process.exit(1);
     };
 
     const onto_sha = if (onto) |o|
@@ -114,6 +119,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     try replayCommits(allocator, git_dir, io, store, &refs_manager, &commits_to_replay, onto_sha, &head_info);
     try io.print("Successfully rebased and updated refs/heads/{s}.\n", .{switch (head_info) {
         .branch => |b| b.name.items,
+        .unborn => |u| u.name.items,
         .detached => "(detached)",
     }});
 }
@@ -150,6 +156,11 @@ fn replayCommits(
     switch (head_info.*) {
         .branch => |b| {
             const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
+            defer allocator.free(ref_name);
+            try refs_manager.write(allocator, io.io, ref_name, current_parent);
+        },
+        .unborn => |u| {
+            const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{u.name.items});
             defer allocator.free(ref_name);
             try refs_manager.write(allocator, io.io, ref_name, current_parent);
         },
@@ -294,6 +305,11 @@ fn interactiveRebase(
     switch (head_info.*) {
         .branch => |b| {
             const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{b.name.items});
+            defer allocator.free(ref_name);
+            try refs_manager.write(allocator, io.io, ref_name, current_parent);
+        },
+        .unborn => |u| {
+            const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{u.name.items});
             defer allocator.free(ref_name);
             try refs_manager.write(allocator, io.io, ref_name, current_parent);
         },
