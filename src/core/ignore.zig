@@ -91,6 +91,18 @@ pub const IgnoreRuleSet = struct {
 
         return result;
     }
+
+    /// Whether this ruleset has an opinion about `path` at all.
+    ///
+    /// A negation that matched counts, so the caller can tell "this deeper
+    /// file re-included the path" from "this file said nothing about it".
+    pub fn decides(self: IgnoreRuleSet, path: []const u8, is_dir: bool) bool {
+        for (self.rules.items) |rule| {
+            if (rule.directory_only and !is_dir) continue;
+            if (matchIgnorePattern(rule.pattern, path, rule.anchored)) return true;
+        }
+        return false;
+    }
 };
 
 /// Manages .gitignore files at multiple directory levels
@@ -121,12 +133,23 @@ pub const IgnoreStack = struct {
         try self.rulesets.append(self.allocator, ruleset);
     }
 
-    /// Check if a path should be ignored
+    /// Check if a path should be ignored.
+    ///
+    /// Rulesets are consulted most-specific first: files loaded later (a
+    /// nested .gitignore, or info/exclude after the root file) take precedence,
+    /// which is how git resolves a `!pattern` re-inclusion in a deeper file.
+    ///
+    /// The previous version returned true if *any* ruleset matched, so once a
+    /// path was ignored by the root file no later `!negation` could ever
+    /// re-include it.
     pub fn isIgnored(self: IgnoreStack, path: []const u8, is_dir: bool) bool {
-        for (self.rulesets.items) |ruleset| {
-            if (ruleset.isIgnored(path, is_dir)) {
-                return true;
-            }
+        var i = self.rulesets.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.rulesets.items[i].isIgnored(path, is_dir)) return true;
+            // A ruleset that decided nothing about this path is skipped; a
+            // ruleset that re-included it returns false and that wins.
+            if (self.rulesets.items[i].decides(path, is_dir)) return false;
         }
         return false;
     }

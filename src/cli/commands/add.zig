@@ -6,11 +6,17 @@ const index_mod = @import("../../core/index.zig");
 const object = @import("../../core/object.zig");
 const storage_mod = @import("../../core/storage.zig");
 const ignore_mod = @import("../../core/ignore.zig");
+const errors = @import("../errors.zig");
 
 pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
-    // `add -A` / `add -u` / `add .` all mean "stage the whole worktree",
-    // deletions included. Without `-A` there is still nothing to do.
+    // `-A` and `add .` stage the whole worktree, new files included.
+    // `-u`/`--update` stages only what is already tracked, which is a
+    // different operation: it was aliased to `-A`, so `gitz add -u newfile`
+    // added a brand-new file.
     var stage_all = false;
+    var update_only = false;
+    var force = false;
+    var dry_run = false;
     var paths: std.ArrayList([]const u8) = .empty;
     defer {
         for (paths.items) |p| allocator.free(p);
@@ -18,24 +24,35 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     }
 
     for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-A") or std.mem.eql(u8, arg, "--all") or
-            std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--update"))
-        {
+        if (std.mem.eql(u8, arg, "-A") or std.mem.eql(u8, arg, "--all")) {
             stage_all = true;
+        } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--update")) {
+            update_only = true;
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            // Required to add a file that .gitignore excludes.
+            force = true;
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            // Already the default here: every added file is announced.
         } else if (std.mem.eql(u8, arg, ".") or std.mem.eql(u8, arg, "./")) {
             // git treats `add .` as "stage everything under here", which
             // includes files that were deleted from the worktree.
             stage_all = true;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            // Everything after this is a pathspec, even if it starts with `-`.
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             // The command runs from the worktree root, so a path typed inside a
             // subdirectory has to be re-anchored: `gitz add c.txt` in src/deep
             // means src/deep/c.txt, not <root>/c.txt.
             try paths.append(allocator, try io.rebasePath(arg));
+        } else {
+            errors.errorf(io, "unknown option '{s}'", .{arg});
         }
     }
 
-    if (!stage_all and paths.items.len == 0) {
-        try io.eprint("usage: gitz add [-A|--all] <paths...>\n", .{});
+    if (!stage_all and !update_only and paths.items.len == 0) {
+        try io.eprint("usage: gitz add [-A|--all] [-u|--update] [-f] [-n] <paths...>\n", .{});
         std.process.exit(1);
     }
 
@@ -50,11 +67,23 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     var ignore_stack = ignore_mod.IgnoreStack.init(allocator);
     defer ignore_stack.deinit();
     ignore_stack.loadFile(io.io, ".gitignore") catch {};
+    const exclude_path = try std.fmt.allocPrint(allocator, "{s}/info/exclude", .{git_dir});
+    defer allocator.free(exclude_path);
+    // `gitz init` writes defaults here (*.o, node_modules/, .DS_Store) that
+    // nothing ever read, so those files showed up as untracked and
+    // `gitz add .` committed them.
+    ignore_stack.loadFile(io.io, exclude_path) catch {};
+
+    // Names to report as ignored, so `git add` can explain itself instead of
+    // skipping the path in silence.
+    var ignored_paths = std.ArrayList([]const u8).empty;
+    defer ignored_paths.deinit(allocator);
 
     for (paths.items) |path| {
         // Check if path is ignored
-        if (ignore_stack.isIgnored(path, false)) {
-            continue; // silently skip ignored files
+        if (!force and ignore_stack.isIgnored(path, false)) {
+            try ignored_paths.append(allocator, path);
+            continue;
         }
         if (isDirectory(path, io)) {
             try addDirectory(allocator, git_dir, &idx, path, io, &ignore_stack);
@@ -73,9 +102,22 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     if (stage_all) {
         try addDirectory(allocator, git_dir, &idx, ".", io, &ignore_stack);
         stageDeletions(allocator, &idx, io);
+    } else if (update_only) {
+        // Only what is already tracked: re-stat each entry and drop the ones
+        // whose file disappeared. New files are left alone.
+        stageDeletions(allocator, &idx, io);
     }
 
+    if (dry_run) return;
+
     try idx.writeToFile(git_dir, allocator, io.io);
+
+    if (ignored_paths.items.len > 0) {
+        try io.eprint("The following paths are ignored by one of your .gitignore files:\n", .{});
+        for (ignored_paths.items) |p| try io.eprint("  {s}\n", .{p});
+        try io.eprint("hint: Use -f if you really want to add them.\n", .{});
+    }
+
     if (pathspec_failed) std.process.exit(128);
 }
 

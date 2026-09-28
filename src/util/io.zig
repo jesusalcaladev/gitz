@@ -13,13 +13,22 @@ pub const Io = struct {
     environ: std.process.Environ,
     /// Owned subdirectory prefix, set once the repository root is known.
     owned_prefix: ?[]u8 = null,
+    /// Whether stdout is attached to a terminal. Colour is only emitted there,
+    /// matching git's `color.ui = auto` default.
+    isTty: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) Io {
         const no_color = std.process.Environ.contains(environ, std.heap.page_allocator, "NO_COLOR") catch false;
+        const is_tty = std.Io.File.stdout().isTty(io) catch false;
         return .{
             .io = io,
             .allocator = allocator,
-            .color = !no_color,
+            // git's `color.ui = auto` default: colour only on a terminal. Hard
+            // -coding colour on meant `gitz diff | cat` emitted escape
+            // sequences, and `gitz diff > p.patch` produced a patch that
+            // `git apply` rejected.
+            .color = !no_color and is_tty,
+            .isTty = is_tty,
             .environ = environ,
         };
     }
@@ -67,7 +76,13 @@ pub const Io = struct {
             },
         };
 
-        try self.writeOutput(std.Io.File.stdout(), msg);
+        // A closed pipe (`gitz log | head`) is the normal way a pager ends the
+        // stream, not a failure: the error used to reach main and print a
+        // BrokenPipe stack trace.
+        self.writeOutput(std.Io.File.stdout(), msg) catch |err| switch (err) {
+            error.BrokenPipe => {},
+            else => return err,
+        };
     }
 
     pub fn eprint(self: Io, comptime fmt: []const u8, args: anytype) !void {
@@ -92,6 +107,8 @@ pub const Io = struct {
         defer self.allocator.free(plain);
         try file.writeStreamingAll(self.io, plain);
     }
+
+
 
     fn stripAnsi(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
         var plain_len: usize = 0;

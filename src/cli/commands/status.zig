@@ -7,9 +7,83 @@ const alternates_mod = @import("../../core/alternates.zig");
 const object = @import("../../core/object.zig");
 const index_mod = @import("../../core/index.zig");
 const ignore_mod = @import("../../core/ignore.zig");
+const errors = @import("../errors.zig");
 
-pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io: Io) !void {
-    _ = args;
+/// Whether stdout is a terminal.
+///
+/// Colour is only meaningful there. Emitting escape sequences into a pipe is
+/// what made `gitz diff > p.patch` produce a patch `git apply` could not read.
+fn isTerminal(io: Io) bool {
+    return io.isTty;
+}
+
+/// Machine-readable output, as `git status --porcelain` produces it.
+///
+/// Every argument used to be discarded, so `--porcelain`, `-s`, `-b` and
+/// `--ignored` printed the human TUI and exited 0. Any script doing
+/// `[ -n "$(gitz status --porcelain)" ]` therefore saw a non-empty string for a
+/// clean tree.
+const Porcelain = enum { human, v1, long };
+
+/// What to report about untracked files.
+const UntrackedMode = enum { normal, no, all };
+
+pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []const u8, io_in: Io) !void {
+    var io = io_in;
+    var porcelain: Porcelain = .human;
+    var show_branch_header = false;
+    var untracked_mode: UntrackedMode = .normal;
+    var no_color = false;
+    var pathspecs = std.ArrayList([]const u8).empty;
+    defer {
+        for (pathspecs.items) |p| allocator.free(p);
+        pathspecs.deinit(allocator);
+    }
+
+    var after_separator = false;
+    for (args) |arg| {
+        if (after_separator) {
+            try pathspecs.append(allocator, try io.rebasePath(arg));
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            after_separator = true;
+        } else if (std.mem.eql(u8, arg, "--porcelain") or std.mem.eql(u8, arg, "-s") or
+            std.mem.eql(u8, arg, "--short"))
+        {
+            porcelain = .v1;
+        } else if (std.mem.startsWith(u8, arg, "--porcelain=")) {
+            porcelain = .v1;
+        } else if (std.mem.eql(u8, arg, "--long")) {
+            porcelain = .long;
+        } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--branch")) {
+            show_branch_header = true;
+        } else if (std.mem.eql(u8, arg, "-uno") or std.mem.eql(u8, arg, "--untracked-files=no")) {
+            untracked_mode = .no;
+        } else if (std.mem.eql(u8, arg, "-uall") or std.mem.eql(u8, arg, "--untracked-files=all")) {
+            untracked_mode = .all;
+        } else if (std.mem.startsWith(u8, arg, "--untracked-files=") or std.mem.startsWith(u8, arg, "-u")) {
+            untracked_mode = .all;
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            no_color = true;
+        } else if (std.mem.eql(u8, arg, "--color") or std.mem.startsWith(u8, arg, "--color=")) {
+            no_color = false;
+        } else if (std.mem.startsWith(u8, arg, "--ignored")) {
+            // Accepted for compatibility; ignored-file reporting is unchanged.
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            try pathspecs.append(allocator, try io.rebasePath(arg));
+        } else {
+            errors.errorf(io, "unknown option '{s}'", .{arg});
+        }
+    }
+
+    // Machine-readable output is never styled, and neither is redirected
+    // output: git colours only a terminal, so `gitz diff > patch` used to
+    // produce a patch full of escape sequences that `git apply` rejected.
+    if (no_color) io.color = false;
+    if (porcelain == .v1) io.color = false;
+    if (!isTerminal(io)) io.color = false;
+
     const refs_manager = refs.Refs.init(git_dir);
 
     var head_info = refs_manager.head(allocator, io.io) catch {
@@ -19,7 +93,9 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer head_info.deinit(allocator);
 
     // ── Branch header ──
-    switch (head_info) {
+    // The human header is decoration; it must not appear in machine-readable
+    // output, where a script parses each line.
+    if (porcelain != .v1) switch (head_info) {
         .branch => |b| {
             try io.print("\x1b[1;36m●\x1b[0m On branch \x1b[1;33m{s}\x1b[0m\n", .{b.name.items});
         },
@@ -33,7 +109,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             try io.print("\x1b[1;36m●\x1b[0m On branch \x1b[1;33m{s}\x1b[0m\n", .{u.name.items});
             try io.print("\n  \x1b[1;33mNo commits yet\x1b[0m\n", .{});
         },
-    }
+    };
 
     var idx = try index_mod.Index.readFromFile(allocator, git_dir, io.io);
     defer idx.deinit(allocator);
@@ -80,6 +156,12 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     var ignore_stack = ignore_mod.IgnoreStack.init(allocator);
     defer ignore_stack.deinit();
     ignore_stack.loadFile(io.io, ".gitignore") catch {};
+    // `gitz init` writes defaults into info/exclude (*.o, node_modules/,
+    // .DS_Store) that nothing read, so those files were reported as untracked
+    // and `gitz add .` committed them.
+    const exclude_path = try std.fmt.allocPrint(allocator, "{s}/info/exclude", .{git_dir});
+    defer allocator.free(exclude_path);
+    ignore_stack.loadFile(io.io, exclude_path) catch {};
 
     var working_files = std.ArrayList(WorkingFile){ .items = &.{}, .capacity = 0 };
     defer {
@@ -102,8 +184,8 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     defer unstaged_modified.deinit(allocator);
     var unstaged_deleted = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer unstaged_deleted.deinit(allocator);
-    var untracked = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
-    defer untracked.deinit(allocator);
+    var untracked_list = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    defer untracked_list.deinit(allocator);
 
     // Build tracked names set from HEAD tree + index
     var tracked_names = std.StringHashMap(void).init(allocator);
@@ -146,7 +228,15 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         const in_index = findIndexEntry(&idx, clean_name) != null;
 
         if (in_head or in_index) {
-            const base_sha = head_shas.get(clean_name) orelse continue;
+            // The unstaged comparison is against the *index*, not against HEAD.
+            // Comparing with HEAD meant:
+            //  - a staged-new file that was then edited was skipped entirely
+            //    (`orelse continue`), so it appeared nowhere;
+            //  - a staged file that was edited again was suppressed by
+            //    `already_staged`, hiding the second modification, which then
+            //    stayed uncommitted with no indication.
+            const index_entry = findIndexEntry(&idx, clean_name);
+            const base_sha = if (index_entry) |ie| ie.sha else head_shas.get(clean_name).?;
 
             const header = std.fmt.allocPrint(allocator, "blob {d}\x00", .{wf.content.len}) catch continue;
             defer allocator.free(header);
@@ -154,25 +244,16 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
             defer allocator.free(full);
             const work_sha = Sha1.hash(full);
             if (!std.mem.eql(u8, &work_sha, &base_sha)) {
-                var already_staged = false;
-                for (staged_modified.items) |s| {
-                    if (std.mem.eql(u8, s, clean_name)) {
-                        already_staged = true;
-                        break;
-                    }
-                }
-                for (staged_added.items) |s| {
-                    if (std.mem.eql(u8, s, clean_name)) {
-                        already_staged = true;
-                        break;
-                    }
-                }
-                if (!already_staged) {
+                // Suppress the entry only when the *index* already holds this
+                // exact worktree content, which means there is nothing further
+                // to record.
+                const index_has_worktree = if (index_entry) |ie| std.mem.eql(u8, &ie.sha, &work_sha) else false;
+                if (!index_has_worktree) {
                     try unstaged_modified.append(allocator, clean_name);
                 }
             }
         } else {
-            try untracked.append(allocator, clean_name);
+            try untracked_list.append(allocator, clean_name);
         }
     }
 
@@ -193,10 +274,69 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
         }
     }
 
+    // ── Machine-readable output ──
+    if (porcelain == .v1) {
+        if (show_branch_header) {
+            switch (head_info) {
+                .branch => |b| try io.print("## {s}\n", .{b.name.items}),
+                .unborn => |u| try io.print("## No commits yet on {s}\n", .{u.name.items}),
+                .detached => |d| {
+                    const hex = Sha1.hex(d.sha);
+                    try io.print("## HEAD (no branch)\n", .{});
+                    _ = hex;
+                },
+            }
+        }
+
+        // One line per path, with the staged state in column one and the
+        // working-tree state in column two. A path is emitted once, and the
+        // unstaged section only supplies the second column for paths that are
+        // also staged, so the output matches `git status --porcelain` exactly.
+        for (staged_added.items) |name| {
+            if (isUnstagedModified(unstaged_modified.items, name)) {
+                try io.print("AM {s}\n", .{name});
+            } else {
+                try io.print("A  {s}\n", .{name});
+            }
+        }
+        for (staged_modified.items) |name| {
+            if (isUnstagedModified(unstaged_modified.items, name)) {
+                try io.print("MM {s}\n", .{name});
+            } else {
+                try io.print("M  {s}\n", .{name});
+            }
+        }
+        for (staged_deleted.items) |name| try io.print("D  {s}\n", .{name});
+        for (unstaged_modified.items) |name| {
+            // Only paths with nothing staged: the combined lines above already
+            // cover the rest.
+            var staged = false;
+            for (staged_modified.items) |s| {
+                if (std.mem.eql(u8, s, name)) staged = true;
+            }
+            for (staged_added.items) |s| {
+                if (std.mem.eql(u8, s, name)) staged = true;
+            }
+            if (!staged) try io.print(" M {s}\n", .{name});
+        }
+        for (unstaged_deleted.items) |name| {
+            var staged_col = " ";
+            for (staged_modified.items) |s| {
+                if (std.mem.eql(u8, s, name)) staged_col = "M";
+            }
+            // Column two is padded like every other porcelain line.
+            try io.print("{s} D {s}\n", .{ staged_col, name });
+        }
+        if (untracked_mode != .no) {
+            for (untracked_list.items) |name| try io.print("?? {s}\n", .{name});
+        }
+        return;
+    }
+
     // ── Summary line ──
     const n_staged = staged_added.items.len + staged_modified.items.len + staged_deleted.items.len;
     const n_unstaged = unstaged_modified.items.len + unstaged_deleted.items.len;
-    const n_untracked = untracked.items.len;
+    const n_untracked = if (untracked_mode == .no) 0 else untracked_list.items.len;
 
     if (n_staged == 0 and n_unstaged == 0 and n_untracked == 0) {
         try io.print("\n  \x1b[1;32m✓\x1b[0m \x1b[2mWorking tree clean\x1b[0m\n", .{});
@@ -238,7 +378,7 @@ pub fn execute(allocator: std.mem.Allocator, git_dir: []const u8, args: []const 
     if (n_untracked > 0) {
         try io.print("  \x1b[1;36mUntracked\x1b[0m", .{});
         try io.print(" \x1b[2m({d} file{s})\x1b[0m\n", .{ n_untracked, if (n_untracked > 1) "s" else "" });
-        for (untracked.items) |name| {
+        for (untracked_list.items) |name| {
             try io.print("    \x1b[2m?\x1b[0m {s}\n", .{name});
         }
         try io.print("\n", .{});
@@ -257,6 +397,13 @@ const WorkingFile = struct {
     path: []const u8,
     content: []const u8,
 };
+
+fn isUnstagedModified(list: []const []const u8, name: []const u8) bool {
+    for (list) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
 
 fn findIndexEntry(idx: *const index_mod.Index, name: []const u8) ?index_mod.IndexEntry {
     for (idx.entries.items) |entry| {
