@@ -17,16 +17,18 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     // the right directory per role from `repo`.
     _ = args;
 
-    // Packfiles are not readable yet: nothing in the tree knows how to resolve
-    // an object out of objects/pack/, and gc does not write a .idx either. Any
-    // commit whose tree is still loose would look unreachable while in fact
-    // being reachable from a packed parent, so with packs present we must not
-    // prune at all. See the note in `core/objectstore.zig` `gc`.
-    if (try hasPackedObjects(allocator, io, repo.common_dir)) {
-        try io.print("Counting objects: skipped\n", .{});
-        try io.print("Repository contains packfiles that cannot be read yet; refusing to prune loose objects.\n", .{});
-        return;
-    }
+    // This used to refuse to do anything at all when `objects/pack/` held a
+    // packfile, because nothing could read one: every object reached from a
+    // packed parent looked unreachable, so pruning would have deleted live
+    // history. `core/pack_store.zig` now reads packs, and the traversal below
+    // goes through `StorageBackend`, so reachability spans loose and packed
+    // objects alike.
+    //
+    // Only loose objects are ever removed -- the sweep below walks the `xx`
+    // fanout directories and nothing else -- so a pack is never rewritten or
+    // deleted here.
+    // `packed` is a Zig keyword, hence the name.
+    const repo_has_packs = try hasPackedObjects(allocator, io, repo.common_dir);
 
     try io.print("Counting objects: ", .{});
 
@@ -123,7 +125,9 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     }
 
     try io.print("{d}, done.\n", .{loose_count});
-    if (freed_count > 0) {
+    if (repo_has_packs and loose_count == 0) {
+        try io.print("No loose objects to prune; history lives in a packfile.\n", .{});
+    } else if (freed_count > 0) {
         try io.print("Pruning {d} unreachable objects\n", .{freed_count});
     } else {
         try io.print("No unreachable objects to prune.\n", .{});

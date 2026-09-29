@@ -205,6 +205,10 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
         var n: usize = 0;
         while (n < shown) : (n += 1) {
             const item = all_commits.items[n];
+            // git separates full entries with a blank line rather than
+            // trailing each one, which left a blank past the last commit.
+            // `--oneline` has no separator at all.
+            if (n > 0 and !oneline) try io.print("\n", .{});
             try printCommit(allocator, io, item.sha, item.commit, oneline, graph);
             if (decorate) try printDecoration(allocator, repo, io, item.sha);
             if (show_diff) try printCommitDiff(allocator, repo, io, item.sha, item.commit, stat_only, name_only);
@@ -276,6 +280,10 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     var printed: usize = 0;
     var idx: usize = first;
     while (idx < total and printed < limit) : (idx += 1) {
+        // The blank line separates one entry from the next, so it precedes
+        // every entry but the first; trailing one would follow the last commit
+        // where git prints nothing. `--oneline` has no separator.
+        if (printed > 0 and !oneline) try io.print("\n", .{});
         printed += 1;
         const item = collected.items[if (reverse) total - 1 - idx else idx];
         try printCommit(allocator, io, item.sha, item.commit, oneline, graph);
@@ -698,21 +706,46 @@ fn printCommit(
         try io.print("Date:   {s}\n\n", .{try formatDate(&date_buf, commit.author.timestamp, tz)});
 
         var msg_lines = std.mem.splitScalar(u8, message, '\n');
+        // Blank lines inside the message are part of it and git indents them
+        // too. The one *after* a trailing newline is not: the newline already
+        // ended the line, so printing it emitted a spurious blank per commit.
+        const ends_with_newline = message.len > 0 and message[message.len - 1] == '\n';
         while (msg_lines.next()) |line| {
-            if (line.len > 0) try io.print("    {s}\n", .{line});
+            if (ends_with_newline and line.len == 0 and msg_lines.index == null) break;
+            try io.print("    {s}\n", .{line});
         }
-        try io.print("\n", .{});
     }
 }
 
 /// `Mon Aug 28 12:00:00 2026 +0000`, as git prints it.
 ///
-/// Writes into a caller-provided buffer: the command allocator is an arena, so
-/// a slice into a stack temporary would dangle by the time it is printed.
+/// The offset in seconds that a commit's recorded timezone denotes, e.g.
+/// `-0400` is -4h and `+0530` is +5h30m. An unparsable zone is treated as UTC.
+fn timezoneOffsetSeconds(timezone: []const u8) i64 {
+    if (timezone.len == 0) return 0;
+    if (std.mem.eql(u8, timezone, "Z") or std.mem.eql(u8, timezone, "-00")) return 0;
+    if (timezone.len != 5) return 0;
+    if (timezone[0] != '+' and timezone[0] != '-') return 0;
+
+    const hours = std.fmt.parseInt(i64, timezone[1..3], 10) catch return 0;
+    const minutes = std.fmt.parseInt(i64, timezone[3..5], 10) catch return 0;
+    const magnitude = hours * 3600 + minutes * 60;
+    return if (timezone[0] == '-') -magnitude else magnitude;
+}
+
+/// Writes into a caller-provided buffer: the command allocator is an arena, so a
+/// slice into a stack temporary would dangle by the time it is printed.
 fn formatDate(buf: []u8, timestamp: i64, timezone: []const u8) ![]const u8 {
     if (timestamp <= 0) return buf[0..0];
 
-    const secs: u64 = @intCast(timestamp);
+    // git renders the timestamp in the author's own zone, which is the one
+    // recorded in the commit -- not in UTC. Skipping this made every date in
+    // `log` wrong by the offset, so a commit at 13:11 -0400 printed as 17:11.
+    // The offset is added before the calendar split because crossing midnight
+    // changes the day, not just the clock.
+    const offset = timezoneOffsetSeconds(timezone);
+    const local: i64 = std.math.add(i64, timestamp, offset) catch timestamp;
+    const secs: u64 = @intCast(local);
     const day_index: u64 = secs / 86400;
     const time_of_day: u64 = secs % 86400;
     const hour = time_of_day / 3600;
@@ -720,24 +753,29 @@ fn formatDate(buf: []u8, timestamp: i64, timezone: []const u8) ![]const u8 {
     const second = time_of_day % 60;
 
     const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    // Laid out so that entry 0 is the epoch's own weekday, 1970-01-01 being a
+    // Thursday. The previous `(day + 4) % 7` shifted every date by four days.
     const weekdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
 
-    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(local) };
     const year_day = epoch.getEpochDay().calculateYearDay();
     const year: u32 = @intCast(year_day.year);
-    // `day` is 0-based within the year; the month/day pair needs the real
-    // month lengths, which only the calendar type knows.
+    // `day_index` counts from zero within the month, and the month enum is
+    // numbered from one. Both were used unsifted, which printed every commit a
+    // day early and in the following month.
     const month_day = year_day.calculateMonthDay();
-    const day_in_month: u32 = @intCast(month_day.day_index);
-    const month_index = @intFromEnum(month_day.month);
+    const day_in_month: u32 = @as(u32, @intCast(month_day.day_index)) + 1;
+    const month_index = @as(usize, @intFromEnum(month_day.month)) -| 1;
 
-    const weekday_index = (day_index + 4) % 7; // 1970-01-01 was a Thursday
+    const weekday_index = day_index % weekdays.len;
     const month = names[@min(month_index, 11)];
     const weekday = weekdays[weekday_index];
 
+    // git writes the day of the month unpadded (`Sep 1`, not `Sep  1`) and the
+    // clock zero padded, so a single digit second reads `09:05:03`.
     return std.fmt.bufPrint(
         buf,
-        "{s} {s} {d:2} {d:2}:{d:2}:{d:2} {d} {s}",
+        "{s} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} {d} {s}",
         .{ weekday, month, day_in_month, hour, minute, second, year, if (timezone.len > 0) timezone else "+0000" },
     );
 }

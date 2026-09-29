@@ -3,12 +3,14 @@ const Sha1 = @import("sha1.zig").Sha1;
 const object_mod = @import("object.zig");
 const loose_mod = @import("loose.zig");
 const shard_mod = @import("shard_store.zig");
+const pack_store_mod = @import("pack_store.zig");
 const Repo = @import("repo.zig").Repo;
 
 const GitObject = object_mod.GitObject;
 const ObjectType = object_mod.ObjectType;
 const LooseStore = loose_mod.LooseStore;
 const ShardStore = shard_mod.ShardStore;
+const PackStore = pack_store_mod.Store;
 
 /// Pluggable storage backend for git objects.
 ///
@@ -25,6 +27,15 @@ const ShardStore = shard_mod.ShardStore;
 pub const StorageBackend = union(enum) {
     loose: LooseStore,
     shard: ShardStore,
+    /// Loose objects *and* `objects/pack/*.pack`.
+    ///
+    /// A repository that git has ever `gc`'d keeps most of its history in
+    /// packfiles, and a loose-only backend simply cannot see it. That is not a
+    /// rare corner: it is what every real clone looks like after a while, and
+    /// `gitz log` reported the few loose commits as if that were the whole
+    /// history. Reads consult the packs first and fall back to loose objects and
+    /// alternates; writes still go to loose objects, which is what git does too.
+    pack: PackStore,
 
     // -----------------------------------------------------------------------
     // Common API — all backends implement these
@@ -34,6 +45,7 @@ pub const StorageBackend = union(enum) {
         return switch (self) {
             .loose => |s| s.read(allocator, io, sha),
             .shard => |s| s.read(allocator, io, sha),
+            .pack => |s| s.read(allocator, sha),
         };
     }
 
@@ -41,6 +53,9 @@ pub const StorageBackend = union(enum) {
         return switch (self) {
             .loose => |s| s.write(allocator, io, obj),
             .shard => |s| s.write(allocator, io, obj),
+            // Writing into a packfile means rewriting it; git writes loose
+            // objects too and lets the next `gc` collect them.
+            .pack => |s| s.loose.write(allocator, io, obj),
         };
     }
 
@@ -50,6 +65,7 @@ pub const StorageBackend = union(enum) {
         return switch (self) {
             .loose => |s| s.writeRaw(allocator, io, obj_type, data),
             .shard => |s| s.writeRaw(allocator, io, obj_type, data),
+            .pack => |s| s.loose.writeRaw(allocator, io, obj_type, data),
         };
     }
 
@@ -57,6 +73,7 @@ pub const StorageBackend = union(enum) {
         return switch (self) {
             .loose => |s| s.exists(io, sha),
             .shard => |s| s.exists(io, sha),
+            .pack => |s| s.exists(sha),
         };
     }
 
@@ -64,6 +81,7 @@ pub const StorageBackend = union(enum) {
         return switch (self) {
             .loose => |s| s.delete(allocator, io, sha),
             .shard => |s| s.delete(allocator, io, sha),
+            .pack => |s| s.loose.delete(allocator, io, sha),
         };
     }
 
@@ -80,6 +98,27 @@ pub const StorageBackend = union(enum) {
     /// Each shard can live on a different physical volume for horizontal I/O scaling.
     pub fn shardBackend(git_dir: []const u8, num_shards: u8) StorageBackend {
         return .{ .shard = ShardStore.init(git_dir, num_shards) };
+    }
+
+    /// Whether the repository has any packfile in `objects/pack/`.
+    ///
+    /// A cheap directory peek: the pack store reads whatever is there, so this
+    /// only decides which backend to hand out. Opening a pack that turns out to
+    /// be unreadable leaves the loose fallback in place.
+    fn hasPacks(allocator: std.mem.Allocator, io: std.Io, git_dir: []const u8) bool {
+        const pack_dir = std.fmt.allocPrint(allocator, "{s}/objects/pack", .{git_dir}) catch return false;
+        defer allocator.free(pack_dir);
+
+        var dir = std.Io.Dir.cwd().openDir(io, pack_dir, .{ .iterate = true }) catch return false;
+        defer dir.close(io);
+
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".pack")) continue;
+            return true;
+        }
+        return false;
     }
 
     /// Select backend from config string.
@@ -142,6 +181,19 @@ pub const StorageBackend = union(enum) {
                 else
                     16;
                 return shardBackend(git_dir, num_shards);
+            }
+        }
+
+        // Packed history is invisible to a loose-only backend, so a repository
+        // that has any packfile gets the pack store. `PackStore` falls back to
+        // loose objects and alternates, so this covers the mixed case: a fresh
+        // fetch writes loose objects while the previous history sits in a pack.
+        if (hasPacks(allocator, io, git_dir)) {
+            if (PackStore.open(allocator, io, git_dir)) |store| {
+                return .{ .pack = store };
+            } else |_| {
+                // Unreadable packs fall back to loose rather than failing: a
+                // repository is still usable through whatever it has loose.
             }
         }
 

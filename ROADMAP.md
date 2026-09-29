@@ -84,12 +84,13 @@ commit history for the per-bug detail.
 
 | Feature | File | Status | Advantage over git |
 |---------|------|--------|-------------------|
-| Packfile v2 reader/writer | packfile.zig | Done | Identical format to git |
+| Packfile v2 writer | packfile.zig | Done | Identical format to git |
+| Packfile v2 reader | pack_store.zig | Done | Objects read out of `objects/pack/*.pack` |
 | Delta compression (xdelta) | packfile.zig | Done | 10x less space |
 | Topological sort (DAG-aware) | packfile.zig | Done | Sequential reads = cache hits |
 | Pack index O(log n) | packindex.zig | Done | Binary search vs linear scan |
-| Delta resolution | delta.zig | Done | Resolve delta chains |
-| mmap zero-copy | mmap.zig | Done | OS page cache |
+| Delta resolution | delta.zig, pack_store.zig | Done | `ofs_delta` and `ref_delta`, bases in packs or loose |
+| mmap zero-copy for `.idx` | mmap.zig | Done | OS page cache |
 | Thread pool | threadpool.zig | Done | Parallel operations |
 | Parallel stat | parallel.zig | Done | 100k files < 200ms |
 | Smart HTTP transport | smart_http.zig | Done | No git binary dependency |
@@ -328,6 +329,98 @@ than git does; both orders are valid, and the set is identical.
 Verified identical to git on the real 51 commit history -- set, order, `--all`,
 `-5`, `--skip=3`, `--reverse`, `--author`, `--grep` and a pathspec -- and on a
 synthetic repository with merges, a tag and a deletion.
+
+## Phase 7 -- Reading a repository git has packed (done)
+
+Every repository that has ever been `git gc`'d keeps most of its history inside
+`objects/pack/*.pack`, and `gitz` could not read a single byte of it. The
+format was never implemented on the read path: `PackIndex` and `PackReader`
+existed and were correct in outline, but `StorageBackend` only had `loose` and
+`shard` variants, so nothing ever called them. A repository that had been packed
+reported a history of a few dozen loose commits as if that were all of it.
+
+`core/pack_store.zig` is the new read path, wired in as a third
+`StorageBackend` variant. Reads consult packs first and fall back to loose
+objects and alternates; writes still go to loose objects, which is what git
+does. Repositories with no packfile get the plain loose backend, unchanged.
+
+Wiring it up exposed that the modules it depends on had never actually run, and
+none of them worked:
+
+- **The index magic was wrong.** `PackIndex.open` compared against
+  `0x377f3ab2`. git's `PACK_IDX_SIGNATURE` is `0xff744f63` -- the bytes
+  `ff 74 4f 63`. Every real index was rejected as corrupt, so the reader was
+  never reached at all.
+- **The integers were read byte-swapped.** The fanout and offset tables were
+  cast to `[]const u32` and read in the host's order. Git writes them in
+  network byte order, and x86 reads the reverse, so every offset came out
+  reversed -- and then looked larger than the packfile, so every lookup missed.
+  Both tables are now decoded with an explicit `.big`.
+- **`writeIndex` wrote the same wrong magic**, so an index gitz produced would
+  have been rejected by git as well as by its own reader. Its checksum was a run
+  of zeros; it is now the real SHA-1 of the file's contents.
+- **`mmap` produced a length-less slice.** `MmapFile.open` cast a pointer
+  without a length, so the slice ran to a sentinel byte and `data.len` had
+  nothing to do with the file size. Anything computed as `len - k` -- including
+  the offset table's position -- landed in the wrong place.
+- **The offset table is not always after the SHA list.** A 711 object index
+  written by git 2.55 here is 20980 bytes where the format predicts 18136: 4
+  extra bytes per object sit between the SHAs and the offsets, and git reads the
+  offsets from the position the plain layout does *not* predict. The table is
+  located from the end of the file instead, which gives the right answer for
+  both shapes and still leaves room for the optional 64-bit offset table.
+- **`ref_delta` skipped 20 bytes too many.** `getObjectAt` already consumes the
+  base id, so adding another 20 landed inside the compressed stream, which
+  inflated to nothing.
+- **A `ref_delta` base was re-serialized before the delta was applied.** A delta
+  applies to the base's *content*, but `GitObject.serialize` prepends
+  `"blob <len>\0"`, so the delta was applied to the wrong bytes. The base is now
+  read as raw content, the same way the `ofs_delta` path already did it.
+
+`gitz gc` refused to do anything at all in a repository holding a packfile,
+because an object reachable from a packed parent looked unreachable and pruning
+would have deleted live history. The reachability walk goes through
+`StorageBackend`, so it now spans loose and packed objects; only loose objects
+are removed, and a pack is never rewritten.
+
+Two more things became visible only once packed history could be read. Both are
+about `packed-refs`, the file git writes when it prunes the loose `refs/` tree,
+and both left `gitz` reporting an empty repository where git saw 52 commits:
+
+- Refs were resolved only from the loose tree, so a repository with no loose refs
+  had none at all. `Refs.read` falls back to `packed-refs`, and `list`/`listAll`
+  fold it in, with the loose spelling winning where both exist.
+- `gitz branch -d` deleted the loose file and stopped. When the ref existed only
+  in `packed-refs` the branch simply came back on the next read, so `delete`
+  now rewrites that file too, dropping a tag's peeled `^<sha>` line with its
+  entry.
+
+### `gitz log` dates (fixed here)
+
+With history finally visible, every date in it was wrong in four independent
+ways:
+
+- The commit's timezone was never applied, so a commit at `13:11 -0400` printed
+  as `17:11` -- the wall clock in UTC with the offset printed after it.
+- `std.time`'s month enum is numbered from one and was used as a zero-based
+  index, so September printed as October.
+- The day of the month is zero-based and was printed unsifted, so every commit
+  was a day early.
+- The weekday was `(day + 4) % 7` against an array already starting at the
+  epoch's own weekday, shifting every date by four days.
+- Seconds were space padded (`9: 5: 3`) rather than zero padded, and the day of
+  the month was padded when git leaves it bare.
+- Blank lines inside a commit message were dropped rather than indented, and a
+  separator was printed after the last commit as well as between them.
+
+`gitz log` and `gitz log --all` are now byte-identical to git over a clone whose
+52 commits live entirely in a packfile with no loose objects at all, as is
+`--oneline`. Every object in the pack was read back and re-hashed to its own id,
+which also exercises the delta chains. `gitz gc` leaves such a repository
+untouched and reports why.
+
+`--graph` still differs: git draws lanes and edges through merges, which is a
+renderer of its own and is not implemented here.
 
 ## Phase 5 -- Worktrees (phases 0-3 done) & Multi-Agent (phase 4 not started)
 

@@ -102,6 +102,7 @@ pub const ObjectStore = struct {
         return switch (self.backend) {
             .loose => "loose",
             .shard => "shard",
+            .pack => "pack",
         };
     }
 

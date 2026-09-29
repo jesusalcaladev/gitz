@@ -119,9 +119,46 @@ pub const Refs = struct {
         return std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited);
     }
 
+    /// Look a ref up in `packed-refs`, the file git uses to hold every ref in
+    /// one place.
+    ///
+    /// git prunes the loose `refs/heads/main` once it has written a ref there,
+    /// so a repository that has ever been `gc`'d keeps *no* loose refs at all.
+    /// Reading only loose files made every command in such a repository report
+    /// no commits, while `git` was perfectly happy. The loose file still wins,
+    /// because that is where a ref being updated lives.
+    fn readPackedRefs(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) ![20]u8 {
+        const path = try std.fmt.allocPrint(allocator, "{s}/packed-refs", .{self.repo.common_dir});
+        defer allocator.free(path);
+
+        const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch
+            return error.RefNotFound;
+        defer allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            // A line is `<sha> <refname>`, optionally followed by `^<peeled>` on
+            // the next line. `^` never starts a refname, so skipping it here is
+            // enough.
+            if (line[0] == '^') continue;
+
+            const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const sha_hex = line[0..space];
+            const name = std.mem.trim(u8, line[space + 1 ..], " \t\r");
+            if (name.len != refname.len) continue;
+            if (!std.mem.eql(u8, name, refname)) continue;
+            if (sha_hex.len != 40) continue;
+            return Sha1.fromHex(sha_hex) catch return error.InvalidRef;
+        }
+        return error.RefNotFound;
+    }
+
     pub fn read(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) ![20]u8 {
         const content = self.readFileContent(allocator, io, refname) catch {
-            return error.RefNotFound;
+            // No loose file: the ref may live in `packed-refs` instead.
+            return self.readPackedRefs(allocator, io, refname);
         };
         defer allocator.free(content);
 
@@ -177,13 +214,78 @@ pub const Refs = struct {
         try std.Io.File.writeStreamingAll(f, io, "\n");
     }
 
-    pub fn delete(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) !void {
-        if (!isValidRefName(refname)) return error.InvalidRefName;
+    /// The contents of `packed-refs`, or an empty list when there is no such file.
+fn packedRefsLines(self: Refs, allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/packed-refs", .{self.repo.common_dir});
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch return "";
+}
 
-        const ref_path = try self.dirFor(allocator, refname);
-        defer allocator.free(ref_path);
-        try std.Io.Dir.cwd().deleteFile(io, ref_path);
+/// Rewrite `packed-refs` with one entry per name in `updates`, leaving every
+/// other entry alone.
+///
+/// A ref written loose shadows the packed copy, so the packed line is dropped
+/// rather than replaced. Leaving it behind is what makes a delete look like it
+/// did nothing: git prunes the loose file after packing, so the stale line was
+/// all that remained and the branch came straight back.
+fn removeFromPackedRefs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    common_dir: []const u8,
+    refname: []const u8,
+) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/packed-refs", .{common_dir});
+    defer allocator.free(path);
+
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch return;
+    defer allocator.free(content);
+
+    var kept: std.Io.Writer.Allocating = .init(allocator);
+    defer kept.deinit();
+
+    // The peeled line `^<sha>` that follows a tag's entry belongs to that
+    // entry, so dropping the entry has to drop both.
+    var skip_peeled = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        if (raw.len == 0) continue;
+        const line = std.mem.trim(u8, raw, " \t\r");
+
+        if (skip_peeled and line.len > 0 and line[0] == '^') {
+            skip_peeled = false;
+            continue;
+        }
+        skip_peeled = false;
+
+        if (line.len > 0 and line[0] != '#' and line[0] != '^') {
+            if (std.mem.indexOfScalar(u8, line, ' ')) |space| {
+                const name = std.mem.trim(u8, line[space + 1 ..], " \t\r");
+                if (std.mem.eql(u8, name, refname)) {
+                    skip_peeled = true;
+                    continue;
+                }
+            }
+        }
+        try kept.writer.writeAll(raw);
+        try kept.writer.writeAll("\n");
     }
+
+    const out = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer out.close(io);
+    try std.Io.File.writeStreamingAll(out, io, kept.written());
+}
+
+pub fn delete(self: Refs, allocator: std.mem.Allocator, io: std.Io, refname: []const u8) !void {
+    if (!isValidRefName(refname)) return error.InvalidRefName;
+
+    const ref_path = try self.dirFor(allocator, refname);
+    defer allocator.free(ref_path);
+    std.Io.Dir.cwd().deleteFile(io, ref_path) catch {};
+
+    // The ref may only exist in `packed-refs`, where a missing loose file is
+    // the normal state rather than an error, so deleting it must not fail.
+    removeFromPackedRefs(allocator, io, self.repo.common_dir, refname) catch {};
+}
 
     /// Describe HEAD.
     ///
@@ -228,23 +330,131 @@ pub const Refs = struct {
     /// the intermediate directory `refs/heads/feature` as if it were the ref,
     /// hiding `feature/login` from `gitz branch`, `log --all` and reachability
     /// walks in `gc`.
-    pub fn list(self: Refs, allocator: std.mem.Allocator, io: std.Io, subcategory: []const u8) ![][]const u8 {
+    /// The refs in one namespace (`heads`, `tags`, `remotes`), loose and packed.
+///
+/// `packed-refs` is included because after a `git gc` the directory is simply
+/// empty: listing it alone reported a repository with no branches at all.
+pub fn list(self: Refs, allocator: std.mem.Allocator, io: std.Io, subcategory: []const u8) ![][]const u8 {
         const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs/{s}", .{ self.repo.common_dir, subcategory });
         defer allocator.free(dir_path);
 
         const prefix = try std.fmt.allocPrint(allocator, "refs/{s}", .{subcategory});
         defer allocator.free(prefix);
 
-        return listDirRaw(allocator, io, dir_path, prefix, 0) catch &.{};
+        var all = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (all.items) |r| allocator.free(r);
+            all.deinit(allocator);
+        }
+
+        {
+            const loose = listDirRaw(allocator, io, dir_path, prefix, 0) catch &.{};
+            defer {
+                for (loose) |r| allocator.free(r);
+                allocator.free(loose);
+            }
+            for (loose) |name| {
+                const copy = try allocator.dupe(u8, name);
+                all.append(allocator, copy) catch {
+                    allocator.free(copy);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+
+        const content = packedRefsLines(self, allocator, io) catch "";
+        defer if (content.len > 0) allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+            const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const name = std.mem.trim(u8, line[space + 1 ..], " \t\r");
+            if (name.len <= prefix.len or !std.mem.startsWith(u8, name, prefix)) continue;
+            if (name[prefix.len] != '/') continue;
+
+            var already = false;
+            for (all.items) |existing| {
+                if (std.mem.eql(u8, existing, name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+
+            const copy = try allocator.dupe(u8, name);
+            all.append(allocator, copy) catch {
+                allocator.free(copy);
+                return error.OutOfMemory;
+            };
+        }
+
+        return all.toOwnedSlice(allocator);
     }
 
     /// List every ref in the repository, regardless of namespace
     /// (`refs/heads`, `refs/tags`, `refs/remotes`, `refs/stash`, ...).
-    pub fn listAll(self: Refs, allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
+    /// Every ref in the repository, loose or packed.
+///
+/// The loose `refs/` tree is walked first and `packed-refs` is folded in
+/// afterwards, keeping the loose spelling when both hold the same name. A
+/// repository that has been `git gc`'d keeps *no* loose refs at all, so listing
+/// only the directory reported an empty repository: `gitz branch` printed
+/// nothing and `--all` walks started from nothing.
+pub fn listAll(self: Refs, allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
         const dir_path = try std.fmt.allocPrint(allocator, "{s}/refs", .{self.repo.common_dir});
         defer allocator.free(dir_path);
 
-        return listDirRaw(allocator, io, dir_path, "refs", 0) catch &.{};
+        var all: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+        errdefer {
+            for (all.items) |r| allocator.free(r);
+            all.deinit(allocator);
+        }
+
+        {
+            const loose = listDirRaw(allocator, io, dir_path, "refs", 0) catch &.{};
+            defer {
+                for (loose) |r| allocator.free(r);
+                allocator.free(loose);
+            }
+            for (loose) |name| {
+                const copy = try allocator.dupe(u8, name);
+                all.append(allocator, copy) catch {
+                    allocator.free(copy);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+
+        const content = packedRefsLines(self, allocator, io) catch "";
+        defer if (content.len > 0) allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+            const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const name = std.mem.trim(u8, line[space + 1 ..], " \t\r");
+            if (name.len == 0) continue;
+
+            var already: ?usize = null;
+            for (all.items, 0..) |existing, i| {
+                if (std.mem.eql(u8, existing, name)) {
+                    already = i;
+                    break;
+                }
+            }
+            if (already != null) continue;
+
+            const copy = try allocator.dupe(u8, name);
+            all.append(allocator, copy) catch {
+                allocator.free(copy);
+                return error.OutOfMemory;
+            };
+        }
+
+        return all.toOwnedSlice(allocator);
     }
 
     /// The `worktrees/` admin directory, where linked worktrees keep their

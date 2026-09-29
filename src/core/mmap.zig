@@ -34,7 +34,12 @@ pub const MmapFile = struct {
         _ = linux.close(@intCast(fd));
 
         return .{
-            .data = @ptrCast(mapped_ptr),
+            // The length is the file size that was just measured. Casting the
+            // pointer on its own would build the slice from a sentinel, and the
+            // search for the terminator yields a length unrelated to the file
+            // -- which is enough to make a table located by
+            // `len - something` land in the wrong place entirely.
+            .data = @as([*]const u8, @ptrCast(mapped_ptr))[0..size],
             .mapped = true,
         };
     }
@@ -42,7 +47,8 @@ pub const MmapFile = struct {
     /// Close and unmap the file.
     pub fn close(self: *MmapFile) void {
         if (self.mapped and self.data.len > 0) {
-            std.posix.munmap(@alignCast(@ptrCast(self.data.ptr)));
+            // munmap takes the mapped slice, not a bare pointer.
+            std.posix.munmap(@alignCast(self.data));
             self.mapped = false;
         } else if (self.data.len > 0) {
             std.heap.page_allocator.free(@constCast(self.data));

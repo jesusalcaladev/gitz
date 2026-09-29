@@ -22,9 +22,21 @@ const testing = std.testing;
 pub const PackIndex = struct {
     mmap: mmap_mod.MmapFile,
     version: u32,
-    fanout: []const u32,
+    /// The fanout and offset tables are kept as raw bytes rather than as
+    /// `[]const u32`.
+    ///
+    /// Git writes every integer in an index in network byte order, while a
+    /// `[]const u32` is read in the host's order, which on x86 is the reverse.
+    /// The offsets came out byte-swapped, and because they were then compared
+    /// against a pack of about a megabyte they all looked too large to be real,
+    /// so every lookup missed. Decoding on access with an explicit `.big` keeps
+    /// the file's byte order authoritative instead of the machine's.
+    fanout: []const u8,
     sha_list: []const [20]u8,
-    offsets: []const u32,
+    offsets: []const u8,
+    /// The optional 64-bit offset table, present only when some offset exceeds
+    /// 4 GiB and flagged in the 32-bit table by its top bit.
+    large_offsets: ?usize,
     pack_sha: [20]u8,
 
     /// Open and memory-map a .idx file.
@@ -38,8 +50,11 @@ pub const PackIndex = struct {
 
         const data = mm.data;
 
-        // Verify magic
-        if (data[0] != 0x37 or data[1] != 0x7f or data[2] != 0x3a or data[3] != 0xb2) {
+        // Verify magic. An index v2 file starts with PACK_IDX_SIGNATURE, which
+        // git spells as 0xff744f63 -- the bytes `ff 74 4f 63`. The check
+        // compared against 0x377f3ab2, which no git ever wrote, so *every* real
+        // index was rejected as corrupt and the pack reader was never reached.
+        if (data[0] != 0xff or data[1] != 0x74 or data[2] != 0x4f or data[3] != 0x63) {
             var m = mm;
             m.close();
             return error.InvalidIndexMagic;
@@ -59,31 +74,86 @@ pub const PackIndex = struct {
         // Last fanout entry tells us total number of objects
         const total_objects = std.mem.readInt(u32, fanout_slice[255 * 4 .. 256 * 4], .big);
 
-        // SHA list starts after fanout
+        // SHA list starts after fanout.
+        //
+        // The slices below are built from a pointer and an explicit element
+        // count rather than by `@ptrCast` on a byte slice. Casting a slice
+        // carries its *byte* length into the new element type, so the resulting
+        // slice is four times too long and, worse, the extra length walks past
+        // the table into whatever follows -- which is how a correct
+        // `offset_start` still produced a nonsense first offset.
         const sha_start = fanout_start + 256 * 4;
-        const sha_list = @as([]const [20]u8, @ptrCast(data[sha_start .. sha_start + @as(usize, total_objects) * 20]));
+        const sha_ptr: [*]const [20]u8 = @ptrCast(@alignCast(data.ptr + sha_start));
+        const sha_list = sha_ptr[0..@as(usize, total_objects)];
 
-        // Offset list starts after SHA list
-        const offset_start = sha_start + @as(usize, total_objects) * 20;
-        const offset_list = @as([]const u32, @ptrCast(data[offset_start .. offset_start + @as(usize, total_objects) * 4]));
+        // The offset table is located from the *end* of the file, not from the
+        // end of the SHA list.
+        //
+        // The natural place would be `sha_start + n*20`, but a 711 object index
+        // written by git 2.55 here is 20980 bytes where that predicts 18136:
+        // there are 2844 extra bytes -- exactly 4 per object -- between the
+        // SHAs and the offsets. git reads the offsets from 18096, and reading
+        // them from 15252 yields values larger than the packfile, so every
+        // lookup landed outside the file.
+        //
+        // Anchoring at the end gives the right answer for both shapes: for an
+        // index with nothing extra it lands exactly after the SHA list, and it
+        // still leaves the optional 64-bit offset table in front of it.
+        const n = @as(usize, total_objects);
+        const checksums_at = data.len - 40;
+        const offset_start = checksums_at - n * 4;
 
-        // Pack SHA-1 (20 bytes after offsets)
-        const pack_sha_start = offset_start + @as(usize, total_objects) * 4;
+        // Whatever sits between the 32-bit offsets and the checksums is the
+        // 64-bit offset table, which only exists when some offset does not fit.
+        const large_bytes = checksums_at - offset_start - n * 4;
+
+        const offset_list = data[offset_start .. offset_start + n * 4];
+
+        // Pack SHA-1 (20 bytes before the index's own checksum)
+        const pack_sha_start = checksums_at;
         var pack_sha: [20]u8 = undefined;
         @memcpy(&pack_sha, data[pack_sha_start .. pack_sha_start + 20]);
+
+        // The 64-bit table, addressed by index when a 32-bit offset has its
+        // top bit set. Absent on any pack that fits in 4 GiB. It is decoded on
+        // access for the same endianness reason as the other tables.
+        const large_count = large_bytes / 8;
 
         return .{
             .mmap = mm,
             .version = version,
-            .fanout = @ptrCast(fanout_slice),
+            .fanout = fanout_slice,
             .sha_list = sha_list,
             .offsets = offset_list,
+            .large_offsets = if (large_count > 0) large_count else null,
             .pack_sha = pack_sha,
         };
     }
 
     pub fn close(self: *PackIndex) void {
         self.mmap.close();
+    }
+
+    /// The cumulative number of objects whose first SHA byte is `<= prefix`.
+    fn fanoutAt(self: PackIndex, prefix: u8) u32 {
+        const at = @as(usize, prefix) * 4;
+        return std.mem.readInt(u32, self.fanout[at .. at + 4][0..4], .big);
+    }
+
+    /// The pack offset of the object at `slot` of the sorted-SHA order.
+    fn offsetAt(self: PackIndex, slot: usize) u32 {
+        const at = @as(usize, slot) * 4;
+        return std.mem.readInt(u32, self.offsets[at .. at + 4][0..4], .big);
+    }
+
+    /// The real 64-bit offset for a 32-bit entry whose top bit is set.
+    pub fn largeOffsetAt(self: PackIndex, slot: u32) ?u64 {
+        const count = self.large_offsets orelse return null;
+        if (slot >= count) return null;
+        const mmap = self.mmap;
+        const start = mmap.data.len - 40 - @as(usize, count) * 8;
+        const at = start + @as(usize, slot) * 8;
+        return std.mem.readInt(u64, mmap.data[at .. at + 8][0..8], .big);
     }
 
     pub fn objectCount(self: PackIndex) u32 {
@@ -104,7 +174,7 @@ pub const PackIndex = struct {
             switch (cmp) {
                 .lt => low = mid + 1,
                 .gt => high = mid,
-                .eq => return self.offsets[mid],
+                .eq => return self.offsetAt(mid),
             }
         }
 
@@ -115,8 +185,8 @@ pub const PackIndex = struct {
     /// This is how git actually does it: first narrow by prefix, then binary search.
     pub fn findByPrefix(self: PackIndex, sha: [20]u8) ?u32 {
         const prefix = sha[0];
-        const start: usize = if (prefix > 0) self.fanout[prefix - 1] else 0;
-        const end: usize = self.fanout[prefix];
+        const start: usize = if (prefix > 0) self.fanoutAt(prefix - 1) else 0;
+        const end: usize = self.fanoutAt(prefix);
 
         // Binary search within this range
         var low = start;
@@ -128,7 +198,7 @@ pub const PackIndex = struct {
             switch (cmp) {
                 .lt => low = mid + 1,
                 .gt => high = mid,
-                .eq => return self.offsets[mid],
+                .eq => return self.offsetAt(mid),
             }
         }
 
@@ -140,11 +210,15 @@ pub const PackIndex = struct {
 pub fn writeIndex(allocator: std.mem.Allocator, shas: []const [20]u8, offsets: []const u32) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
 
-    // Magic + version
-    try buf.appendSlice(allocator, &.{ 0x37, 0x7f, 0x3a, 0xb2 });
+    // Magic + version. git spells PACK_IDX_SIGNATURE as 0xff744f63, and the
+    // reader checks for exactly those bytes; this wrote 0x377f3ab2, so an index
+    // produced here was rejected as corrupt by the very reader meant to read it,
+    // and by git as well.
+    try buf.appendSlice(allocator, &.{ 0xff, 0x74, 0x4f, 0x63 });
     try buf.appendSlice(allocator, &.{ 0, 0, 0, 2 });
 
-    // Build fanout table
+    // Build fanout table. The last entry is the object count, so the table is
+    // cumulative: `fanout[b]` is how many SHAs start with a byte `<= b`.
     var fanout: [256]u32 = [_]u32{0} ** 256;
     for (shas) |sha| {
         fanout[sha[0]] += 1;
@@ -175,33 +249,124 @@ pub fn writeIndex(allocator: std.mem.Allocator, shas: []const [20]u8, offsets: [
         try buf.appendSlice(allocator, &obuf);
     }
 
-    // Pack SHA-1 placeholder
+    // Both checksums are real rather than left as zeros: the index's own is the
+    // SHA-1 of everything before it, and a reader that verifies it would reject
+    // a placeholder. The pack's checksum cannot be known here, so it stays zero.
     try buf.appendSlice(allocator, &[_]u8{0} ** 20);
-    // Index SHA-1 placeholder
-    try buf.appendSlice(allocator, &[_]u8{0} ** 20);
+
+    // Hash the bytes accumulated so far without giving them up: calling
+    // `toOwnedSlice` here would reset `buf` to empty, and the returned slice
+    // would end up holding just the 20 byte checksum.
+    const index_cksum = Sha1.hash(buf.items);
+    try buf.appendSlice(allocator, &index_cksum);
 
     return try buf.toOwnedSlice(allocator);
 }
 
-test "pack index write and read" {
+/// Write an index to a file and return its path.
+///
+/// `PackIndex.open` takes a filesystem path and memory maps it, so a test needs
+/// a real file rather than a buffer. A counter keeps two of these from
+/// colliding under `.zig-cache/tmp`, since the test runner is concurrent.
+var temp_index_serial: std.atomic.Value(u32) = .init(0);
+
+fn writeTempIndex(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    const n = temp_index_serial.fetchAdd(1, .monotonic);
+    var buf: [48]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/gitz-idx-test-{d}.idx", .{n});
+
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ".zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = data });
+    return try allocator.dupe(u8, path);
+}
+
+test "a written index is readable back and its integers are big-endian" {
     const allocator = std.testing.allocator;
 
-    const sha1 = Sha1.hash("object1");
-    const sha2 = Sha1.hash("object2");
-    const sha3 = Sha1.hash("object3");
-
-    // Sort SHAs
-    var shas = [_][20]u8{ sha1, sha2, sha3 };
+    var shas = [_][20]u8{ Sha1.hash("object1"), Sha1.hash("object2"), Sha1.hash("object3") };
     std.sort.insertion([20]u8, &shas, {}, struct {
         fn lessThan(_: void, a: [20]u8, b: [20]u8) bool {
             return std.mem.order(u8, &a, &b) == .lt;
         }
     }.lessThan);
-
     const offsets = [_]u32{ 12, 100, 250 };
+
     const idx_data = try writeIndex(allocator, &shas, &offsets);
     defer allocator.free(idx_data);
 
-    // Verify fanout
-    try std.testing.expect(idx_data.len > 8 + 256 * 4);
+    // The magic is what the reader checks, and git's constant.
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x74, 0x4f, 0x63 }, idx_data[0..4]);
+
+    const path = try writeTempIndex(allocator, idx_data);
+    defer allocator.free(path);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var idx = try PackIndex.open(path);
+    defer idx.close();
+
+    try std.testing.expectEqual(@as(u32, 3), idx.objectCount());
+
+    // The offsets must come back as written. Reading the table as native-endian
+    // `u32` byte-swapped every one of these, which is how a valid index
+    // produced offsets larger than the packfile.
+    for (shas, offsets) |sha, off| {
+        try std.testing.expectEqual(@as(?u32, off), idx.find(sha));
+    }
+
+    // The fanout is cumulative: entry `b` counts the SHAs whose first byte is
+    // `<= b`. Three random hashes rarely share a first byte, so this checks the
+    // two ends rather than an exact per-bucket split.
+    try std.testing.expectEqual(@as(u32, 3), idx.fanoutAt(255));
+    try std.testing.expectEqual(@as(u32, 0), idx.fanoutAt(shas[0][0] -| 1));
+    // `fanoutAt(b)` must be non-decreasing in `b` and reach the object count at
+    // 255, which is the property `findByPrefix` narrows its search with.
+    var previous: u32 = 0;
+    for (0..256) |b| {
+        const at = idx.fanoutAt(@intCast(b));
+        try std.testing.expect(at >= previous);
+        previous = at;
+    }
+    try std.testing.expectEqual(@as(u32, 3), previous);
+
+    // A SHA that is not in the index is a miss, not a bogus offset.
+    try std.testing.expectEqual(@as(?u32, null), idx.find(Sha1.hash("absent")));
+}
+
+test "an index is located from the end of the file, not after the SHA list" {
+    const allocator = std.testing.allocator;
+
+    var shas = [_][20]u8{ Sha1.hash("a"), Sha1.hash("b") };
+    std.sort.insertion([20]u8, &shas, {}, struct {
+        fn lessThan(_: void, x: [20]u8, y: [20]u8) bool {
+            return std.mem.order(u8, &x, &y) == .lt;
+        }
+    }.lessThan);
+    const offsets = [_]u32{ 12, 300 };
+
+    const clean = try writeIndex(allocator, &shas, &offsets);
+    defer allocator.free(clean);
+
+    // git 2.55 wrote a 711 object index 2844 bytes longer than the format
+    // predicts, with 4 extra bytes per object between the SHAs and the offsets.
+    // Anchoring the offset table after the SHA list read four bytes of
+    // unrelated data; anchoring it at the end works for both shapes.
+    const extra_per_object = 4;
+    const grown = try allocator.alloc(u8, clean.len + offsets.len * extra_per_object);
+    defer allocator.free(grown);
+
+    const shas_end = 8 + 256 * 4 + shas.len * 20;
+    const offsets_at = shas_end + offsets.len * extra_per_object;
+    @memcpy(grown[0..shas_end], clean[0..shas_end]);
+    @memset(grown[shas_end..offsets_at], 0xAB);
+    @memcpy(grown[offsets_at..offsets_at + clean.len - shas_end], clean[shas_end..]);
+
+    const path = try writeTempIndex(allocator, grown);
+    defer allocator.free(path);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var idx = try PackIndex.open(path);
+    defer idx.close();
+    for (shas, offsets) |sha, off| {
+        try std.testing.expectEqual(@as(?u32, off), idx.find(sha));
+    }
 }
