@@ -5,6 +5,7 @@ const object = @import("../core/object.zig");
 const packfile_mod = @import("../core/packfile.zig");
 const zlib_mod = @import("../core/zlib.zig");
 const Repo = @import("../core/repo.zig").Repo;
+const pktline = @import("../core/pktline.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -50,23 +51,14 @@ pub const SshTransport = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
-        var refs = std.ArrayList(RemoteRef).empty;
-        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-        while (lines.next()) |line| {
-            if (line.len >= 41 and line[40] == ' ') {
-                const sha_hex = line[0..40];
-                const name = std.mem.trim(u8, line[41..], &[_]u8{ '\n', '\r', ' ' });
-                if (name.len > 0) {
-                    const sha = Sha1.fromHex(sha_hex) catch continue;
-                    try refs.append(self.allocator, .{
-                        .name = try self.allocator.dupe(u8, name),
-                        .sha = sha,
-                    });
-                }
-            }
-        }
-
-        return try refs.toOwnedSlice(self.allocator);
+        // The advertisement is pkt-line framed, so each ref is preceded by a
+        // four-hex-digit length and the first one carries the server
+        // capabilities after a NUL. This used to be read as plain `<sha>
+        // <name>` lines, which matched nothing, so `gitz clone`, `fetch` and
+        // `push` all reported "no refs found on remote" against any real
+        // server. `pktline.parseRefs` is the same parser the HTTP transport
+        // uses, and it already handles the NUL capability suffix.
+        return pktline.parseRefs(self.allocator, result.stdout);
     }
 
     /// Fetch objects via SSH
@@ -100,13 +92,51 @@ pub const SshTransport = struct {
         try argv.append(self.allocator, "git-upload-pack");
         try argv.append(self.allocator, self.path);
 
-        const result = std.process.run(self.allocator, self.io, .{
+        // The wants have to reach the server, so this cannot use
+        // `std.process.run`: that helper hardcodes `.stdin = .ignore`, so the
+        // `input` built above was discarded and the server sent no pack at all.
+        // The fetch then "succeeded" having written zero objects, and the
+        // following checkout failed with nothing to check out.
+        var child = std.process.spawn(self.io, .{
             .argv = argv.items,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            // Inherited rather than piped: reading stdout to completion while a
+            // stderr pipe sits unread can deadlock once the server writes more
+            // error output than the pipe buffer holds. upload-pack reports
+            // protocol-level errors on stdout, so nothing is lost.
+            .stderr = .inherit,
         }) catch return error.SshError;
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
 
-        try self.parsePackfile(repo, result.stdout);
+        if (child.stdin) |*stdin| {
+            const fd = stdin.handle;
+            var written: usize = 0;
+            while (written < input.items.len) {
+                const n = std.os.linux.write(@intCast(fd), input.items[written..].ptr, input.items.len - written);
+                if (n <= 0) return error.SshError;
+                written += n;
+            }
+            stdin.close(self.io);
+            child.stdin = null;
+        }
+
+        var stdout_buf: [64 * 1024]u8 = undefined;
+        var stdout_data: std.ArrayList(u8) = .empty;
+        defer stdout_data.deinit(self.allocator);
+        while (child.stdout) |*f| {
+            const n = std.Io.File.readStreaming(f.*, self.io, &.{&stdout_buf}) catch break;
+            if (n == 0) break;
+            stdout_data.appendSlice(self.allocator, stdout_buf[0..n]) catch break;
+        }
+
+        const term = child.wait(self.io) catch return error.SshError;
+        const exit_code: i32 = switch (term) {
+            .exited => |code| @intCast(code),
+            else => -1,
+        };
+        if (exit_code != 0) return error.FetchFailed;
+
+        try self.parsePackfile(repo, stdout_data.items);
     }
 
     /// Push objects via SSH
@@ -387,10 +417,9 @@ pub const SshTransport = struct {
     }
 };
 
-pub const RemoteRef = struct {
-    name: []const u8,
-    sha: [20]u8,
-};
+/// The shared pkt-line parser defines its own, identical shape. Aliasing it
+/// keeps one definition instead of three copies of the same struct.
+pub const RemoteRef = pktline.RemoteRef;
 
 const SshUrl = struct {
     host: []const u8,

@@ -82,8 +82,8 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
             allocator.free(refs);
         }
 
-        ssh_transport.fetch(repo, refs, have_slice) catch {
-            try io.print("Note: SSH fetch failed, falling back to git\n", .{});
+        ssh_transport.fetch(repo, refs, have_slice) catch |ferr| {
+            try io.print("Note: SSH fetch failed ({s}), falling back to git\n", .{@errorName(ferr)});
             try fetchViaGit(allocator, git_dir, name, io);
             return;
         };
