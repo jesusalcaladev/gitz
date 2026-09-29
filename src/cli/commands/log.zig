@@ -23,7 +23,14 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     var skip: usize = 0;
     var author_filter: ?[]const u8 = null;
     var grep_filter: ?[]const u8 = null;
+    // `gitz log show <rev>`: print a single commit, like `git show`.
     var show_commit: ?[]const u8 = null;
+    // A bare revision argument: where the history walk starts, like
+    // `git log <rev>`. This is not the same thing as `show` -- a revision
+    // argument lists the history *from* that point, it does not print one
+    // commit, and routing it through the show path was why `gitz log main`
+    // printed one commit instead of the 51 behind it.
+    var start_rev: ?[]const u8 = null;
     var file_path: ?[]const u8 = null;
     var reverse = false;
     var decorate = false;
@@ -35,6 +42,12 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
         for (pathspecs.items) |p| allocator.free(p);
         pathspecs.deinit(allocator);
     }
+
+    // A single positional is owned by whichever of `show_commit` / `file_path`
+    // ends up holding it, so that clearing the list below does not leak it and
+    // the list's own teardown does not free it out from under the holder.
+    var sole_positional: ?[]const u8 = null;
+    defer if (sole_positional) |sp| allocator.free(sp);
 
     var after_separator = false;
     var i: usize = 0;
@@ -95,6 +108,11 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
         } else if (std.mem.eql(u8, arg, "--skip") and i + 1 < args.len) {
             i += 1;
             skip = std.fmt.parseInt(usize, args[i], 10) catch 0;
+        } else if (std.mem.startsWith(u8, arg, "--skip=")) {
+            // `--grep=` and `--max-count=` both accepted the attached form, so
+            // `--skip=3` was the odd one out: it fell through, the value was
+            // never read, and `gitz log --skip=3` printed the whole history.
+            skip = std.fmt.parseInt(usize, arg["--skip=".len..], 10) catch 0;
         } else if (std.mem.eql(u8, arg, "show") and i + 1 < args.len) {
             i += 1;
             show_commit = args[i];
@@ -117,12 +135,21 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     }
 
     // A single positional may be a revision to log, or a path to filter by.
+    //
+    // Ownership moves to `sole_positional`. Two things went wrong here before:
+    // freeing the string here while `show_commit` kept the pointer made
+    // `gitz log origin/main` read freed memory and die, and clearing the list
+    // with `pathspecs.items = &.{}` replaced the list's buffer pointer with a
+    // static empty slice, so its own `deinit` then freed a pointer that never
+    // came from the allocator. Setting the length to zero is the correct way to
+    // stop owning the element.
     if (pathspecs.items.len == 1) {
         const only = pathspecs.items[0];
+        pathspecs.items.len = 0;
+        sole_positional = only;
+
         if (show_all or isRevisionLike(allocator, io, repo, only)) {
-            show_commit = only;
-            allocator.free(only);
-            pathspecs.items = &.{};
+            start_rev = only;
         } else {
             file_path = only;
         }
@@ -134,174 +161,116 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     var alts = try alternates_mod.Reader.init(allocator, io.io, repo.common_dir);
     defer alts.deinit();
 
-    // Show a specific commit
-    if (show_commit) |sha_str| {
-        try showSpecificCommit(allocator, repo, sha_str, io, &alts);
-        return;
-    }
-
     const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     const refs_manager = refs_mod.Refs.init(repo);
 
+    // `gitz log show <rev>` prints one commit and stops.
+    if (show_commit) |spec| {
+        try showSpecificCommit(allocator, repo, spec, io, &alts);
+        return;
+    }
+
     if (show_all) {
-        // Show all branches
-        const branches = try refs_manager.list(allocator, io.io, "heads");
+        // Every ref in the repository, not just local branches. `--all` listed
+        // only `refs/heads/*`, so a freshly fetched repository -- which has
+        // `refs/remotes/origin/*` and usually no local branch yet -- printed
+        // nothing at all.
+        //
+        // Walking each ref separately printed the shared history once per ref
+        // (106 lines for a 51 commit repository). git walks all the tips
+        // together with one visited set, so a commit reachable from several
+        // branches appears once, in committer-date order.
+        const all_refs = refs_manager.listAll(allocator, io.io) catch &.{};
         defer {
-            for (branches) |b| allocator.free(b);
-            allocator.free(branches);
+            for (all_refs) |r| allocator.free(r);
+            allocator.free(all_refs);
         }
 
-        for (branches) |branch_ref| {
-            const branch_sha = refs_manager.read(allocator, io.io, branch_ref) catch continue;
-            const branch_name = if (std.mem.startsWith(u8, branch_ref, "refs/heads/"))
-                branch_ref[11..]
-            else
-                branch_ref;
+        var tips: std.ArrayList([20]u8) = .empty;
+        defer tips.deinit(allocator);
+        for (all_refs) |ref_name| {
+            // `refs/stash` is a log, not a commit, so there is nothing to walk.
+            if (std.mem.eql(u8, ref_name, "refs/stash")) continue;
+            const tip = refs_manager.read(allocator, io.io, ref_name) catch continue;
+            // Duplicate tips are left in: the walk's visited set is what dedups,
+            // and marking them here instead made the walk skip every tip.
+            try tips.append(allocator, tip);
+        }
 
-            try io.print("Branch: {s}\n", .{branch_name});
-            var shown: usize = 0;
-            var current_sha = branch_sha;
+        var all_commits: std.ArrayList(Collected) = .empty;
+        defer freeCollected(allocator, &all_commits);
+        try walkHistory(allocator, io, store, &alts, tips.items, &all_commits);
 
-            while (shown < (count orelse std.math.maxInt(usize))) {
-                const obj = readWithAlternates(allocator, io.io, store, &alts, current_sha) catch break;
-                defer obj.deinit(allocator);
-                const commit = switch (obj) {
-                    .commit => |c| c,
-                    else => break,
-                };
-
-                if (author_filter) |af| {
-                    if (std.mem.indexOf(u8, commit.author.name, af) == null and
-                        std.mem.indexOf(u8, commit.author.email, af) == null)
-                    {
-                        if (commit.parents.len > 0) {
-                            current_sha = commit.parents[0];
-                        } else break;
-                        continue;
-                    }
-                }
-
-                if (grep_filter) |gf| {
-                    if (std.mem.indexOf(u8, commit.message, gf) == null) {
-                        if (commit.parents.len > 0) {
-                            current_sha = commit.parents[0];
-                        } else break;
-                        continue;
-                    }
-                }
-
-                try printCommit(allocator, io, current_sha, commit, oneline, graph);
-                shown += 1;
-                if (commit.parents.len > 0) {
-                    current_sha = commit.parents[0];
-                } else break;
-            }
-            try io.print("\n", .{});
+        const shown = @min(count orelse all_commits.items.len, all_commits.items.len);
+        var n: usize = 0;
+        while (n < shown) : (n += 1) {
+            const item = all_commits.items[n];
+            try printCommit(allocator, io, item.sha, item.commit, oneline, graph);
+            if (decorate) try printDecoration(allocator, repo, io, item.sha);
+            if (show_diff) try printCommitDiff(allocator, repo, io, item.sha, item.commit, stat_only, name_only);
         }
         return;
     }
 
-    // Normal log - follow HEAD
-    const head_sha = refs_manager.read(allocator, io.io, "HEAD") catch {
-        try io.print("No commits yet\n", .{});
-        return;
-    };
+    // Where the walk starts: the given revision, or HEAD.
+    const head_sha = if (start_rev) |spec|
+        resolveRevision(allocator, io, refs_manager, store, spec) catch {
+            try io.eprint("fatal: bad revision '{s}'\n", .{spec});
+            return;
+        }
+    else
+        refs_manager.read(allocator, io.io, "HEAD") catch {
+            try io.print("No commits yet\n", .{});
+            return;
+        };
 
     // `--skip` drops the first N matching commits, and `--reverse` walks the
     // other way. Both were silently ignored.
-    var collected = std.ArrayList(struct { sha: [20]u8, commit: object.Commit }).empty;
-    defer collected.deinit(allocator);
+    //
+    // The walk used to be a single chain over `parents[0]`, which is
+    // first-parent: everything behind a merge was invisible, and `gitz log` on
+    // a repository with merges reported a fraction of what git shows.
+    var collected: std.ArrayList(Collected) = .empty;
+    defer freeCollected(allocator, &collected);
 
-    var current_sha = head_sha;
+    const one = [_][20]u8{head_sha};
+    var reachable: std.ArrayList(Collected) = .empty;
+    defer freeCollected(allocator, &reachable);
+    try walkHistory(allocator, io, store, &alts, one[0..], &reachable);
 
-    const limit = count orelse std.math.maxInt(usize);
-    // Bounded so a corrupt graph containing a cycle cannot spin forever.
-    var steps: usize = 0;
-    const max_steps: usize = 1_000_000;
-
-    while (steps < max_steps) {
-        steps += 1;
-
-        const obj = readWithAlternates(allocator, io.io, store, &alts, current_sha) catch break;
-        const commit = switch (obj) {
-            .commit => |c| c,
-            else => {
-                obj.deinit(allocator);
-                break;
-            },
-        };
-        const this_sha = current_sha;
-
-        // The parent list is copied *before* the object is freed. Reading
-        // `commit.parents` after `deinit` returned freed memory, so the walk
-        // stopped after one or two commits and `--skip`/`--reverse` had nothing
-        // to work with.
-        const has_parent = commit.parents.len > 0;
-        const parent_sha: [20]u8 = if (has_parent) commit.parents[0] else [_]u8{0} ** 20;
-
+    // Filters are applied after the walk so that every branch of the history is
+    // considered, not just the first-parent chain.
+    for (reachable.items) |item| {
         var keep = true;
-
         if (author_filter) |af| {
-            keep = std.mem.indexOf(u8, commit.author.name, af) != null or
-                std.mem.indexOf(u8, commit.author.email, af) != null;
+            keep = std.mem.indexOf(u8, item.commit.author.name, af) != null or
+                std.mem.indexOf(u8, item.commit.author.email, af) != null;
         }
-
         if (keep) {
-            if (grep_filter) |gf| {
-                keep = std.mem.indexOf(u8, commit.message, gf) != null;
-            }
+            if (grep_filter) |gf| keep = std.mem.indexOf(u8, item.commit.message, gf) != null;
         }
-
-        if (keep) {
-            // Only commits whose diff touches one of the paths. The old check
-            // was "does the file exist in this commit's tree", which listed
-            // every commit after the file was added and never matched a nested
-            // path.
-            if (file_path) |fp| {
-                keep = commitTouchesFile(allocator, io.io, &store, &alts, commit, fp);
-            } else if (multi_pathspecs.len > 0) {
-                for (multi_pathspecs) |p| {
-                    if (commitTouchesFile(allocator, io.io, &store, &alts, commit, p)) {
-                        keep = true;
-                        break;
-                    }
+        if (keep and file_path != null) {
+            keep = commitTouchesFile(allocator, io.io, &store, &alts, item.commit, file_path.?);
+        } else if (keep and multi_pathspecs.len > 0) {
+            keep = false;
+            for (multi_pathspecs) |p| {
+                if (commitTouchesFile(allocator, io.io, &store, &alts, item.commit, p)) {
+                    keep = true;
+                    break;
                 }
             }
         }
-
         if (keep) {
-            // The commit's strings belong to `obj`, which is freed here, so they
-            // are copied first. Storing borrowed slices made every later print
-            // read freed memory: author names, messages and dates came out as
-            // rows of replacement characters.
-            var held: object.Commit = .{
-                .tree = commit.tree,
-                .parents = if (has_parent) try allocator.dupe([20]u8, commit.parents) else &.{},
-                .author = commit.author,
-                .committer = commit.committer,
-                .message = try allocator.dupe(u8, commit.message),
-            };
-            held.author.name = try allocator.dupe(u8, commit.author.name);
-            held.author.email = try allocator.dupe(u8, commit.author.email);
-            held.author.timezone = try allocator.dupe(u8, commit.author.timezone);
-            held.committer.name = try allocator.dupe(u8, commit.committer.name);
-            held.committer.email = try allocator.dupe(u8, commit.committer.email);
-            held.committer.timezone = try allocator.dupe(u8, commit.committer.timezone);
-
-            try collected.append(allocator, .{ .sha = this_sha, .commit = held });
+            try collected.append(allocator, .{
+                .sha = item.sha,
+                .commit = try cloneCommit(allocator, item.commit),
+            });
         }
-
-        obj.deinit(allocator);
-        if (!has_parent) break;
-        current_sha = parent_sha;
     }
 
-    // `collected` was filled walking backwards from HEAD, so entry 0 is already
-    // the newest commit. `--reverse` prints it in the same order; the default
-    // prints oldest-first to match `git log`.
-    //
-    // The `skip` entries at the head of `collected` are the newest ones, which
-    // is what `--skip` means.
+    // `reachable` is already newest first, and so is the filtered list, so
+    // `--skip` drops the newest entries and `--reverse` flips the order.
+    const limit = count orelse std.math.maxInt(usize);
     const total = collected.items.len;
     const first: usize = @min(skip, total);
     var printed: usize = 0;
@@ -319,7 +288,6 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
     }
 }
 
-/// Whether `name` looks like a revision rather than a path.
 /// Whether `namespace/name` resolves to a ref.
 fn tryRevExists(allocator: std.mem.Allocator, io: Io, repo: Repo, namespace: []const u8, name: []const u8) bool {
     const full = std.fmt.allocPrint(allocator, "{s}/{s}", .{ namespace, name }) catch return false;
@@ -330,6 +298,302 @@ fn tryRevExists(allocator: std.mem.Allocator, io: Io, repo: Repo, namespace: []c
 }
 
 /// Whether `name` names a revision rather than a path.
+/// Resolve a revision to a commit: a ref name, `HEAD`, a full or abbreviated
+/// SHA, or a chain of `~`/`^` steps (`main~3`, `origin/main^2`, `v1.0^`).
+///
+/// The argument `gitz log` is given is a *revision*, not a SHA. Only raw SHAs
+/// used to be accepted here, even though `isRevisionLike` had to accept every
+/// one of these forms in order to tell a revision from a path.
+fn resolveRevision(
+    allocator: std.mem.Allocator,
+    io: Io,
+    refs_manager: refs_mod.Refs,
+    store: storage_mod.StorageBackend,
+    spec: []const u8,
+) ![20]u8 {
+    // `^{}` means "the commit this points at", which for a tag is its target.
+    // It is not a step, so it is stripped before the walk starts.
+    const base_spec = if (std.mem.endsWith(u8, spec, "^{}")) spec[0 .. spec.len - 3] else spec;
+
+    const cut = splitSteps(base_spec);
+    const base = base_spec[0..cut];
+    const steps = base_spec[cut..];
+
+    var sha = try resolveBase(allocator, io, refs_manager, store, base);
+
+    // Walk the step string as a sequence of `~` / `^` tokens rather than as bytes,
+    // so `^12` is one step and not two.
+    var at: usize = 0;
+    while (at < steps.len) {
+        const kind = steps[at];
+        at += 1;
+        if (kind != '~' and kind != '^') return error.BadRevision;
+
+        var digits_end = at;
+        while (digits_end < steps.len and isDigit(steps[digits_end])) digits_end += 1;
+        // A bare `~` or `^` means one step; with a count, that count.
+        const n: usize = if (digits_end > at)
+            (std.fmt.parseInt(usize, steps[at..digits_end], 10) catch return error.BadRevision)
+        else
+            1;
+
+        if (kind == '~') {
+            // `~N` walks N commits back along the first-parent chain, so each
+            // step is parent index 0. Passing 1 here asked for the *second*
+            // parent, which in a history with no merge commits does not exist --
+            // so every `~N` reported "bad revision".
+            var i: usize = 0;
+            while (i < n) : (i += 1) sha = try parentAt(allocator, io, store, sha, 0);
+        } else {
+            // `^N` is the Nth parent and numbering starts at 1, so it indexes
+            // parents[n - 1]. Passing `n` straight through asked for one parent
+            // further along, and every `^` on a history with no merge commits
+            // fell off the end of a one-element parent list.
+            if (n == 0) return error.BadRevision;
+            sha = try parentAt(allocator, io, store, sha, n - 1);
+        }
+        at = digits_end;
+    }
+    return sha;
+}
+
+/// Copy the strings out of a commit object that is about to be freed.
+///
+/// The commit's message, author and committer borrow from the object store's
+/// buffers, so keeping the struct itself keeps a dangling pointer.
+/// Collect every commit reachable from `tips`, in git's default order.
+///
+/// This follows *all* parents of every commit. Following only the first parent
+/// -- a linear walk over `parents[0]` -- silently drops the history behind every
+/// merge, so a repository with merges reported a fraction of what git shows.
+///
+/// Ordering is topological, not purely by date. Sorting on the timestamp alone
+/// can print a parent before the child that came before it, which is not a valid
+/// history order. Kahn's algorithm with the ready set ordered newest-first
+/// gives git's rule: a commit is only emitted once every commit that descends
+/// from it has been, and among the commits that are ready the newest wins.
+///
+/// The visited set does double duty: it dedups commits reachable from more than
+/// one ref, and it stops a corrupt graph containing a cycle from spinning.
+fn walkHistory(
+    allocator: std.mem.Allocator,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    alts: *const alternates_mod.Reader,
+    tips: []const [20]u8,
+    out: *std.ArrayList(Collected),
+) !void {
+    // 1. Everything reachable, in any order.
+    var reachable: std.ArrayList(Collected) = .empty;
+    defer freeCollected(allocator, &reachable);
+
+    var seen = std.AutoHashMap([20]u8, void).init(allocator);
+    defer seen.deinit();
+
+    var stack: std.ArrayList([20]u8) = .empty;
+    defer stack.deinit(allocator);
+    for (tips) |tip| try stack.append(allocator, tip);
+
+    while (stack.items.len > 0) {
+        const sha = stack.pop().?;
+        if (seen.contains(sha)) continue;
+        try seen.put(sha, {});
+
+        const obj = readWithAlternates(allocator, io.io, store, alts, sha) catch continue;
+        const commit = switch (obj) {
+            .commit => |c| c,
+            else => {
+                obj.deinit(allocator);
+                continue;
+            },
+        };
+        for (commit.parents) |parent| try stack.append(allocator, parent);
+
+        try reachable.append(allocator, .{ .sha = sha, .commit = try cloneCommit(allocator, commit) });
+        obj.deinit(allocator);
+    }
+
+    if (reachable.items.len == 0) return;
+
+    // 2. Where each commit sits, and how many of its children are in the set.
+    //    A parent that is outside the set cannot constrain the order, so it is
+    //    ignored rather than treated as a child that never arrives.
+    var index = std.AutoHashMap([20]u8, usize).init(allocator);
+    defer index.deinit();
+    for (reachable.items, 0..) |item, i| try index.put(item.sha, i);
+
+    const pending = try allocator.alloc(usize, reachable.items.len);
+    defer allocator.free(pending);
+    @memset(pending, 0);
+
+    for (reachable.items) |item| {
+        for (item.commit.parents) |parent| {
+            if (index.get(parent)) |pi| pending[pi] += 1;
+        }
+    }
+
+    // 3. Emit, always taking the newest commit that has no children left.
+    const Ready = struct { at: usize, timestamp: i64 };
+    const NewestFirst = struct {
+        fn order(_: void, a: Ready, b: Ready) std.math.Order {
+            if (a.timestamp == b.timestamp) return .eq;
+            return if (a.timestamp > b.timestamp) .lt else .gt; // min-heap: newest pops first
+        }
+    };
+    var queue: std.PriorityQueue(Ready, void, NewestFirst.order) = .empty;
+    defer queue.deinit(allocator);
+
+    for (pending, 0..) |n, i| {
+        if (n == 0) try queue.push(allocator, .{ .at = i, .timestamp = reachable.items[i].commit.committer.timestamp });
+    }
+
+    // A cycle in a corrupt graph would leave commits unemitted; they are
+    // appended so that nothing reachable is silently dropped.
+    var emitted = try allocator.alloc(bool, reachable.items.len);
+    defer allocator.free(emitted);
+    @memset(emitted, false);
+    var count: usize = 0;
+
+    while (queue.pop()) |ready| {
+        const item = reachable.items[ready.at];
+        try out.append(allocator, .{ .sha = item.sha, .commit = try cloneCommit(allocator, item.commit) });
+        emitted[ready.at] = true;
+        count += 1;
+
+        for (item.commit.parents) |parent| {
+            const pi = index.get(parent) orelse continue;
+            pending[pi] -= 1;
+            if (pending[pi] == 0) {
+                try queue.push(allocator, .{
+                    .at = pi,
+                    .timestamp = reachable.items[pi].commit.committer.timestamp,
+                });
+            }
+        }
+    }
+
+    if (count < reachable.items.len) {
+        for (reachable.items, 0..) |item, i| {
+            if (emitted[i]) continue;
+            try out.append(allocator, .{ .sha = item.sha, .commit = try cloneCommit(allocator, item.commit) });
+        }
+    }
+}
+
+/// A commit the walk kept a private copy of, together with its id.
+const Collected = struct { sha: [20]u8, commit: object.Commit };
+
+fn cloneCommit(allocator: std.mem.Allocator, commit: object.Commit) !object.Commit {
+    var held: object.Commit = .{
+        .tree = commit.tree,
+        .parents = try allocator.dupe([20]u8, commit.parents),
+        .author = commit.author,
+        .committer = commit.committer,
+        .message = try allocator.dupe(u8, commit.message),
+    };
+    held.author.name = try allocator.dupe(u8, commit.author.name);
+    held.author.email = try allocator.dupe(u8, commit.author.email);
+    held.author.timezone = try allocator.dupe(u8, commit.author.timezone);
+    held.committer.name = try allocator.dupe(u8, commit.committer.name);
+    held.committer.email = try allocator.dupe(u8, commit.committer.email);
+    held.committer.timezone = try allocator.dupe(u8, commit.committer.timezone);
+    return held;
+}
+
+fn freeCollected(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(Collected),
+) void {
+    for (items.items) |it| freeCommitStrings(allocator, it.commit);
+    items.deinit(allocator);
+}
+
+fn freeCommitStrings(allocator: std.mem.Allocator, commit: object.Commit) void {
+    allocator.free(commit.parents);
+    allocator.free(commit.message);
+    allocator.free(commit.author.name);
+    allocator.free(commit.author.email);
+    allocator.free(commit.author.timezone);
+    allocator.free(commit.committer.name);
+    allocator.free(commit.committer.email);
+    allocator.free(commit.committer.timezone);
+}
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Where the trailing run of `~`/`^N` steps begins.
+///
+/// Digits are consumed first, then the `~` or `^` that introduced them, so
+/// `HEAD~2` and `v1^` both split correctly while a branch whose name merely
+/// ends in a digit (`fix2`) is left whole.
+fn splitSteps(spec: []const u8) usize {
+    var at = spec.len;
+    while (at > 0) {
+        var before_digits = at;
+        while (before_digits > 0 and isDigit(spec[before_digits - 1])) before_digits -= 1;
+
+        if (before_digits == at) {
+            // No digits: the character itself has to be a step marker.
+            const c = spec[at - 1];
+            if (c != '~' and c != '^') break;
+            at -= 1;
+            continue;
+        }
+
+        if (before_digits == 0) break;
+        const c = spec[before_digits - 1];
+        if (c != '~' and c != '^') break; // trailing digits that are not a step
+        at = before_digits - 1;
+    }
+    return at;
+}
+
+fn resolveBase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    refs_manager: refs_mod.Refs,
+    store: storage_mod.StorageBackend,
+    base: []const u8,
+) ![20]u8 {
+    if (base.len == 0) return error.BadRevision;
+    if (refs_manager.read(allocator, io.io, base)) |sha| return sha else |_| {}
+
+    // A bare name is shorthand for the namespaces a user actually types:
+    // `main` is `refs/heads/main`, `v1.0` is `refs/tags/v1.0`, and
+    // `origin/main` is `refs/remotes/origin/main`. Without this, `gitz log main`
+    // looked for a ref literally named `main` and reported "bad revision".
+    for ([_][]const u8{ "refs/heads/", "refs/tags/", "refs/remotes/" }) |ns| {
+        const full = std.fmt.allocPrint(allocator, "{s}{s}", .{ ns, base }) catch return error.OutOfMemory;
+        defer allocator.free(full);
+        if (refs_manager.read(allocator, io.io, full)) |sha| return sha else |_| {}
+    }
+
+    if (Sha1.fromHex(base)) |sha| {
+        if (store.exists(io.io, sha)) return sha;
+    } else |_| {}
+    return error.BadRevision;
+}
+
+/// The `n`th parent of a commit, where 0 is the first parent.
+fn parentAt(
+    allocator: std.mem.Allocator,
+    io: Io,
+    store: storage_mod.StorageBackend,
+    sha: [20]u8,
+    n: usize,
+) ![20]u8 {
+    const obj = store.read(allocator, io.io, sha) catch return error.BadRevision;
+    defer obj.deinit(allocator);
+    const commit = switch (obj) {
+        .commit => |c| c,
+        else => return error.BadRevision,
+    };
+    if (n >= commit.parents.len) return error.BadRevision;
+    return commit.parents[n];
+}
+
 fn isRevisionLike(allocator: std.mem.Allocator, io: Io, repo: Repo, name: []const u8) bool {
     if (Sha1.fromHex(name)) |_| {
         return true;
@@ -607,22 +871,29 @@ fn readWithAlternates(
     };
 }
 
-fn showSpecificCommit(allocator: std.mem.Allocator, repo: Repo, sha_str: []const u8, io: Io, alts: *const alternates_mod.Reader) !void {
-    const sha = Sha1.fromHex(sha_str) catch {
-        try io.eprint("fatal: invalid commit SHA '{s}'\n", .{sha_str});
+fn showSpecificCommit(allocator: std.mem.Allocator, repo: Repo, spec: []const u8, io: Io, alts: *const alternates_mod.Reader) !void {
+    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
+    const refs_manager = refs_mod.Refs.init(repo);
+
+    // The argument is a revision, not necessarily a SHA: `gitz log main`,
+    // `gitz log origin/main` and `gitz log HEAD~3` are the common forms, and
+    // only raw SHAs used to be accepted. The other one had to accept them so
+    // that `isRevisionLike` could tell a rev from a path, which meant the
+    // resolved path could not assume a SHA.
+    const sha = resolveRevision(allocator, io, refs_manager, store, spec) catch {
+        try io.eprint("fatal: bad revision '{s}'\n", .{spec});
         return;
     };
 
-    const store = storage_mod.StorageBackend.fromRepoConfig(allocator, io.io, repo);
     const obj = readWithAlternates(allocator, io.io, store, alts, sha) catch {
-        try io.eprint("fatal: not a commit object '{s}'\n", .{sha_str});
+        try io.eprint("fatal: not a commit object '{s}'\n", .{spec});
         return;
     };
 
     const commit = switch (obj) {
         .commit => |c| c,
         else => {
-            try io.eprint("fatal: object '{s}' is not a commit\n", .{sha_str});
+            try io.eprint("fatal: object '{s}' is not a commit\n", .{spec});
             obj.deinit(allocator);
             return;
         },

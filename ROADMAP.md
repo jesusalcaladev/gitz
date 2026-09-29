@@ -291,12 +291,43 @@ to the `git` binary.
 - The success line printed `<new>..<new>`, reusing the new SHA for the old one, so
   a force-push and a normal push looked identical.
 
-### Still broken, and not part of this phase
+### `gitz log` (fixed here)
 
-`gitz log <rev>` truncates: 23 commits where git shows 50, and `log --all` shows
-none. This predates the protocol work -- the binary from before it reports 1 for
-the same input -- but it makes a freshly fetched history hard to inspect, so it
-wants fixing before the repository is used with gitz alone.
+`log` was only correct with no arguments. Every other form was broken, and the
+numbers were misleading rather than obviously wrong:
+
+- `gitz log <rev>` did not resolve revisions at all. It demanded a raw SHA, so
+  `gitz log main`, `gitz log origin/main` and `gitz log HEAD~2` all reported
+  "bad revision" -- and then crashed, because the string had already been freed.
+- Clearing the positional list with `pathspecs.items = &.{}` replaced the
+  list's *buffer pointer* with a static empty slice, so its own teardown freed a
+  pointer that never came from the allocator. That is the general protection
+  exception, and it is why the "23 commits" this reported were rows of
+  replacement characters rather than commits.
+- A revision argument was routed to the `log show` path, printing **one** commit
+  where `git log <rev>` lists the history from that point. `log show <rev>` is
+  a separate subcommand and still does that.
+- The walk followed only `parents[0]`, which is first-parent: everything behind
+  a merge was invisible.
+- `--all` listed only `refs/heads/*`, so a freshly fetched repository -- which
+  has `refs/remotes/origin/*` and no local branch -- printed nothing.
+- Walking each ref separately printed shared history once per ref: 106 lines
+  for a 51 commit repository.
+- `--skip=3` was never read, because `--grep=` and `--max-count=` accepted the
+  attached form and `--skip` did not.
+- `~N` asked for the *second* parent and `^N` indexed parents from 1 instead of
+  from 0, so every one of them reported "bad revision" on a history with no
+  merge commits.
+
+Ordering is now topological with a newest-first priority among the commits that
+are ready, which is git's rule: a commit is never printed before something that
+descends from it. Sorting on the timestamp alone would print a parent ahead of
+its child. Among commits with the *same* timestamp the tie may break differently
+than git does; both orders are valid, and the set is identical.
+
+Verified identical to git on the real 51 commit history -- set, order, `--all`,
+`-5`, `--skip=3`, `--reverse`, `--author`, `--grep` and a pathspec -- and on a
+synthetic repository with merges, a tag and a deletion.
 
 ## Phase 5 -- Worktrees (phases 0-3 done) & Multi-Agent (phase 4 not started)
 
