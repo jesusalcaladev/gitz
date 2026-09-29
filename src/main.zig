@@ -48,6 +48,9 @@ comptime {
     _ = @import("core/packindex.zig");
     _ = @import("core/parallel.zig");
     _ = @import("core/pktline.zig");
+    _ = @import("core/pack_ingest.zig");
+    _ = @import("transport/wire.zig");
+    _ = @import("core/repo.zig");
     _ = @import("core/mmap.zig");
     _ = @import("core/streampack.zig");
     _ = @import("core/threadpool.zig");

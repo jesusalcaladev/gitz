@@ -13,9 +13,16 @@ const testing = std.testing;
 ///
 /// Used by both SSH and Smart HTTP transports.
 
+/// A ref as advertised by a remote.
+///
+/// `peeled` and `symref_target` are protocol 2 extras: a `peeled` line gives the
+/// commit an annotated tag points at, and `symref-target` says which ref `HEAD`
+/// is symbolic to. Both are absent in a version 0 advertisement.
 pub const RemoteRef = struct {
     name: []const u8,
     sha: [20]u8,
+    peeled: ?[20]u8 = null,
+    symref_target: ?[]const u8 = null,
 };
 
 /// Parse refs from a pkt-line response.

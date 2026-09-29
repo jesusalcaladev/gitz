@@ -234,6 +234,70 @@ store path in `objects/info/alternates` and resolves objects on demand.
 
 ---
 
+## Phase 6 -- Wire Protocol v2 (done)
+
+GitHub stopped serving the packfile for a version 0 `want`/`done` request. It
+still answers the version 0 ref advertisement, so a version 0 client looks like
+it is working right up until it asks for objects and receives an *empty body* --
+which `gitz` reported as a successful fetch that downloaded nothing.
+
+`src/transport/wire.zig` implements version 2, and both transports use it:
+
+- **fetch** -- `ls-refs` and `fetch` commands, over HTTP (`Git-Protocol` header)
+  and over SSH (`GIT_PROTOCOL=version=2` *and* `SendEnv=GIT_PROTOCOL`; setting
+  the variable without asking ssh to forward it silently gets version 0)
+- **push** -- `command=push` with the status report parsed, so a rejected ref is
+  reported as a rejection
+- version 0 is kept as a fallback, and only entered when the server's
+  advertisement says it is not answering in version 2
+
+Verified against GitHub: clone and fetch over both transports, and a push to a
+scratch branch that real git then cloned and `fsck`ed clean. No step falls back
+to the `git` binary.
+
+### Things the server decides, not the client
+
+- GitHub answers `git-upload-pack` with a version 2 advertisement and
+  `git-receive-pack` with a **version 0** one. Real git pushes over version 0
+  there too. So "version 2" is not universal: the code asks what the
+  advertisement says instead of assuming.
+- A fetch response's packfile arrives **side-band-64k framed** after the
+  `packfile` section, with a stray newline between the two. Reading it as a bare
+  packfile lands one byte into `PACK`. The shape is detected, not assumed.
+- `fetch` never requests `thin-pack`, so every delta base is inside the pack.
+
+### Bugs found and fixed on the way
+
+- `applyDelta` never skipped the two size varints that open a delta stream, so
+  it read a size byte as an opcode. **The first real delta of a real packfile
+  failed** with `DeltaOutOfBounds`. The existing unit test had encoded the bug by
+  omitting the prefix.
+- `delta.parsePackHeader` set `content_start` and `content_start_after_ofs` to
+  the same offset, so an `ofs_delta` read its base reference and its delta data
+  from the same place.
+- The pack ingester registered each object's SHA against the *next* object's
+  offset, so every `ref-delta` resolved against its neighbour.
+- `decompressZlib` inflated into the page allocator: one leaked page per resolved
+  object, which is thousands per clone.
+- The version 0 pack reader in both transports stopped at the first delta
+  (`else => break`), silently dropping most of a real clone.
+- `POST` requests to upload-pack carried no `Content-Type`, which the server
+  answers with `200` and an empty body.
+- Control packets (`0000`, `0001`) were followed by a stray newline, which the
+  server read as a malformed packet header and answered `400`.
+- `gitz push` printed its success line unconditionally, after a transport that
+  had thrown the server's answer away. A push the server refused was reported as
+  having worked.
+- The success line printed `<new>..<new>`, reusing the new SHA for the old one, so
+  a force-push and a normal push looked identical.
+
+### Still broken, and not part of this phase
+
+`gitz log <rev>` truncates: 23 commits where git shows 50, and `log --all` shows
+none. This predates the protocol work -- the binary from before it reports 1 for
+the same input -- but it makes a freshly fetched history hard to inspect, so it
+wants fixing before the repository is used with gitz alone.
+
 ## Phase 5 -- Worktrees (phases 0-3 done) & Multi-Agent (phase 4 not started)
 
 ### The idea

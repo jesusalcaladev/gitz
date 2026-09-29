@@ -76,6 +76,10 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
         return;
     }
 
+    // The remote's previous value for the ref, so the summary can show the real
+    // old and new instead of the new one twice.
+    var pushed_old: ?[20]u8 = null;
+
     // Try appropriate transport based on URL
     const is_ssh = ssh_mod.isSshUrl(url.?);
 
@@ -104,11 +108,23 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
             }
         }
 
-        ssh_transport.push(repo, ref, push_sha, old_sha) catch {
-            try io.print("Note: SSH push failed, falling back to git\n", .{});
-            try pushViaGit(allocator, git_dir, name, ref, force, io);
-            return;
-        };
+        // A transport failure is retried through real git, but a transport that
+        // *succeeded* and was told by the server that the ref was rejected is a
+        // rejection, not a failure to try harder. Falling back there is what
+        // made `gitz push` report success for a push that never happened.
+        const pushed = ssh_transport.push(repo, ref, push_sha, old_sha);
+        if (pushed) |_| {
+            pushed_old = old_sha;
+        } else |err| {
+            if (err != error.PushRejected) {
+                try io.print("Note: SSH push failed ({s}), falling back to git\n", .{@errorName(err)});
+                try pushViaGit(allocator, git_dir, name, ref, force, io);
+                return reportSuccess(io, url.?, old_sha, push_sha, ref);
+            }
+            // The server said no. Printing "To <url>" after that is a lie.
+            try io.eprint("error: push rejected by {s}\n", .{url.?});
+            std.process.exit(errors.ExitFailure);
+        }
     } else {
         // Use HTTP transport
         var transport = http.HttpTransport.init(allocator, io.io, url.?) catch {
@@ -118,16 +134,34 @@ pub fn execute(allocator: std.mem.Allocator, repo: Repo, args: []const []const u
         };
         defer transport.deinit();
 
-        transport.push(repo, ref, push_sha) catch {
-            try io.print("Note: HTTP push failed, falling back to git\n", .{});
-            try pushViaGit(allocator, git_dir, name, ref, force, io);
-            return;
-        };
+        const pushed = transport.push(repo, ref, push_sha);
+        if (pushed) |_| {
+            pushed_old = null;
+        } else |err| {
+            if (err != error.PushRejected) {
+                try io.print("Note: HTTP push failed ({s}), falling back to git\n", .{@errorName(err)});
+                try pushViaGit(allocator, git_dir, name, ref, force, io);
+                return reportSuccess(io, url.?, null, push_sha, ref);
+            }
+            try io.eprint("error: push rejected by {s}\n", .{url.?});
+            std.process.exit(errors.ExitFailure);
+        }
     }
 
-    const hex = Sha1.hex(push_sha);
-    try io.print("To {s}\n", .{url.?});
-    try io.print("   {s}..{s}  {s} -> {s}\n", .{ hex[0..7], hex[0..7], ref, ref });
+    try reportSuccess(io, url.?, pushed_old, push_sha, ref);
+}
+
+/// Report the ref update the way git does, with the real old and new values.
+///
+/// The old line printed `hex..hex` -- the same SHA on both sides -- because it
+/// reused the new SHA for the old one, so a force-push and a normal push looked
+/// identical.
+fn reportSuccess(io: Io, url: []const u8, old_sha: ?[20]u8, new_sha: [20]u8, ref: []const u8) !void {
+    const new_hex = Sha1.hex(new_sha);
+    const old_hex: [40]u8 = if (old_sha) |o| Sha1.hex(o) else ([_]u8{'0'} ** 40);
+
+    try io.print("To {s}\n", .{url});
+    try io.print("   {s}..{s}  {s} -> {s}\n", .{ old_hex[0..7], new_hex[0..7], ref, ref });
 }
 
 /// Push using system git as fallback.

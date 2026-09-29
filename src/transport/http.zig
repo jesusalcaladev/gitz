@@ -7,14 +7,14 @@ const zlib_mod = @import("../core/zlib.zig");
 const packfile_mod = @import("../core/packfile.zig");
 const storage_mod = @import("../core/storage.zig");
 const Repo = @import("../core/repo.zig").Repo;
+const wire = @import("wire.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// A parsed remote reference
-pub const RemoteRef = struct {
-    name: []const u8,
-    sha: [20]u8,
-};
+/// The wire module owns this shape; version 2 carries extra fields on it, so
+/// aliasing avoids a second, subtly different definition.
+pub const RemoteRef = wire.RemoteRef;
 
 /// HTTP transport for Smart Git protocol
 pub const HttpTransport = struct {
@@ -34,8 +34,46 @@ pub const HttpTransport = struct {
         _ = self;
     }
 
-    /// Discover remote refs via GET /info/refs?service=git-upload-pack
+    /// Discover remote refs, preferring protocol version 2.
+    ///
+    /// Version 0 is kept as a fallback because some servers still only speak it,
+    /// but it is tried second: a version 0 server that answers the ref
+    /// advertisement will then return an *empty* body for the pack, which used
+    /// to look like a successful fetch that downloaded nothing.
     pub fn discoverRefs(self: *HttpTransport) ![]RemoteRef {
+        if (self.discoverRefsV2()) |refs| return refs else |_| {}
+        return self.discoverRefsV0();
+    }
+
+    fn discoverRefsV2(self: *HttpTransport) ![]RemoteRef {
+        var url_buf: [1024]u8 = undefined;
+        const info_url = try std.fmt.bufPrint(&url_buf, "{s}/info/refs?service=git-upload-pack", .{self.url});
+
+        const advertisement = try self.httpGetV2(info_url);
+        defer self.allocator.free(advertisement);
+
+        // A smart server still sends the `# service=` preamble before the
+        // advertisement when version 2 was requested.
+        const body = wire.skipServicePreamble(advertisement);
+        const adv = try wire.parseAdvertisement(self.allocator, body);
+        if (adv.version != 2) return error.ProtocolV2Refused;
+        freeAdvertisement(self.allocator, adv);
+
+        // Version 2 moved ref listing into a command, so the advertisement alone
+        // names no refs at all.
+        var upload_buf: [1024]u8 = undefined;
+        const upload_url = try std.fmt.bufPrint(&upload_buf, "{s}/git-upload-pack", .{self.url});
+        const request = try wire.buildLsRefs(self.allocator, &.{});
+        defer self.allocator.free(request);
+
+        const response = try self.httpPostV2(upload_url, request);
+        defer self.allocator.free(response);
+
+        return wire.parseLsRefs(self.allocator, response);
+    }
+
+    /// Version 0 ref advertisement, for servers that refuse version 2.
+    fn discoverRefsV0(self: *HttpTransport) ![]RemoteRef {
         var url_buf: [1024]u8 = undefined;
         const info_url = try std.fmt.bufPrint(&url_buf, "{s}/info/refs?service=git-upload-pack", .{self.url});
 
@@ -88,8 +126,49 @@ pub const HttpTransport = struct {
         return try result.toOwnedSlice(self.allocator);
     }
 
-    /// Fetch objects from remote
+    /// Fetch objects from remote, over protocol version 2 when the server allows
+    /// it and version 0 otherwise.
     pub fn fetch(self: *HttpTransport, repo: Repo, refs: []RemoteRef, have_shas: []const [20]u8) !void {
+        if (self.fetchV2(repo, refs, have_shas)) |_| {
+            return;
+        } else |err| switch (err) {
+            // A version 0 server answers the ref advertisement but returns an
+            // empty body for a version 0 pack request, so the fallback is not
+            // optional for those servers.
+            error.ProtocolV2Refused, error.EmptyPack, error.NotAPackfile => return self.fetchV0(repo, refs, have_shas),
+            else => return err,
+        }
+    }
+
+    fn fetchV2(self: *HttpTransport, repo: Repo, refs: []RemoteRef, have_shas: []const [20]u8) anyerror!void {
+        var upload_buf: [1024]u8 = undefined;
+        const url = try std.fmt.bufPrint(&upload_buf, "{s}/git-upload-pack", .{self.url});
+
+        // Only branches are wanted; a tag ref would make the server send history
+        // that no branch needs.
+        var wants: std.ArrayList([20]u8) = .empty;
+        defer wants.deinit(self.allocator);
+        for (refs) |ref| {
+            if (!std.mem.startsWith(u8, ref.name, "refs/heads/")) continue;
+            try wants.append(self.allocator, ref.sha);
+        }
+        if (wants.items.len == 0) return error.NothingToFetch;
+
+        const request = try wire.buildFetch(self.allocator, wants.items, have_shas, .{});
+        defer self.allocator.free(request);
+
+        const response = try self.httpPostV2(url, request);
+        defer self.allocator.free(response);
+
+        const result = try wire.parseFetchResponse(self.allocator, response);
+        defer result.deinit(self.allocator);
+        if (result.server_errors.len > 0) return error.ServerRejectedFetch;
+        if (result.pack.len == 0) return error.EmptyPack;
+
+        _ = try wire.ingestPack(self.allocator, self.io, repo, result.pack);
+    }
+
+    fn fetchV0(self: *HttpTransport, repo: Repo, refs: []RemoteRef, have_shas: []const [20]u8) !void {
         _ = have_shas;
 
         // Build the upload-pack request body
@@ -290,58 +369,124 @@ pub const HttpTransport = struct {
     }
 
     /// Push objects to remote
+    /// Push objects to the remote, over protocol version 2 when possible.
+    ///
+    /// The response is parsed and a rejected ref reported as a failure. The old
+    /// implementation posted the request and threw the answer away, so a push
+    /// the server had refused still looked like it had worked.
     pub fn push(self: *HttpTransport, repo: Repo, ref_name: []const u8, sha: [20]u8) !void {
-        // 1. Discover refs via GET /info/refs?service=git-receive-pack
-        var push_url: [1024]u8 = undefined;
-        const info_url = try std.fmt.bufPrint(&push_url, "{s}/info/refs?service=git-receive-pack", .{self.url});
+        const old_sha = try self.remoteRefSha(ref_name);
+        const objects = try self.collectPushObjects(repo, sha, old_sha);
+        defer self.allocator.free(objects);
 
-        const refs_response = try self.httpGet(info_url);
-        defer self.allocator.free(refs_response);
+        if (self.pushV2(repo, ref_name, sha, old_sha, objects)) |_| {
+            return;
+        } else |err| switch (err) {
+            error.ProtocolV2Refused => return self.pushV0(repo, ref_name, sha, old_sha, objects),
+            else => return err,
+        }
+    }
 
-        // Parse old remote SHA for this ref (for the update command)
-        var old_sha: ?[20]u8 = null;
-        var pos: usize = 0;
-        while (pos + 4 <= refs_response.len) {
-            const pkt_len = std.fmt.parseInt(usize, refs_response[pos..][0..4], 16) catch break;
-            if (pkt_len == 0) {
-                pos += 4;
-                continue;
+    fn pushV2(
+        self: *HttpTransport,
+        repo: Repo,
+        ref_name: []const u8,
+        sha: [20]u8,
+        old_sha: ?[20]u8,
+        objects: []const [20]u8,
+    ) anyerror!void {
+        var recv_buf: [1024]u8 = undefined;
+        const recv_url = try std.fmt.bufPrint(&recv_buf, "{s}/git-receive-pack", .{self.url});
+
+        const updates = [_]wire.Update{.{
+            .ref_name = ref_name,
+            .old_sha = old_sha orelse ([_]u8{0} ** 20),
+            .new_sha = sha,
+        }};
+
+        const body = try self.buildPushBody(repo, &updates, objects);
+        defer self.allocator.free(body);
+
+        const response = try self.httpPostV2To(recv_url, body, "application/x-git-receive-pack-request");
+        defer self.allocator.free(response);
+
+        const report = try wire.parsePushResponse(self.allocator, response);
+        defer {
+            for (report.results) |r| {
+                self.allocator.free(r.ref_name);
+                if (r.reason) |x| self.allocator.free(x);
             }
-            if (pkt_len < 4) break;
-            if (pos + pkt_len > refs_response.len) break;
-            const line = refs_response[pos + 4 .. pos + pkt_len];
-            pos += pkt_len;
-
-            if (line.len >= 41 and line[40] == ' ') {
-                const sha_hex = line[0..40];
-                const name = std.mem.trimEnd(u8, line[41..], &[_]u8{ '\n', '\r' });
-                if (std.mem.eql(u8, name, ref_name)) {
-                    old_sha = Sha1.fromHex(sha_hex) catch null;
-                    break;
-                }
-            }
+            self.allocator.free(report.results);
+            if (report.unpack_error) |x| self.allocator.free(x);
+            if (report.fatal) |x| self.allocator.free(x);
         }
 
-        // 2. Collect all objects reachable from new SHA but not from old SHA
-        const objects_to_send = try self.collectPushObjects(repo, sha, old_sha);
-        defer self.allocator.free(objects_to_send);
+        if (report.fatal) |f| {
+            try io_stderr(self.io, "remote: {s}\n", .{f});
+            return error.PushRejected;
+        }
+        if (report.unpack_error) |u| {
+            try io_stderr(self.io, "remote: could not unpack objects: {s}\n", .{u});
+            return error.PushRejected;
+        }
+        if (!report.allOk()) {
+            for (report.results) |r| {
+                if (r.ok) continue;
+                try io_stderr(self.io, " ! {s} {s}\n", .{ r.ref_name, r.reason orelse "rejected" });
+            }
+            return error.PushRejected;
+        }
+    }
 
-        if (objects_to_send.len == 0) return; // nothing to push
+    /// Version 0 push, for servers that refuse version 2.
+    fn pushV0(
+        self: *HttpTransport,
+        repo: Repo,
+        ref_name: []const u8,
+        sha: [20]u8,
+        old_sha: ?[20]u8,
+        objects: []const [20]u8,
+    ) !void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
 
-        // 3. Build packfile
+        const old_hex = if (old_sha) |s| Sha1.hex(s) else ([_]u8{'0'} ** 40);
+        const new_hex = Sha1.hex(sha);
+
+        var cmd_buf: [256]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, "{s} {s} {s}\x00", .{ &old_hex, &new_hex, ref_name });
+        try appendPktLine(self.allocator, &body, cmd);
+        try body.appendSlice(self.allocator, "0000");
+
+        const pack = try self.packFor(repo, objects);
+        defer self.allocator.free(pack);
+        try body.appendSlice(self.allocator, pack);
+
+        var recv_buf: [1024]u8 = undefined;
+        const recv_url = try std.fmt.bufPrint(&recv_buf, "{s}/git-receive-pack", .{self.url});
+
+        const response = try self.httpPost(recv_url, body.items);
+        defer self.allocator.free(response);
+
+        // Even in version 0 the answer says what happened to the ref.
+        if (std.mem.indexOf(u8, response, "ng ") != null) return error.PushRejected;
+    }
+
+    /// Serialise the objects into a packfile, reusing the writer the fetch path
+    /// already used.
+    fn packFor(self: *HttpTransport, repo: Repo, objects: []const [20]u8) ![]u8 {
         var pw = packfile_mod.PackWriter.init(self.allocator);
         defer pw.deinit();
-        try pw.writeHeader(2, @intCast(objects_to_send.len));
+        try pw.writeHeader(2, @intCast(objects.len));
 
         const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo);
-        for (objects_to_send) |obj_sha| {
+        for (objects) |obj_sha| {
             const obj = store.read(self.allocator, self.io, obj_sha) catch continue;
             const serialized = try obj.serialize(self.allocator);
             defer self.allocator.free(serialized);
 
             const null_pos = std.mem.indexOfScalar(u8, serialized, 0) orelse 0;
             const content = serialized[null_pos + 1 ..];
-
             const pot: packfile_mod.ObjectType = switch (obj) {
                 .blob => .blob,
                 .tree => .tree,
@@ -351,35 +496,107 @@ pub const HttpTransport = struct {
             try pw.writeObject(pot, obj_sha, content);
         }
         try pw.finalize();
+        return self.allocator.dupe(u8, pw.getPackData());
+    }
 
-        // 4. Build receive-pack command + pack data
-        var body = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-        defer body.deinit(self.allocator);
+    /// The `command=push` request with the packfile appended after the flush.
+    ///
+    /// The pack is a plain packfile, not side-band framed: version 2 clients send
+    /// it raw after the command's flush packet.
+    fn buildPushBody(
+        self: *HttpTransport,
+        repo: Repo,
+        updates: []const wire.Update,
+        objects: []const [20]u8,
+    ) ![]u8 {
+        const command = try wire.buildPush(self.allocator, updates, .{});
+        defer self.allocator.free(command);
 
-        // Command: "<old-sha> <new-sha> <ref-name>\0"
-        const old_hex = if (old_sha) |s| Sha1.hex(s) else [_]u8{'0'} ** 40;
-        const new_hex = Sha1.hex(sha);
-        const cmd_line = try std.fmt.allocPrint(self.allocator, "{s} {s} {s}\x00", .{ &old_hex, &new_hex, ref_name });
-        defer self.allocator.free(cmd_line);
+        var body: std.ArrayList(u8) = .empty;
+        errdefer body.deinit(self.allocator);
+        try body.appendSlice(self.allocator, command);
 
-        const cmd_pkt_len: u16 = @intCast(4 + cmd_line.len);
-        const cmd_pkt_hex = try std.fmt.allocPrint(self.allocator, "{x:0>4}", .{cmd_pkt_len});
-        defer self.allocator.free(cmd_pkt_hex);
-        try body.appendSlice(self.allocator, cmd_pkt_hex);
-        try body.appendSlice(self.allocator, cmd_line);
+        // Zero objects is still a valid push: a ref update where the server
+        // already has everything, or a deletion.
+        if (objects.len > 0) {
+            var pw = packfile_mod.PackWriter.init(self.allocator);
+            defer pw.deinit();
+            try pw.writeHeader(2, @intCast(objects.len));
 
-        // Flush
-        try body.appendSlice(self.allocator, "0000");
+            const store = storage_mod.StorageBackend.fromRepoConfig(self.allocator, self.io, repo);
+            for (objects) |obj_sha| {
+                const obj = store.read(self.allocator, self.io, obj_sha) catch continue;
+                defer obj.deinit(self.allocator);
+                const serialized = try obj.serialize(self.allocator);
+                defer self.allocator.free(serialized);
 
-        // Append pack data
-        try body.appendSlice(self.allocator, pw.getPackData());
+                const null_pos = std.mem.indexOfScalar(u8, serialized, 0) orelse 0;
+                const content = serialized[null_pos + 1 ..];
+                const pot: packfile_mod.ObjectType = switch (obj) {
+                    .blob => .blob,
+                    .tree => .tree,
+                    .commit => .commit,
+                    .tag => .tag,
+                };
+                try pw.writeObject(pot, obj_sha, content);
+            }
+            try pw.finalize();
+            try body.appendSlice(self.allocator, pw.getPackData());
+        }
 
-        // 5. POST to /git-receive-pack
-        const recv_url = try std.fmt.allocPrint(self.allocator, "{s}/git-receive-pack", .{self.url});
-        defer self.allocator.free(recv_url);
+        return body.toOwnedSlice(self.allocator);
+    }
 
-        const response = try self.httpPost(recv_url, body.items);
+    /// The current value of `ref_name` on the remote, which a push has to claim
+    /// as the expected old value.
+    fn remoteRefSha(self: *HttpTransport, ref_name: []const u8) !?[20]u8 {
+        var info_buf: [1024]u8 = undefined;
+        const info_url = try std.fmt.bufPrint(&info_buf, "{s}/info/refs?service=git-receive-pack", .{self.url});
+
+        if (self.discoverRefsV2Push()) |refs| {
+            defer {
+                for (refs) |r| self.allocator.free(r.name);
+                self.allocator.free(refs);
+            }
+            for (refs) |r| {
+                if (std.mem.eql(u8, r.name, ref_name)) return r.sha;
+            }
+            return null;
+        } else |_| {}
+
+        // Version 0 puts the refs in the advertisement itself.
+        const response = try self.httpGet(info_url);
         defer self.allocator.free(response);
+
+        var reader = wire.Reader.init(response);
+        while (try reader.next()) |pkt| {
+            if (pkt.kind != .data) continue;
+            const line = std.mem.trim(u8, pkt.payload, " \t\r\n");
+            if (line.len < 42 or line[40] != ' ') continue;
+            const name = line[41..];
+            if (std.mem.eql(u8, name, ref_name)) return Sha1.fromHex(line[0..40]) catch null;
+        }
+        return null;
+    }
+
+    /// `ls-refs` against receive-pack, which is how version 2 learns the remote
+    /// refs before a push.
+    fn discoverRefsV2Push(self: *HttpTransport) ![]RemoteRef {
+        var recv_buf: [1024]u8 = undefined;
+        const recv_url = try std.fmt.bufPrint(&recv_buf, "{s}/git-receive-pack", .{self.url});
+
+        const request = try wire.buildLsRefs(self.allocator, &.{});
+        defer self.allocator.free(request);
+        const response = try self.httpPostV2To(recv_url, request, "application/x-git-receive-pack-request");
+        defer self.allocator.free(response);
+        return wire.parseLsRefs(self.allocator, response);
+    }
+
+    fn httpPostV2To(self: *HttpTransport, url: []const u8, body: []const u8, content_type: []const u8) ![]const u8 {
+        return self.httpRequest("POST", url, body, &.{
+            .{ .name = "Content-Type", .value = content_type },
+            .{ .name = "Git-Protocol", .value = "version=2" },
+        });
     }
 
     /// Collect all objects reachable from `new_sha` that are not reachable from `old_sha`.
@@ -468,16 +685,63 @@ pub const HttpTransport = struct {
 
     /// HTTP GET using std.http.Client (no curl dependency)
     fn httpGet(self: *HttpTransport, url: []const u8) ![]const u8 {
-        return self.httpRequest("GET", url, &.{});
+        return self.httpRequest("GET", url, &.{}, &.{});
     }
 
     /// HTTP POST using std.http.Client (no curl dependency)
     fn httpPost(self: *HttpTransport, url: []const u8, body: []const u8) ![]const u8 {
-        return self.httpRequest("POST", url, body);
+        return self.httpRequest("POST", url, body, &.{.{ .name = "Content-Type", .value = "application/x-git-upload-pack-request" }});
+    }
+
+    /// Request that asks for wire protocol version 2.
+    ///
+    /// The `Git-Protocol` header has to be on the ref advertisement *and* on the
+    /// POST; without it the server answers in version 0 and the pack request
+    /// comes back empty.
+    fn httpGetV2(self: *HttpTransport, url: []const u8) ![]const u8 {
+        return self.httpRequest("GET", url, &.{}, &.{.{ .name = "Git-Protocol", .value = "version=2" }});
+    }
+
+    fn appendPktLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), payload: []const u8) !void {
+        const line = try wire.encodeData(allocator, payload);
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+
+    fn io_stderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        try std.Io.File.stderr().writeStreamingAll(io, msg);
+    }
+
+    /// The `Content-Type` is not optional. upload-pack answers a POST without it
+    /// with `200` and an *empty* body, which reads as a successful fetch that
+    /// downloaded nothing rather than as an error.
+    fn httpPostV2(self: *HttpTransport, url: []const u8, body: []const u8) ![]const u8 {
+        return self.httpRequest("POST", url, body, &.{
+            .{ .name = "Content-Type", .value = "application/x-git-upload-pack-request" },
+            .{ .name = "Git-Protocol", .value = "version=2" },
+        });
+    }
+
+    fn freeAdvertisement(allocator: std.mem.Allocator, adv: wire.Advertisement) void {
+        for (adv.capabilities.entries) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        allocator.free(adv.capabilities.entries);
     }
 
     /// Execute HTTP request using Zig's built-in HTTP client
-    fn httpRequest(self: *HttpTransport, method: []const u8, url: []const u8, body: []const u8) ![]const u8 {
+    ///
+    /// `header` is an optional name/value pair, used for `Git-Protocol`.
+    fn httpRequest(
+        self: *HttpTransport,
+        method: []const u8,
+        url: []const u8,
+        body: []const u8,
+        headers: []const std.http.Header,
+    ) ![]const u8 {
         var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -488,11 +752,14 @@ pub const HttpTransport = struct {
 
         const method_enum: std.http.Method = if (std.mem.eql(u8, method, "POST")) .POST else .GET;
 
+        // `extra_headers` is borrowed by the request, so the slice has to
+        // outlive the call, which it does as long as the caller owns it.
         const result = client.fetch(.{
             .location = .{ .uri = uri },
             .method = method_enum,
             .payload = if (body.len > 0) body else null,
             .response_writer = &aw.writer,
+            .extra_headers = headers,
         }) catch return error.HttpRequestFailed;
 
         if (@intFromEnum(result.status) >= 400) return error.HttpRequestFailed;
